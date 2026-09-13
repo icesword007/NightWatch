@@ -82,6 +82,82 @@ def state_for(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    def test_night_worker_adjacent_to_shop_can_buy_needed_medicine(self):
+        # Break caught: rounds_until_night=0 suppresses every nighttime purchase.
+        payload = economy_payload(round_no=71, worker_pos=(5, 2), gold=10)
+        payload["teamOur"]["teamId"] = "economy-night-medicine"
+        payload["teamOur"]["roles"][0]["health"] = 100
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:2]
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["weaponShopList"] = [{"name": "Medicine", "price": 10}]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy",
+            "name": "Medicine",
+            "num": 1,
+        })
+
+    def test_unreachable_nearest_shop_does_not_hide_reachable_shop(self):
+        # Break caught: selecting by distance alone stops at an enclosed shop.
+        payload = economy_payload(round_no=1, worker_pos=(1, 1), gold=10)
+        payload["teamOur"]["teamId"] = "economy-reachable-shop"
+        payload["teamOur"]["roles"][0]["health"] = 100
+        blocked = [
+            {"pos": {"x": x, "y": y}, "neutralType": "vendor"}
+            for x in range(2, 5)
+            for y in range(0, 3)
+            if (x, y) != (3, 1)
+        ]
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 3, "y": 1}, "neutralType": "weaponShop"},
+            {"pos": {"x": 8, "y": 8}, "neutralType": "weaponShop"},
+            *blocked,
+        ]
+        payload["weaponShopList"] = [{"name": "Medicine", "price": 10}]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(8, 8))
+
+    def test_affordable_immediate_repair_is_not_blocked_by_costly_upgrade(self):
+        # Break caught: the first logical need is unaffordable and hides WallFixer.
+        payload = economy_payload(worker_pos=(5, 2), gold=20)
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=100)
+        )
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "WallFixer", "price": 10},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy",
+            "name": "WallFixer",
+            "num": 1,
+        })
+
+        without_repair = copy.deepcopy(payload)
+        without_repair["teamOur"]["teamId"] = "economy-no-forced-buy"
+        without_repair["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        response = DecisionEngine().decide(without_repair)
+        self.assertFalse(any(
+            command.get("action") == "buy"
+            for command in response["roleCommandMap"].values()
+        ))
+
     def test_full_backpack_and_insufficient_gold_do_not_advance_chain(self):
         # Break caught: collection/purchase is issued despite current hard limits.
         economy = importlib.import_module("agent.economy")

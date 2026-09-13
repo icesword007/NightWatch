@@ -66,6 +66,11 @@ class TaskMemory:
     solver_stopped_reason: str | None = None
     last_tool_result_fingerprint: str | None = None
     repeated_tool_result_count: int = 0
+    last_command: str | None = None
+    last_cycle_fingerprint: str | None = None
+    repeated_cycle_count: int = 0
+    final_answer_requested: bool = False
+    abandon_move_attempted: bool = False
     end_reason: str | None = None
 
 
@@ -94,6 +99,7 @@ class SessionState:
     ended_tasks: list[TaskMemory] = field(default_factory=list)
     history: list[HistoricalFact] = field(default_factory=list)
     late_tool_results: int = 0
+    wall_trial_started: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +189,17 @@ class StateStore:
                     else None
                 ),
             )
+            task = state.active_task
+            if (
+                task is not None
+                and task.solver_stopped_reason is not None
+                and owner_id == task.owner_id
+                and command.get("action") == "move"
+                and target is not None
+                and task.task_cells
+                and all(distance(target, cell) != 1 for cell in task.task_cells)
+            ):
+                task.abandon_move_attempted = True
             if (
                 state.active_task is not None
                 and command.get("action") == "submitAnswer"
@@ -218,6 +235,8 @@ class StateStore:
         deadline_round: int | None,
     ) -> None:
         state = self._require_state()
+        if reason == "build:wall":
+            state.wall_trial_started = True
         state.plans[role_id] = PlanState(
             role_id=role_id,
             target=target,

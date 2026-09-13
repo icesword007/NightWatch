@@ -53,6 +53,16 @@ def parse_llm_envelope(raw: str) -> LlmEnvelope | None:
     if not isinstance(value, dict):
         return None
     kind = value.get("kind")
+    if kind == "abandon":
+        reason = value.get("reason")
+        if (
+            set(value) != {"kind", "reason"}
+            or not isinstance(reason, str)
+            or not reason
+            or len(reason) > MAX_COMMAND_CHARS
+        ):
+            return None
+        return LlmEnvelope(kind, reason)
     content = value.get("content")
     if not isinstance(content, str) or not content:
         return None
@@ -135,8 +145,6 @@ def _continue_active_task(
     owner = turn.unit(task.owner_id) if task.owner_id is not None else None
     if owner is None or owner.kind != PIONEER:
         return TaskTurnProposal()
-    if task.solver_stopped_reason is not None:
-        return TaskTurnProposal()
     if task.pending_llm_round is not None or task.pending_cmd_round is not None:
         return TaskTurnProposal()
     if task.deferred_answer is not None:
@@ -145,6 +153,10 @@ def _continue_active_task(
             owner.unit_id,
             submit_answer_command(task.deferred_answer),
         )),))
+    if task.solver_stopped_reason is not None:
+        return _leave_task(turn, task, owner)
+
+    remaining = _remaining_rounds(turn, task)
 
     if task.consumed_tool_results < len(task.tool_results):
         kind, result = task.tool_results[task.consumed_tool_results]
@@ -159,19 +171,35 @@ def _continue_active_task(
             task.repeated_tool_result_count = 1
         if task.repeated_tool_result_count > 2:
             task.solver_stopped_reason = "repeated_identical_tool_result"
-            return TaskTurnProposal()
+            return _leave_task(turn, task, owner)
         if kind == "llm":
             envelope = parse_llm_envelope(result)
             if envelope is None:
                 _remember(task, "Rejected LLM response", result)
+                if remaining == 0:
+                    task.solver_stopped_reason = "deadline_without_answer"
+                    return _leave_task(turn, task, owner)
                 return TaskTurnProposal(prompt=_solver_prompt(
                     turn, task,
                     "The previous LLM response violated the JSON envelope.",
                 ))
             if envelope.kind == "command":
+                if task.final_answer_requested or (
+                    remaining is not None and remaining < 2
+                ):
+                    task.solver_stopped_reason = "command_after_final_request"
+                    return _leave_task(turn, task, owner)
                 _remember(task, "Platform command requested", envelope.content)
+                task.last_command = envelope.content
                 return TaskTurnProposal(execute_cmd=envelope.content)
+            if envelope.kind == "abandon":
+                _remember(task, "Solver abandoned task", envelope.content)
+                task.solver_stopped_reason = "solver_abandoned"
+                return _leave_task(turn, task, owner)
             if envelope.content == task.last_submitted_answer:
+                if remaining == 0:
+                    task.solver_stopped_reason = "deadline_repeated_answer"
+                    return _leave_task(turn, task, owner)
                 return TaskTurnProposal(prompt=_solver_prompt(
                     turn, task,
                     "Do not repeat the unchanged submitted answer; improve it.",
@@ -189,6 +217,28 @@ def _continue_active_task(
             else "The platform sandbox result was empty, failed, timed out, or truncated."
         )
         _remember(task, "Platform command result", result)
+        if remaining == 0:
+            task.solver_stopped_reason = "command_result_at_deadline"
+            return _leave_task(turn, task, owner)
+        cycle_fingerprint = hashlib.sha256(
+            f"{task.last_command or ''}\0{result}".encode("utf-8")
+        ).hexdigest()
+        if cycle_fingerprint == task.last_cycle_fingerprint:
+            task.repeated_cycle_count += 1
+        else:
+            task.last_cycle_fingerprint = cycle_fingerprint
+            task.repeated_cycle_count = 1
+        if task.repeated_cycle_count >= 3:
+            if remaining == 0:
+                task.solver_stopped_reason = "repeated_cycle_at_deadline"
+                return _leave_task(turn, task, owner)
+            task.final_answer_requested = True
+            return TaskTurnProposal(prompt=_solver_prompt(
+                turn,
+                task,
+                "No more command exploration. Return an evidence-based complete "
+                "or partial answer now, or abandon the task.",
+            ))
         return TaskTurnProposal(prompt=_solver_prompt(
             turn, task,
             f"{status}\nPlatform result:\n{_bounded(result, MAX_TOOL_CONTEXT_CHARS)}",
@@ -212,11 +262,21 @@ def _continue_active_task(
         if task.last_submission_feedback_round != previous_submit.pending.round_no:
             _remember(task, "Submission feedback", context)
             task.last_submission_feedback_round = previous_submit.pending.round_no
+        if remaining == 0:
+            task.solver_stopped_reason = "deadline_after_failed_submission"
+            return _leave_task(turn, task, owner)
         return TaskTurnProposal(prompt=_solver_prompt(turn, task, context))
 
+    if remaining == 0:
+        task.solver_stopped_reason = "deadline_without_answer"
+        return _leave_task(turn, task, owner)
     urgency = ""
-    if task.timeout_round is not None and task.timeout_round - turn.round_no <= 1:
-        urgency = "The task deadline is imminent; return the best submit-ready answer now."
+    if remaining is not None and remaining <= 1:
+        task.final_answer_requested = True
+        urgency = (
+            "The task deadline is imminent; return the best evidence-based complete "
+            "or partial submit-ready answer now, or abandon the task."
+        )
     return TaskTurnProposal(prompt=_solver_prompt(turn, task, urgency))
 
 
@@ -224,16 +284,74 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
     task_text = _bounded(turn.phase_task, MAX_TASK_PROMPT_CHARS)
     context_text = _bounded(context, MAX_TOOL_CONTEXT_CHARS)
     history_text = _solver_history_text(task)
+    remaining = _remaining_rounds(turn, task)
+    if remaining is None:
+        budget_text = "Known remaining task rounds: unknown."
+    else:
+        budget_text = (
+            f"Known remaining task rounds: {remaining} "
+            f"(current round {turn.round_no}, deadline round {task.timeout_round})."
+        )
+    command_allowed = (
+        not task.final_answer_requested
+        and (remaining is None or remaining >= 3)
+    )
+    command_text = (
+        "Command exploration is allowed."
+        if command_allowed
+        else "Command exploration is not allowed; answer from existing evidence or abandon."
+    )
     return (
         "Solve the following competition task using only the stated task and "
         "platform sandbox evidence. Return exactly one JSON object and no markdown. "
-        'Use {"kind":"command","content":"<sandbox command>"} when another '
-        "platform sandbox step is necessary. Use "
+        f"{budget_text} {command_text} "
+        'Use {"kind":"command","content":"<sandbox command>"} only when another '
+        "platform sandbox step is allowed and necessary. Use "
         '{"kind":"answer","content":"<submit-ready answer>","complete":true} '
         "for a complete answer, or complete:false for a reliable partial answer. "
+        'Use {"kind":"abandon","reason":"<why evidence is insufficient>"} '
+        "instead of fabricating an answer. "
         "Never claim success from an empty, failed, timed-out, or truncated result.\n"
         f"{context_text}\nSolver history:\n{history_text}\nTask:\n{task_text}"
     )
+
+
+def _remaining_rounds(turn: Turn, task: TaskMemory) -> int | None:
+    if task.timeout_round is None:
+        return None
+    return max(0, task.timeout_round - turn.round_no)
+
+
+def _leave_task(
+    turn: Turn,
+    task: TaskMemory,
+    owner: Unit,
+) -> TaskTurnProposal:
+    if task.abandon_move_attempted:
+        return TaskTurnProposal()
+    if not task.task_cells:
+        return TaskTurnProposal()
+    blocked = turn.blocked(owner)
+    candidates = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if not (dx or dy):
+                continue
+            target = Pos(owner.pos.x + dx, owner.pos.y + dy)
+            if not turn.land(target) or target in blocked:
+                continue
+            separation = min(distance(target, cell) for cell in task.task_cells)
+            if separation > 1:
+                candidates.append((separation, target))
+    if not candidates:
+        return TaskTurnProposal()
+    _, target = max(candidates, key=lambda item: (item[0], -item[1].x, -item[1].y))
+    return TaskTurnProposal(actions=(PlannedAction(ActionProposal(
+        owner.unit_id,
+        owner.unit_id,
+        move_command(target),
+        destination=target,
+    ), target, "task-abandon"),))
 
 
 def _remember(task: TaskMemory, label: str, content: str) -> None:

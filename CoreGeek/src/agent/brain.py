@@ -235,13 +235,14 @@ class DecisionEngine:
             or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
             or len(turn.weapons()) < 3
             or turn.walls()
+            or state.wall_trial_started
+            or any(plan.reason == "build:wall" for plan in state.plans.values())
         ):
             return False
         if any(
             completed.pending.action == "build"
             and completed.pending.name == "wall"
             and completed.pending.source_session == state.session_index
-            and completed.success is False
             for completed in state.action_history
         ):
             return False

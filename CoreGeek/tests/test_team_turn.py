@@ -133,6 +133,109 @@ class TeamTurnTests(unittest.TestCase):
             for command in response["roleCommandMap"].values()
         ))
 
+    def test_two_workers_share_one_wall_trial_reservation(self):
+        # Break caught: each worker starts a different one-time wall experiment.
+        payload = base_payload(round_no=5, team_id="brain-c-wall-team-limit")
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 6, 9),
+            unit(10011, "worker", 12, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        payload["teamOur"]["roles"][1]["backpack"] = ["stone"]
+
+        response = DecisionEngine().decide(payload)
+
+        wall_builds = [
+            command for command in response["roleCommandMap"].values()
+            if command.get("action") == "build" and command.get("name") == "wall"
+        ]
+        self.assertEqual(len(wall_builds), 1)
+
+    def test_in_transit_wall_trial_survives_unknown_feedback_and_owner_death(self):
+        # Break caught: another worker starts a wall after the reserved move is unknown.
+        payload = base_payload(round_no=5, team_id="brain-c-wall-in-transit")
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 0, 0),
+            unit(10011, "worker", 14, 0),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["mapInfo"]["width"] = 20
+        payload["mapInfo"]["height"] = 20
+        payload["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        payload["teamOur"]["roles"][1]["backpack"] = ["stone"]
+        engine = DecisionEngine()
+
+        engine.decide(payload)
+        self.assertEqual(sum(
+            plan.reason == "build:wall"
+            for plan in engine.state.state.plans.values()
+        ), 1)
+
+        unknown = json.loads(json.dumps(payload))
+        unknown["roundNo"] = 6
+        unknown["lastRoundRoleActionResults"] = {}
+        engine.decide(unknown)
+        self.assertEqual(sum(
+            plan.reason == "build:wall"
+            for plan in engine.state.state.plans.values()
+        ), 1)
+
+        owner = next(
+            role_id for role_id, plan in engine.state.state.plans.items()
+            if plan.reason == "build:wall"
+        )
+        died = json.loads(json.dumps(unknown))
+        died["roundNo"] = 7
+        next(
+            role for role in died["teamOur"]["roles"] if role["id"] == owner
+        )["health"] = 0
+        response = engine.decide(died)
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertFalse(any(
+            plan.reason == "build:wall"
+            for plan in engine.state.state.plans.values()
+        ))
+
+    def test_unknown_wall_build_feedback_does_not_open_another_trial(self):
+        # Break caught: missing feedback is treated as permission for another wall.
+        payload = base_payload(round_no=5, team_id="brain-c-wall-unknown")
+        worker = unit(10010, "worker", 6, 9)
+        worker["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10011, "worker", 12, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamOur"]["roles"][1]["backpack"] = ["stone"]
+        engine = DecisionEngine()
+        first = engine.decide(payload)
+        self.assertTrue(any(
+            command.get("name") == "wall"
+            for command in first["roleCommandMap"].values()
+        ))
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {}
+        response = engine.decide(following)
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            for command in response["roleCommandMap"].values()
+        ))
+
     def test_critical_gunner_uses_held_medicine_before_attacking(self):
         # Break caught: protected gunner filtering suppresses emergency self-care.
         payload = base_payload(round_no=71, team_id="brain-c-medicine")

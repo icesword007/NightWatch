@@ -1,5 +1,6 @@
 import time
 from collections import Counter
+from dataclasses import replace
 from typing import Callable
 
 from .actions import ActionProposal, PlannedAction
@@ -41,6 +42,9 @@ def propose_economy(
     maintained_roles: set[int] = set()
     claimed_build_targets: set[Pos] = set()
     claimed_tower_types: set[str] = set()
+    wall_trial_claimed = state.wall_trial_started or any(
+        plan.reason == "build:wall" for plan in state.plans.values()
+    )
     claimed_gold = 0
     failed_builds = {
         completed.pending.target
@@ -81,7 +85,7 @@ def propose_economy(
             turn, state, worker, failed_builds,
             clock, deadline, max_expansions,
         )
-        if candidate is None and need_wall:
+        if candidate is None and need_wall and not wall_trial_claimed:
             candidate = _wall_action(
                 turn,
                 worker,
@@ -90,6 +94,8 @@ def propose_economy(
                 },
                 clock, deadline, max_expansions,
             )
+            if candidate is not None:
+                wall_trial_claimed = True
         if candidate is None:
             candidate = _tower_action(
                 turn,
@@ -375,16 +381,32 @@ def _trade_or_mine(
                 turn, worker, target, clock, deadline, max_expansions,
             )
 
-    purchase = _needed_purchase(turn, worker)
     shops = turn.zones_of("weaponShop")
-    if purchase is not None and shops:
-        price = turn.weapon_prices.get(purchase)
-        if price is not None and price <= available_gold:
-            target = _nearest(worker.pos, shops)
-            return _buy_or_move(
-                turn, worker, target, purchase,
-                clock, deadline, max_expansions,
-            )
+    if shops:
+        for purchase in _purchase_candidates(turn, worker):
+            price = turn.weapon_prices.get(purchase)
+            if price is None or price > available_gold:
+                continue
+            for target in sorted(
+                shops,
+                key=lambda pos: (distance(worker.pos, pos), pos.x, pos.y),
+            ):
+                if not _purchase_is_timely(
+                    turn,
+                    worker,
+                    target,
+                    purchase,
+                    clock,
+                    deadline,
+                    max_expansions,
+                ):
+                    continue
+                candidate = _buy_or_move(
+                    turn, worker, target, purchase,
+                    clock, deadline, max_expansions,
+                )
+                if candidate is not None:
+                    return candidate
 
     mines = turn.zones_of(*MINERALS)
     if not mines or worker.backpack_full:
@@ -474,19 +496,107 @@ def _buy_or_move(
     )
 
 
-def _needed_purchase(turn: Turn, worker: Unit) -> str | None:
+def _purchase_candidates(turn: Turn, worker: Unit) -> tuple[str, ...]:
+    candidates: list[str] = []
     if worker.health < _max_role_health(worker) and "Medicine" in turn.weapon_prices:
-        return "Medicine"
+        candidates.append("Medicine")
+    damaged_wall = next((
+        wall for wall in turn.walls()
+        if wall.health < _max_building_health(wall)
+    ), None)
+    if damaged_wall is not None and "WallFixer" in turn.weapon_prices:
+        candidates.append("WallFixer")
     for target in (*turn.weapons(), *((turn.station(),) if turn.station() else ())):
         prefix = "Weapon" if target.kind in TOWER_TYPES else "Station"
         if target.level in (1, 2):
             item = f"{prefix}UpgradeVoucher{target.level}"
-            if item in turn.weapon_prices:
-                return item
-    damaged_wall = next((wall for wall in turn.walls() if wall.health < _max_building_health(wall)), None)
-    if damaged_wall is not None and "WallFixer" in turn.weapon_prices:
-        return "WallFixer"
-    return None
+            if item in turn.weapon_prices and item not in candidates:
+                candidates.append(item)
+    return tuple(candidates)
+
+
+def _purchase_is_timely(
+    turn: Turn,
+    worker: Unit,
+    shop: Pos,
+    item: str,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> bool:
+    target = _item_target(turn, item)
+    if item != "Medicine" and target is None:
+        return False
+    if not turn.is_day:
+        return item == "Medicine" and distance(worker.pos, shop) == 1
+
+    best_rounds: int | None = None
+    for shop_stand in _adjacent_stands(turn, worker, shop):
+        path = next_step(
+            turn,
+            worker,
+            shop_stand,
+            clock=clock,
+            deadline=deadline,
+            max_expansions=max_expansions,
+        )
+        if path.status == "already_there":
+            shop_rounds = 0
+        elif path.status == "found" and path.cost is not None:
+            shop_rounds = path.cost
+        else:
+            if path.status in ("deadline", "expansion_limit"):
+                return False
+            continue
+
+        use_rounds = 1
+        if target is not None:
+            at_shop = replace(worker, pos=shop_stand)
+            route = _route_cost_to_adjacent(
+                turn,
+                at_shop,
+                target.pos,
+                clock,
+                deadline,
+                max_expansions,
+            )
+            if route is None:
+                continue
+            use_rounds += route
+        total_rounds = shop_rounds + 1 + use_rounds
+        best_rounds = (
+            total_rounds
+            if best_rounds is None
+            else min(best_rounds, total_rounds)
+        )
+    return best_rounds is not None and best_rounds <= turn.rounds_until_night
+
+
+def _route_cost_to_adjacent(
+    turn: Turn,
+    worker: Unit,
+    target: Pos,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> int | None:
+    costs = []
+    for stand in _adjacent_stands(turn, worker, target):
+        path = next_step(
+            turn,
+            worker,
+            stand,
+            clock=clock,
+            deadline=deadline,
+            max_expansions=max_expansions,
+        )
+        if path.status == "already_there":
+            costs.append(0)
+        elif path.status == "found" and path.cost is not None:
+            costs.append(path.cost)
+        elif path.status in ("deadline", "expansion_limit"):
+            return None
+    return min(costs) if costs else None
 
 
 def _item_target(turn: Turn, item: str) -> Unit | None:
@@ -591,7 +701,7 @@ def _planned_purchase_valid(turn: Turn, worker: Unit, item: str) -> bool:
         and not worker.backpack_full
         and price is not None
         and price <= turn.gold
-        and _needed_purchase(turn, worker) == item
+        and item in _purchase_candidates(turn, worker)
     )
 
 

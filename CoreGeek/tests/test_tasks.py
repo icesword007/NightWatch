@@ -129,15 +129,22 @@ class TaskTests(unittest.TestCase):
         answer = tasks.parse_llm_envelope(
             '{"kind":"answer","content":"42","complete":false}'
         )
+        abandon = tasks.parse_llm_envelope(
+            '{"kind":"abandon","reason":"insufficient evidence"}'
+        )
 
         self.assertEqual(command.kind, "command")
         self.assertEqual(command.content, "python3 solve.py")
         self.assertEqual(answer.kind, "answer")
         self.assertFalse(answer.complete)
+        self.assertIsNotNone(abandon)
+        self.assertEqual(abandon.kind, "abandon")
+        self.assertEqual(abandon.content, "insufficient evidence")
         for invalid in (
             "```json\n{\"kind\":\"answer\",\"content\":\"42\",\"complete\":true}\n```",
             '{"kind":"command","content":""}',
             '{"kind":"answer","content":"42","complete":true,"extra":1}',
+            '{"kind":"abandon","reason":""}',
             "not json",
         ):
             self.assertIsNone(tasks.parse_llm_envelope(invalid))
@@ -238,6 +245,194 @@ class TaskTests(unittest.TestCase):
 
         self.assertIn("python3 solve.py --stage one", prompt)
         self.assertIn("[exitCode:0]\nvalue=42", prompt)
+
+    def test_known_deadline_is_in_every_prompt_and_blocks_late_commands(self):
+        # Break caught: normal command/result branches bypass the deadline policy.
+        engine = DecisionEngine()
+        accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 6
+        engine.decide(accepted)
+
+        active = copy.deepcopy(accepted)
+        active["roundNo"] = 2
+        active["phaseTask"] = "active task"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        prompt = engine.decide(active)["prompt"]
+        self.assertIn("Known remaining task rounds: 5", prompt)
+        self.assertIn("Command exploration is allowed", prompt)
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 3
+        command["llmResp"] = '{"kind":"command","content":"step-one"}'
+        self.assertEqual(engine.decide(command)["executeCmd"], "step-one")
+
+        result = copy.deepcopy(active)
+        result["roundNo"] = 4
+        result["lastCmdResult"] = "[exitCode:0]\nprogress"
+        prompt = engine.decide(result)["prompt"]
+        self.assertIn("Known remaining task rounds: 3", prompt)
+
+        command["roundNo"] = 5
+        command["llmResp"] = '{"kind":"command","content":"step-two"}'
+        self.assertEqual(engine.decide(command)["executeCmd"], "step-two")
+
+        result["roundNo"] = 6
+        result["lastCmdResult"] = "[exitCode:0]\nmore progress"
+        prompt = engine.decide(result)["prompt"]
+        self.assertIn("Known remaining task rounds: 1", prompt)
+        self.assertIn("Command exploration is not allowed", prompt)
+
+        late_command = copy.deepcopy(active)
+        late_command["roundNo"] = 7
+        late_command["llmResp"] = (
+            '{"kind":"command","content":"too-late-command"}'
+        )
+        response = engine.decide(late_command)
+        self.assertEqual(response["executeCmd"], "")
+        self.assertFalse(any(
+            command.get("action") == "submitAnswer"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_evidence_based_answer_can_submit_on_last_known_round(self):
+        # Break caught: deadline handling stops a previously requested answer too early.
+        engine = DecisionEngine()
+        accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 6
+        engine.decide(accepted)
+
+        active = copy.deepcopy(accepted)
+        active["roundNo"] = 2
+        active["phaseTask"] = "active task"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        engine.decide(active)
+
+        near_deadline = copy.deepcopy(active)
+        near_deadline["roundNo"] = 6
+        prompt = engine.decide(near_deadline)["prompt"]
+        self.assertIn("Known remaining task rounds: 1", prompt)
+
+        final = copy.deepcopy(active)
+        final["roundNo"] = 7
+        final["llmResp"] = (
+            '{"kind":"answer","content":"supported partial",'
+            '"complete":false}'
+        )
+        response = engine.decide(final)
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "submitAnswer",
+            "taskAnswer": "supported partial",
+        })
+
+    def test_repeated_command_result_cycle_converges_then_leaves(self):
+        # Break caught: alternating LLM and command result kinds reset repetition.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        self.assertIn("remaining task rounds: unknown", engine.decide(active)["prompt"])
+
+        for command_round, result_round in ((2, 3), (4, 5), (6, 7)):
+            command = copy.deepcopy(active)
+            command["roundNo"] = command_round
+            command["llmResp"] = '{"kind":"command","content":"pwd"}'
+            self.assertEqual(engine.decide(command)["executeCmd"], "pwd")
+
+            result = copy.deepcopy(active)
+            result["roundNo"] = result_round
+            result["lastCmdResult"] = "[exitCode:1]\nsame failure"
+            response = engine.decide(result)
+
+        self.assertIn("No more command exploration", response["prompt"])
+
+        ignored = copy.deepcopy(active)
+        ignored["roundNo"] = 8
+        ignored["llmResp"] = '{"kind":"command","content":"pwd"}'
+        response = engine.decide(ignored)
+        self.assertEqual(response["executeCmd"], "")
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertIsNotNone(engine.state.state.active_task.solver_stopped_reason)
+
+    def test_unissued_leave_is_retried_after_task_exit_unblocks(self):
+        # Break caught: a temporarily impossible leave consumes the only attempt.
+        engine = DecisionEngine()
+        blocked = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        blocked["mapInfo"]["zones"].extend(
+            {"pos": {"x": x, "y": y}, "neutralType": "vendor"}
+            for x, y in ((2, 2), (2, 3), (2, 4), (3, 2), (4, 2))
+        )
+        engine.decide(blocked)
+        engine.state.state.active_task.solver_stopped_reason = "test_stop"
+
+        still_blocked = copy.deepcopy(blocked)
+        still_blocked["roundNo"] = 2
+        response = engine.decide(still_blocked)
+        self.assertNotIn("10011", response["roleCommandMap"])
+        self.assertFalse(engine.state.state.active_task.abandon_move_attempted)
+
+        opened = task_payload(
+            round_no=3, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        response = engine.decide(opened)
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertTrue(engine.state.state.active_task.abandon_move_attempted)
+
+    def test_leave_retries_after_same_round_defense_uses_owner(self):
+        # Break caught: an allocator conflict counts an unissued task leave as attempted.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=71, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        active["teamOur"]["roles"].extend([
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 3, 2, health=1000),
+        ])
+        active["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 3, "y": 5},
+            "roleType": "smallRobot",
+            "health": 40,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+        engine.decide(active)
+        engine.state.state.active_task.solver_stopped_reason = "test_stop"
+
+        defended = copy.deepcopy(active)
+        defended["roundNo"] = 72
+        response = engine.decide(defended)
+        self.assertEqual(response["roleCommandMap"]["10020"]["action"], "attack")
+        self.assertFalse(engine.state.state.active_task.abandon_move_attempted)
+
+        safe = copy.deepcopy(active)
+        safe["roundNo"] = 73
+        safe["robot"]["roles"] = []
+        response = engine.decide(safe)
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertTrue(engine.state.state.active_task.abandon_move_attempted)
+
+    def test_changed_command_result_is_progress_not_a_repeated_cycle(self):
+        # Break caught: any repeated command is stopped despite changing evidence.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        engine.decide(active)
+        for index, output in enumerate(("first", "second", "first")):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 2 + index * 2
+            command["llmResp"] = '{"kind":"command","content":"probe"}'
+            engine.decide(command)
+            result = copy.deepcopy(active)
+            result["roundNo"] = 3 + index * 2
+            result["lastCmdResult"] = f"[exitCode:0]\n{output}"
+            response = engine.decide(result)
+
+        self.assertTrue(response["prompt"])
+        self.assertNotIn("No more command exploration", response["prompt"])
+        self.assertIsNone(engine.state.state.active_task.solver_stopped_reason)
 
     def test_task_prompt_marks_task_text_truncation(self):
         # Break caught: an oversized task is silently clipped into a different problem.
@@ -578,7 +773,7 @@ class TaskTests(unittest.TestCase):
         fifth["llmResp"] = fourth["llmResp"]
         response = engine.decide(fifth)
         self.assertEqual(response["prompt"], "")
-        self.assertNotIn("10011", response["roleCommandMap"])
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
 
     def test_immediate_task_pioneer_attack_excludes_same_round_submit(self):
         # Break caught: one pioneer is promised to both a weapon and submitAnswer.
@@ -678,6 +873,7 @@ class TaskTests(unittest.TestCase):
         response = engine.decide(stopped)
         self.assertEqual(response["prompt"], "")
         self.assertEqual(response["executeCmd"], "")
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
 
         for round_no in range(5, 9):
             still_stopped = copy.deepcopy(payload)
@@ -685,6 +881,7 @@ class TaskTests(unittest.TestCase):
             response = engine.decide(still_stopped)
             self.assertEqual(response["prompt"], "")
             self.assertEqual(response["executeCmd"], "")
+            self.assertNotIn("10011", response["roleCommandMap"])
 
         replacement = copy.deepcopy(payload)
         replacement["roundNo"] = 9
