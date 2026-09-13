@@ -1,0 +1,71 @@
+{
+  "roundNo": 1,
+  "mapInfo": {
+    "width": 5,
+    "height": 5,
+    "zones": [
+      {
+        "pos": {"x": 1, "y": 1},
+        "neutralType": "stone"
+      }
+    ]
+  },
+  "teamOur": {
+    "type": "challenger",
+    "teamId": "s0-our",
+    "teamName": "NightWatch",
+    "goldNum": 0,
+    "totalScore": 0,
+    "playerTasks": [],
+    "roles": [
+      {
+        "id": 10010,
+        "pos": {"x": 2, "y": 2},
+        "roleType": "worker",
+        "health": 220,
+        "attackPower": 0,
+        "attackRange": 0,
+        "backPackCapability": 100,
+        "backpack": []
+      }
+    ]
+  },
+  "teamEnemy": {
+    "roles": [
+      {
+        "id": 20010,
+        "pos": {"x": 1, "y": 2},
+        "roleType": "worker",
+        "health": 220,
+        "attackPower": 0,
+        "attackRange": 0,
+        "backPackCapability": 100,
+        "backpack": []
+      }
+    ]
+  },
+  "robot": {
+    "roles": [
+      {
+        "id": 30001,
+        "pos": {"x": 1, "y": 3},
+        "roleType": "smallRobot",
+        "health": 40,
+        "abnormalState": "",
+        "targetTeam": "challenger"
+      }
+    ]
+  },
+  "phaseTask": "",
+  "lastRoundRoleActionResults": {},
+  "lastSummonTreasureResult": 0,
+  "llmResp": "",
+  "worldNews": {
+    "officialNews": "今日无重大新闻",
+    "folkLegends": ""
+  },
+  "lastCmdResult": "",
+  "vendorShopList": [],
+  "weaponShopList": [],
+  "errors": []
+}

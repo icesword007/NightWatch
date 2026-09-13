@@ -28,7 +28,12 @@ class Pos:
 
     @classmethod
     def load(cls, raw: Any) -> "Pos":
-        return cls(int(raw["x"]), int(raw["y"]))
+        if not isinstance(raw, dict):
+            raise ValueError("position must be an object")
+        try:
+            return cls(int(raw["x"]), int(raw["y"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("position requires integer x and y") from error
 
     def dump(self) -> dict[str, int]:
         return {"x": self.x, "y": self.y}
@@ -61,18 +66,23 @@ class Unit:
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "Unit":
-        raw_capacity = raw.get("backPackCapability")
-        return cls(
-            int(raw.get("id") or 0),
-            Pos.load(raw["pos"]),
-            str(raw["roleType"]),
-            int(raw["health"]),
-            int(raw.get("level") or 0),
-            int(raw.get("cooldown") or 0),
-            int(raw.get("attackRange") or 0),
-            int(raw_capacity) if raw_capacity is not None else None,
-            tuple(str(item) for item in raw.get("backpack") or ()),
-        )
+        if not isinstance(raw, dict):
+            raise ValueError("unit must be an object")
+        try:
+            raw_capacity = raw.get("backPackCapability")
+            return cls(
+                int(raw["id"]),
+                Pos.load(raw["pos"]),
+                str(raw["roleType"]),
+                int(raw["health"]),
+                int(raw.get("level") or 0),
+                int(raw.get("cooldown") or 0),
+                int(raw.get("attackRange") or 0),
+                int(raw_capacity) if raw_capacity is not None else None,
+                tuple(str(item) for item in raw.get("backpack") or ()),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("unit requires id, pos, roleType, and health") from error
 
     @property
     def backpack_full(self) -> bool:
@@ -98,7 +108,12 @@ class Robot:
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "Robot":
-        return cls(int(raw["id"]), Pos.load(raw["pos"]), int(raw["health"]))
+        if not isinstance(raw, dict):
+            raise ValueError("robot must be an object")
+        try:
+            return cls(int(raw["id"]), Pos.load(raw["pos"]), int(raw["health"]))
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("robot requires id, pos, and health") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,29 +125,44 @@ class Turn:
     height: int
     zones: dict[Pos, str]
     ours: tuple[Unit, ...]
+    enemies: tuple[Unit, ...]
     robots: tuple[Robot, ...]
 
     @classmethod
     def load(cls, payload: dict[str, Any]) -> "Turn":
-        round_no = int(payload["roundNo"])
-        info = payload["mapInfo"]
-        team = payload["teamOur"]
-        return cls(
-            round_no,
-            (round_no - 1) % ROUNDS_PER_DAY < DAY_ROUNDS,
-            int(team.get("goldNum") or 0),
-            int(info["width"]),
-            int(info["height"]),
-            {
-                Pos.load(zone["pos"]): str(zone["neutralType"])
-                for zone in info.get("zones") or ()
-            },
-            tuple(Unit.load(role) for role in team.get("roles") or ()),
-            tuple(
-                Robot.load(robot)
-                for robot in (payload.get("robot") or {}).get("roles") or ()
-            ),
-        )
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        try:
+            round_no = int(payload["roundNo"])
+            info = payload["mapInfo"]
+            team = payload["teamOur"]
+            enemy = payload["teamEnemy"]
+            robots = payload["robot"]
+            if not all(
+                isinstance(value, dict)
+                for value in (info, team, enemy, robots)
+            ):
+                raise ValueError("request sections must be objects")
+            return cls(
+                round_no,
+                (round_no - 1) % ROUNDS_PER_DAY < DAY_ROUNDS,
+                int(team.get("goldNum") or 0),
+                int(info["width"]),
+                int(info["height"]),
+                {
+                    Pos.load(zone["pos"]): str(zone["neutralType"])
+                    for zone in info.get("zones") or ()
+                },
+                tuple(Unit.load(role) for role in team.get("roles") or ()),
+                tuple(Unit.load(role) for role in enemy.get("roles") or ()),
+                tuple(
+                    Robot.load(robot) for robot in robots.get("roles") or ()
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "request requires roundNo, mapInfo, teamOur, teamEnemy, and robot"
+            ) from error
 
     def station(self) -> Unit | None:
         for unit in self.ours:
@@ -182,7 +212,7 @@ class Turn:
 
     def occupied_cells(self) -> frozenset[Pos]:
         cells: set[Pos] = set()
-        for unit in self.ours:
+        for unit in (*self.ours, *self.enemies):
             cells.update(self.footprint(unit))
         return frozenset(cells)
 
