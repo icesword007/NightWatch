@@ -447,6 +447,43 @@ class EconomyTests(unittest.TestCase):
         plan = engine.state.state.plans.get(10010)
         self.assertTrue(plan is None or not plan.reason.startswith("fund:"))
 
+    def test_active_funding_post_is_not_claimed_by_another_gunner_plan(self):
+        # Break caught: defense ignores the post bound into an accepted funding route.
+        previous = economy_payload(
+            round_no=59,
+            worker_pos=(5, 8),
+            items=("WeaponUpgradeVoucher1",),
+        )
+        previous["teamOur"]["teamId"] = "economy-reserved-funding-post"
+        previous["teamOur"]["roles"] = [
+            role(10010, "worker", 5, 8, items=("WeaponUpgradeVoucher1",)),
+            role(10012, "worker", 7, 4),
+            role(10013, "station", 9, 9, health=1500),
+            role(10020, "gatling", 8, 2, health=1000),
+            role(10030, "railgun", 8, 8, health=1000),
+        ]
+        engine = DecisionEngine()
+        initial_turn = Turn.load(previous)
+        engine.state.observe(
+            initial_turn, previous, request_fingerprint(previous),
+        )
+        engine.state.set_plan(
+            10010,
+            Pos(8, 8),
+            "fund:WeaponUpgradeVoucher1:10020:10030",
+            70,
+        )
+
+        current = copy.deepcopy(previous)
+        current["roundNo"] = 60
+        response = engine.decide(current)
+
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith("fund:")
+        )
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertEqual(engine.state.state.plans[10012].reason, "gunner:10030")
+
     def test_blocked_vendor_route_cannot_start_funding_plan(self):
         payload = economy_payload(
             round_no=30,

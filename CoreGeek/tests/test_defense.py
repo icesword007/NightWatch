@@ -168,6 +168,85 @@ class DefenseTests(unittest.TestCase):
         self.assertEqual(len(attacks), 2)
         self.assertNotEqual(attacks[0]["targetPos"], attacks[1]["targetPos"])
 
+    def test_overlapping_adjacent_controllers_staff_both_towers(self):
+        # Break caught: tower-order greedy consumes the only controller for tower two.
+        payload = defense_payload()
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 7, 6),
+            unit(10012, "worker", 5, 6),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 8, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = [
+            robot(30001, "smallRobot", 6, 9, 40),
+            robot(30002, "middleRobot", 8, 9, 60),
+        ]
+
+        response = DecisionEngine().decide(payload)
+        attacks = {
+            owner_id: command
+            for owner_id, command in response["roleCommandMap"].items()
+            if command["action"] == "attack"
+        }
+
+        self.assertEqual(set(attacks), {"10020", "10030"})
+        self.assertEqual(attacks["10020"]["controllerId"], "10012")
+        self.assertEqual(attacks["10030"]["controllerId"], "10010")
+
+    def test_daytime_positioning_uses_same_maximum_matching_as_projection(self):
+        # Break caught: projected two-post coverage and issued gunner plans disagree.
+        payload = defense_payload(round_no=68)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 7, 8),
+            unit(10012, "worker", 3, 6),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 10, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = []
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            {
+                role_id: engine.state.state.plans[int(role_id)].reason
+                for role_id, command in response["roleCommandMap"].items()
+                if command["action"] == "move"
+            },
+            {"10010": "gunner:10030", "10012": "gunner:10020"},
+        )
+
+    def test_existing_gunner_pairing_is_stable_when_coverage_is_unchanged(self):
+        payload = defense_payload(round_no=65)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 7, 8),
+            unit(10012, "worker", 4, 7),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 10, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = []
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(10010, Pos(6, 6), "gunner:10020", 71)
+        engine.state.set_plan(10012, Pos(10, 6), "gunner:10030", 71)
+
+        current = json.loads(json.dumps(payload))
+        current["roundNo"] = 66
+        response = engine.decide(current)
+
+        self.assertEqual(
+            {
+                role_id: engine.state.state.plans[int(role_id)].reason
+                for role_id, command in response["roleCommandMap"].items()
+                if command["action"] == "move"
+            },
+            {"10010": "gunner:10020", "10012": "gunner:10030"},
+        )
+
     def test_two_staffed_towers_do_not_recall_pioneer_without_third_job(self):
         # Break caught: pioneer returns even though both available guns are staffed.
         payload = defense_payload(round_no=65)

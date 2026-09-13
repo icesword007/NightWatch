@@ -81,6 +81,27 @@ class DecisionEngine:
             task_pioneer = next((
                 turn.unit(role_id) for role_id in task_role_ids
             ), None)
+            economy_candidates = propose_economy(
+                turn,
+                state,
+                clock=self.clock,
+                deadline=deadline,
+                max_expansions=self.max_search_expansions,
+                need_wall=self._needs_wall_trial(turn, state),
+                reserved_role_ids=task_role_ids,
+            )
+            critical_economy = tuple(
+                candidate for candidate in economy_candidates
+                if candidate.plan_reason
+                and candidate.plan_reason.startswith("fund:")
+            )
+            ordinary_economy = tuple(
+                candidate for candidate in economy_candidates
+                if candidate not in critical_economy
+            )
+            funding_roles, funding_posts = self._funding_reservations(
+                critical_economy if turn.is_day else (),
+            )
             day_return = (
                 task_pioneer_day_return_action(
                     turn,
@@ -89,6 +110,8 @@ class DecisionEngine:
                     clock=self.clock,
                     deadline=deadline,
                     max_expansions=self.max_search_expansions,
+                    reserved_role_ids=funding_roles,
+                    reserved_weapon_ids=funding_posts,
                 )
                 if task_pioneer is not None
                 else None
@@ -123,10 +146,11 @@ class DecisionEngine:
                 deadline=deadline,
                 max_expansions=self.max_search_expansions,
                 unavailable_role_ids=(
-                    task_role_ids
+                    task_role_ids | funding_roles
                     if urgent_recall is not None
-                    else unavailable_for_defense
+                    else unavailable_for_defense | funding_roles
                 ),
+                reserved_weapon_ids=funding_posts,
             )
             task_turn = propose_tasks(
                 turn,
@@ -149,24 +173,6 @@ class DecisionEngine:
                     )
             if urgent_recall is not None:
                 defense_candidates = (urgent_recall, *defense_candidates)
-            economy_candidates = propose_economy(
-                turn,
-                state,
-                clock=self.clock,
-                deadline=deadline,
-                max_expansions=self.max_search_expansions,
-                need_wall=self._needs_wall_trial(turn, state),
-                reserved_role_ids=task_role_ids,
-            )
-            critical_economy = tuple(
-                candidate for candidate in economy_candidates
-                if candidate.plan_reason
-                and candidate.plan_reason.startswith("fund:")
-            )
-            ordinary_economy = tuple(
-                candidate for candidate in economy_candidates
-                if candidate not in critical_economy
-            )
             defense_first = (
                 not turn.is_day
                 or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
@@ -283,6 +289,29 @@ class DecisionEngine:
         if task_turn.actions or task_turn.prompt or task_turn.execute_cmd:
             return "task_active"
         return "normal"
+
+    @staticmethod
+    def _funding_reservations(
+        candidates: tuple[Any, ...],
+    ) -> tuple[frozenset[int], frozenset[int]]:
+        roles: set[int] = set()
+        weapons: set[int] = set()
+        for candidate in candidates:
+            reason = candidate.plan_reason
+            if not isinstance(reason, str) or reason.startswith("fund:build:"):
+                continue
+            parts = reason.split(":")
+            if len(parts) < 3:
+                continue
+            try:
+                weapon_id = int(parts[2])
+            except ValueError:
+                continue
+            if weapon_id <= 0:
+                continue
+            roles.add(candidate.proposal.actor_id)
+            weapons.add(weapon_id)
+        return frozenset(roles), frozenset(weapons)
 
     @staticmethod
     def _decision_trace(

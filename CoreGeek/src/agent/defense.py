@@ -12,12 +12,8 @@ TASK_RECALL_THREAT_DISTANCE = 3
 
 
 def protected_gunners(turn: Turn) -> frozenset[int]:
-    used: set[int] = set()
-    for weapon in turn.weapons():
-        controller = _adjacent_controller(turn, weapon, used)
-        if controller is not None:
-            used.add(controller.unit_id)
-    return frozenset(used)
+    assignments = _adjacent_assignments(turn, set())
+    return frozenset(role.unit_id for role in assignments.values())
 
 
 def task_pioneer_recall_action(
@@ -107,16 +103,20 @@ def task_pioneer_day_return_action(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
+    reserved_role_ids: frozenset[int] = frozenset(),
+    reserved_weapon_ids: frozenset[int] = frozenset(),
 ) -> tuple[PlannedAction, int] | None:
     if not turn.is_day or len(turn.weapons()) < 3:
         return None
-    committed_roles: set[int] = set()
-    staffed_weapons: set[int] = set()
-    for weapon in turn.weapons():
-        controller = _adjacent_controller(turn, weapon, committed_roles)
-        if controller is not None and controller.unit_id != pioneer.unit_id:
-            committed_roles.add(controller.unit_id)
-            staffed_weapons.add(weapon.unit_id)
+    adjacent = _adjacent_assignments(
+        turn,
+        {pioneer.unit_id, *reserved_role_ids},
+        excluded_weapon_ids=reserved_weapon_ids,
+    )
+    committed_roles = {role.unit_id for role in adjacent.values()}
+    staffed_weapons = set(adjacent)
+    committed_roles.update(reserved_role_ids)
+    staffed_weapons.update(reserved_weapon_ids)
     for role_id, plan in state.plans.items():
         if role_id == pioneer.unit_id or not plan.reason.startswith("gunner:"):
             continue
@@ -124,11 +124,16 @@ def task_pioneer_day_return_action(
             weapon_id = int(plan.reason.split(":", 1)[1])
         except ValueError:
             continue
-        if turn.unit(role_id) is not None and turn.unit(weapon_id) is not None:
+        if (
+            weapon_id not in staffed_weapons
+            and turn.unit(role_id) is not None
+            and turn.unit(weapon_id) is not None
+        ):
             committed_roles.add(role_id)
             staffed_weapons.add(weapon_id)
     projected_roles, projected_weapons = _project_daytime_gunners(
         turn,
+        state,
         pioneer,
         committed_roles,
         staffed_weapons,
@@ -200,6 +205,7 @@ def task_pioneer_day_return_action(
 
 def _project_daytime_gunners(
     turn: Turn,
+    state: SessionState,
     pioneer: Unit,
     committed_roles: set[int],
     staffed_weapons: set[int],
@@ -207,56 +213,34 @@ def _project_daytime_gunners(
     deadline: float,
     max_expansions: int,
 ) -> tuple[set[int], set[int]]:
-    roles = tuple(
+    roles = [
         role for role in turn.controllable()
         if role.unit_id != pioneer.unit_id
         and role.unit_id not in committed_roles
-    )
-    weapons = tuple(
+    ]
+    weapons = [
         weapon for weapon in turn.weapons()
         if weapon.unit_id not in staffed_weapons
+    ]
+    assignments = _route_assignments(
+        turn,
+        state,
+        roles,
+        weapons,
+        clock,
+        deadline,
+        max_expansions,
+        respect_positioning_window=False,
     )
-    routes: dict[tuple[int, int], int] = {}
-    for role in roles:
-        for weapon in weapons:
-            route = _gunner_route(
-                turn, role, weapon, clock, deadline, max_expansions,
-            )
-            if route is not None and route[2] <= turn.rounds_until_night:
-                routes[(role.unit_id, weapon.unit_id)] = route[2]
-
-    best_roles: set[int] = set()
-    best_weapons: set[int] = set()
-    best_cost: int | None = None
-
-    def search(index: int, used_roles: set[int], used_weapons: set[int], cost: int) -> None:
-        nonlocal best_roles, best_weapons, best_cost
-        if index == len(roles):
-            if (
-                len(used_weapons) > len(best_weapons)
-                or (
-                    len(used_weapons) == len(best_weapons)
-                    and (best_cost is None or cost < best_cost)
-                )
-            ):
-                best_roles = set(used_roles)
-                best_weapons = set(used_weapons)
-                best_cost = cost
-            return
-        role = roles[index]
-        search(index + 1, used_roles, used_weapons, cost)
-        for weapon in weapons:
-            route_cost = routes.get((role.unit_id, weapon.unit_id))
-            if route_cost is None or weapon.unit_id in used_weapons:
-                continue
-            used_roles.add(role.unit_id)
-            used_weapons.add(weapon.unit_id)
-            search(index + 1, used_roles, used_weapons, cost + route_cost)
-            used_roles.remove(role.unit_id)
-            used_weapons.remove(weapon.unit_id)
-
-    search(0, set(), set(), 0)
-    return best_roles, best_weapons
+    on_time = {
+        weapon_id: role
+        for weapon_id, (role, route) in assignments.items()
+        if route[2] <= turn.rounds_until_night
+    }
+    return (
+        {role.unit_id for role in on_time.values()},
+        set(on_time),
+    )
 
 
 def propose_defense(
@@ -267,16 +251,21 @@ def propose_defense(
     deadline: float,
     max_expansions: int,
     unavailable_role_ids: frozenset[int] = frozenset(),
+    reserved_weapon_ids: frozenset[int] = frozenset(),
 ) -> tuple[PlannedAction, ...]:
     candidates: list[PlannedAction] = []
     used_roles: set[int] = set()
-    staffed_weapons: set[int] = set()
+    staffed_weapons: set[int] = set(reserved_weapon_ids)
     projected_damage: dict[int, int] = {}
 
+    adjacent = _adjacent_assignments(
+        turn,
+        used_roles | set(unavailable_role_ids),
+        state,
+        reserved_weapon_ids,
+    )
     for weapon in turn.weapons():
-        controller = _adjacent_controller(
-            turn, weapon, used_roles | set(unavailable_role_ids),
-        )
+        controller = adjacent.get(weapon.unit_id)
         if controller is None:
             continue
         used_roles.add(controller.unit_id)
@@ -404,23 +393,68 @@ def _robots_on_ray(
     return tuple(item[2] for item in sorted(on_ray))
 
 
-def _adjacent_controller(
+def _adjacent_assignments(
     turn: Turn,
-    weapon: Unit,
-    used_roles: set[int],
-) -> Unit | None:
-    controllers = [
+    excluded_role_ids: set[int],
+    state: SessionState | None = None,
+    excluded_weapon_ids: frozenset[int] = frozenset(),
+) -> dict[int, Unit]:
+    roles = tuple(
         role for role in turn.controllable()
-        if role.unit_id not in used_roles
+        if role.unit_id not in excluded_role_ids
         and not _needs_emergency_medicine(role)
-        and distance(role.pos, weapon.pos) == 1
-    ]
-    if not controllers:
-        return None
-    return min(
-        controllers,
-        key=lambda role: (role.kind != "worker", role.unit_id),
     )
+    weapons = tuple(
+        weapon for weapon in turn.weapons()
+        if weapon.unit_id not in excluded_weapon_ids
+    )
+    best: dict[int, Unit] = {}
+    best_score: tuple[int, int, int] | None = None
+    best_pairs: tuple[tuple[int, int], ...] | None = None
+
+    def search(index: int, used_roles: set[int], assigned: dict[int, Unit]) -> None:
+        nonlocal best, best_score, best_pairs
+        if index == len(weapons):
+            planned = 0
+            if state is not None:
+                planned = sum(
+                    state.plans.get(role.unit_id) is not None
+                    and state.plans[role.unit_id].reason == f"gunner:{weapon_id}"
+                    for weapon_id, role in assigned.items()
+                )
+            score = (
+                len(assigned),
+                planned,
+                sum(role.kind == "worker" for role in assigned.values()),
+            )
+            pairs = tuple(sorted(
+                (weapon_id, role.unit_id) for weapon_id, role in assigned.items()
+            ))
+            if (
+                best_score is None
+                or score > best_score
+                or (score == best_score and (best_pairs is None or pairs < best_pairs))
+            ):
+                best = dict(assigned)
+                best_score = score
+                best_pairs = pairs
+            return
+        weapon = weapons[index]
+        search(index + 1, used_roles, assigned)
+        for role in roles:
+            if (
+                role.unit_id in used_roles
+                or distance(role.pos, weapon.pos) != 1
+            ):
+                continue
+            used_roles.add(role.unit_id)
+            assigned[weapon.unit_id] = role
+            search(index + 1, used_roles, assigned)
+            assigned.pop(weapon.unit_id)
+            used_roles.remove(role.unit_id)
+
+    search(0, set(), {})
+    return best
 
 
 def _position_gunners(
@@ -440,49 +474,21 @@ def _position_gunners(
         and role.unit_id not in unavailable_role_ids
         and not _needs_emergency_medicine(role)
     ]
-    available.sort(key=lambda role: (role.kind != "worker", role.unit_id))
     unstaffed = [
         weapon for weapon in turn.weapons()
         if weapon.unit_id not in staffed_weapons
     ]
-    unstaffed.sort(key=lambda weapon: weapon.unit_id)
-
+    assignments = _route_assignments(
+        turn, state, available, unstaffed, clock, deadline, max_expansions,
+    )
     for weapon in unstaffed:
-        if not available or clock() >= deadline:
-            break
-        planned = _planned_controller(state, available, weapon)
-        routes = []
-        for role in available:
-            route = _gunner_route(
-                turn, role, weapon, clock, deadline, max_expansions,
-            )
-            if route is not None:
-                routes.append((role, route))
-            if clock() >= deadline:
-                break
-        if not routes:
+        assigned = assignments.get(weapon.unit_id)
+        if assigned is None:
             continue
-        role, route = min(
-            routes,
-            key=lambda item: (
-                item[1][2] > turn.rounds_until_night,
-                item[0] != planned,
-                item[1][2],
-                item[0].kind != "worker",
-                item[0].unit_id,
-            ),
-        )
+        role, route = assigned
         stand, step, route_cost = route
-        if (
-            turn.is_day
-            and turn.rounds_until_night > DUSK_POSITIONING_ROUNDS
-            and route_cost < turn.rounds_until_night
-            and planned is None
-        ):
-            continue
         if step is None:
             used_roles.add(role.unit_id)
-            available.remove(role)
             continue
         result.append(PlannedAction(
             ActionProposal(
@@ -496,21 +502,94 @@ def _position_gunners(
             turn.round_no + max(turn.rounds_until_night, route_cost, 1),
         ))
         used_roles.add(role.unit_id)
-        available.remove(role)
     return result
 
 
-def _planned_controller(
+def _route_assignments(
+    turn: Turn,
     state: SessionState,
     roles: list[Unit],
-    weapon: Unit,
-) -> Unit | None:
-    reason = f"gunner:{weapon.unit_id}"
-    return next((
-        role for role in roles
-        if state.plans.get(role.unit_id) is not None
-        and state.plans[role.unit_id].reason == reason
-    ), None)
+    weapons: list[Unit],
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    respect_positioning_window: bool = True,
+) -> dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]]:
+    routes: dict[tuple[int, int], tuple[Pos, Pos | None, int]] = {}
+    for role in roles:
+        for weapon in weapons:
+            route = _gunner_route(
+                turn, role, weapon, clock, deadline, max_expansions,
+            )
+            if route is None:
+                continue
+            planned = state.plans.get(role.unit_id)
+            if (
+                respect_positioning_window
+                and turn.is_day
+                and turn.rounds_until_night > DUSK_POSITIONING_ROUNDS
+                and route[2] < turn.rounds_until_night
+                and (
+                    planned is None
+                    or planned.reason != f"gunner:{weapon.unit_id}"
+                )
+            ):
+                continue
+            routes[(role.unit_id, weapon.unit_id)] = route
+            if clock() >= deadline:
+                break
+        if clock() >= deadline:
+            break
+
+    best: dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]] = {}
+    best_score: tuple[int, int, int, int, int] | None = None
+    best_pairs: tuple[tuple[int, int], ...] | None = None
+
+    def search(
+        index: int,
+        used_roles: set[int],
+        assigned: dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]],
+    ) -> None:
+        nonlocal best, best_score, best_pairs
+        if index == len(weapons):
+            score = (
+                sum(route[2] <= turn.rounds_until_night for _, route in assigned.values()),
+                len(assigned),
+                sum(
+                    state.plans.get(role.unit_id) is not None
+                    and state.plans[role.unit_id].reason == f"gunner:{weapon_id}"
+                    for weapon_id, (role, _) in assigned.items()
+                ),
+                -sum(route[2] for _, route in assigned.values()),
+                sum(role.kind == "worker" for role, _ in assigned.values()),
+            )
+            pairs = tuple(sorted(
+                (weapon_id, role.unit_id) for weapon_id, (role, _) in assigned.items()
+            ))
+            if (
+                best_score is None
+                or score > best_score
+                or (score == best_score and (best_pairs is None or pairs < best_pairs))
+            ):
+                best = dict(assigned)
+                best_score = score
+                best_pairs = pairs
+            return
+        weapon = weapons[index]
+        search(index + 1, used_roles, assigned)
+        for role in roles:
+            route = routes.get((role.unit_id, weapon.unit_id))
+            if route is None or role.unit_id in used_roles:
+                continue
+            used_roles.add(role.unit_id)
+            assigned[weapon.unit_id] = (role, route)
+            search(index + 1, used_roles, assigned)
+            assigned.pop(weapon.unit_id)
+            used_roles.remove(role.unit_id)
+
+    search(0, set(), {})
+    return best
 
 
 def _gunner_route(

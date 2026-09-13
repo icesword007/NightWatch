@@ -870,6 +870,39 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(response["prompt"], "")
         self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
 
+    def test_error_code_two_requests_improvement_without_fabricated_resubmit(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        engine.decide(active)
+
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 2
+        answer["llmResp"] = (
+            '{"kind":"answer","content":"supported partial","complete":false}'
+        )
+        self.assertEqual(
+            engine.decide(answer)["roleCommandMap"]["10011"]["action"],
+            "submitAnswer",
+        )
+
+        rejected = copy.deepcopy(active)
+        rejected["roundNo"] = 3
+        rejected["lastRoundRoleActionResults"] = {"10011": False}
+        rejected["errors"] = [{"errorCode": 2, "description": "incomplete"}]
+        response = engine.decide(rejected)
+        self.assertTrue(response["prompt"])
+        self.assertIn("failed or was incomplete", response["prompt"])
+        self.assertNotIn("10011", response["roleCommandMap"])
+
+        unchanged = copy.deepcopy(active)
+        unchanged["roundNo"] = 4
+        unchanged["llmResp"] = answer["llmResp"]
+        response = engine.decide(unchanged)
+        self.assertTrue(response["prompt"])
+        self.assertNotIn("10011", response["roleCommandMap"])
+
     def test_immediate_task_pioneer_attack_excludes_same_round_submit(self):
         # Break caught: one pioneer is promised to both a weapon and submitAnswer.
         engine = DecisionEngine()
