@@ -1,5 +1,6 @@
 import copy
 import concurrent.futures
+import hashlib
 import importlib
 import json
 import threading
@@ -72,6 +73,113 @@ class StateTests(unittest.TestCase):
         self.assertTrue(all(response == responses[0] for response in responses))
         self.assertEqual(engine.state.state.observation_count, 1)
         self.assertEqual(len(engine.state.state.pending_actions), 1)
+
+    def test_duplicate_request_reuses_matching_response_trace(self):
+        engine = brain.DecisionEngine()
+        payload = load_fixture()
+        traces = []
+
+        first = engine.decide(payload, trace_sink=traces.append)
+        second = engine.decide(copy.deepcopy(payload), trace_sink=traces.append)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(traces), 2)
+        self.assertEqual(traces[0], traces[1])
+        self.assertEqual(traces[0]["roundNo"], payload["roundNo"])
+
+    def test_concurrent_duplicate_traces_do_not_mix_between_requests(self):
+        engine = brain.DecisionEngine()
+        payload = load_fixture()
+
+        def decide_once(_):
+            local_trace = []
+            response = engine.decide(
+                copy.deepcopy(payload), trace_sink=local_trace.append,
+            )
+            return response, local_trace
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(decide_once, range(8)))
+
+        first_response, first_trace = results[0]
+        self.assertEqual(len(first_trace), 1)
+        for response, trace in results:
+            self.assertEqual(response, first_response)
+            self.assertEqual(trace, first_trace)
+
+    def test_task_trace_hashes_private_command_and_result_with_known_budget(self):
+        engine = brain.DecisionEngine()
+        payload = load_fixture()
+        payload["teamOur"]["teamId"] = "trace-task"
+        payload["teamOur"]["roles"][0]["roleType"] = "pioneer"
+        payload["teamOur"]["playerTasks"] = [{
+            "taskType": "private type",
+            "taskPosition": {"x": 1, "y": 1},
+            "coldDownRounds": 0,
+            "scoreReward": 10,
+            "goldReward": 10,
+            "isValid": True,
+            "timeoutRounds": 5,
+        }]
+        accept_traces = []
+        accepted = engine.decide(payload, trace_sink=accept_traces.append)
+        self.assertEqual(
+            accepted["roleCommandMap"]["10010"]["action"], "acceptTask",
+        )
+        self.assertNotIn(
+            "private type", json.dumps(accept_traces[0], ensure_ascii=False),
+        )
+
+        active = copy.deepcopy(payload)
+        active["roundNo"] = 2
+        active["phaseTask"] = "private task text"
+        active["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(active)
+
+        command_text = "private command text"
+        command_turn = copy.deepcopy(active)
+        command_turn["roundNo"] = 3
+        command_turn["llmResp"] = json.dumps({
+            "kind": "command", "content": command_text,
+        })
+        command_traces = []
+        response = engine.decide(command_turn, trace_sink=command_traces.append)
+        self.assertEqual(response["executeCmd"], command_text)
+
+        result_text = "[exitCode:0]\nprivate output text"
+        result_turn = copy.deepcopy(active)
+        result_turn["roundNo"] = 4
+        result_turn["llmResp"] = ""
+        result_turn["lastCmdResult"] = result_text
+        result_traces = []
+        engine.decide(result_turn, trace_sink=result_traces.append)
+        trace = result_traces[0]
+        encoded = json.dumps(trace, ensure_ascii=False)
+
+        self.assertEqual(trace["taskInstanceId"], "1:1")
+        self.assertEqual(trace["taskRemainingRounds"], 2)
+        self.assertEqual(
+            command_traces[0]["commandFingerprint"],
+            hashlib.sha256(command_text.encode()).hexdigest()[:16],
+        )
+        self.assertEqual(
+            trace["resultFingerprint"],
+            hashlib.sha256(result_text.encode()).hexdigest()[:16],
+        )
+        self.assertIsNotNone(trace["cycleFingerprint"])
+        for private in ("private task text", command_text, "private output text"):
+            self.assertNotIn(private, encoded)
+
+    def test_late_command_result_is_not_fingerprinted_as_current_task_evidence(self):
+        engine = brain.DecisionEngine()
+        payload = load_fixture()
+        payload["phaseTask"] = "private task"
+        payload["lastCmdResult"] = "late private output"
+        traces = []
+
+        engine.decide(payload, trace_sink=traces.append)
+
+        self.assertIsNone(traces[0]["resultFingerprint"])
 
     def test_expired_improvement_budget_keeps_complete_basic_response(self):
         # Break caught: deadline expiry returns a partial or malformed response.

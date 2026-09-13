@@ -1,6 +1,6 @@
 import time
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from .actions import ActionProposal, PlannedAction
@@ -26,6 +26,27 @@ from .state import SessionState
 MINERALS = ("stone", "iron", "copper")
 TOWER_ORDER = ("gatling", "railgun", "rocket")
 MAX_WEAPONS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class FundingRoute:
+    rounds: int
+    vendor: Pos | None
+    vendor_stand: Pos | None
+    shop: Pos | None
+    shop_stand: Pos | None
+    use_target_id: int | None
+    use_stand: Pos
+    post_weapon_id: int
+    post_stand: Pos
+
+
+@dataclass(frozen=True, slots=True)
+class BuildingFundingRoute:
+    rounds: int
+    vendor: Pos
+    vendor_stand: Pos
+    build_stand: Pos
 
 
 def propose_economy(
@@ -58,9 +79,12 @@ def propose_economy(
     for role in turn.controllable():
         if clock() >= deadline:
             break
-        candidate = _maintenance_action(
-            turn, role, clock, deadline, max_expansions,
-        )
+        plan = state.plans.get(role.unit_id)
+        candidate = None
+        if plan is None or not plan.reason.startswith("fund:"):
+            candidate = _maintenance_action(
+                turn, role, clock, deadline, max_expansions,
+            )
         if (
             role.unit_id in reserved_role_ids
             and candidate is not None
@@ -116,11 +140,14 @@ def propose_economy(
             candidates.append(candidate)
             if (
                 candidate.plan_reason
-                and candidate.plan_reason.startswith("build:")
+                and (
+                    candidate.plan_reason.startswith("build:")
+                    or candidate.plan_reason.startswith("fund:build:")
+                )
                 and candidate.plan_target is not None
             ):
                 claimed_build_targets.add(candidate.plan_target)
-                claimed_tower_types.add(candidate.plan_reason.split(":", 1)[1])
+                claimed_tower_types.add(candidate.plan_reason.rsplit(":", 1)[1])
             action = candidate.proposal.command["action"]
             if action == "build" and candidate.proposal.command.get("name") in TOWER_TYPES:
                 claimed_gold += 25
@@ -246,6 +273,41 @@ def _continue_plan(
             turn, worker, target.pos, plan.reason, plan.deadline_round,
             clock, deadline, max_expansions,
         )
+    if plan.reason.startswith("fund:build:"):
+        kind = plan.reason.rsplit(":", 1)[1]
+        return _funding_build_action(
+            turn,
+            worker,
+            plan.target,
+            kind,
+            plan.deadline_round,
+            clock,
+            deadline,
+            max_expansions,
+        )
+    if plan.reason.startswith("fund:"):
+        parts = plan.reason.split(":")
+        item = parts[1]
+        try:
+            post_weapon_id = int(parts[2]) if len(parts) == 3 else None
+            if len(parts) >= 4:
+                post_weapon_id = int(parts[2])
+                use_target_id = int(parts[3]) or None
+            else:
+                use_target_id = None
+        except ValueError:
+            return None
+        return _funding_action(
+            turn,
+            worker,
+            item,
+            plan.deadline_round,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=post_weapon_id,
+            preferred_use_target_id=use_target_id,
+        )
     if plan.reason.startswith("mine:"):
         if worker.backpack_full or turn.zones.get(plan.target) not in MINERALS:
             return None
@@ -305,7 +367,6 @@ def _tower_action(
         not turn.is_day
         or turn.station() is None
         or len(weapons) + len(claimed_types) >= MAX_WEAPONS
-        or available_gold < 25
     ):
         return None
     existing = Counter(weapon.kind for weapon in weapons)
@@ -327,6 +388,36 @@ def _tower_action(
         return None
     if turn.rounds_until_night < distance(worker.pos, target):
         return None
+    if available_gold < 25:
+        inventory_value = sum(
+            turn.vendor_prices.get(item, 0)
+            for item in worker.backpack
+            if item in MINERALS
+        )
+        if available_gold + inventory_value < 25:
+            return None
+        route = _building_funding_chain(
+            turn,
+            worker,
+            target,
+            25 - available_gold,
+            clock,
+            deadline,
+            max_expansions,
+        )
+        if route is None or route.rounds > turn.rounds_until_night:
+            return None
+        return _funding_build_action(
+            turn,
+            worker,
+            target,
+            kind,
+            turn.round_no + turn.rounds_until_night - 1,
+            clock,
+            deadline,
+            max_expansions,
+            verified_route=route,
+        )
     return _build_or_move(
         turn, worker, target, kind, clock, deadline, max_expansions,
     )
@@ -369,6 +460,23 @@ def _trade_or_mine(
 ) -> PlannedAction | None:
     minerals = Counter(item for item in worker.backpack if item in MINERALS)
     vendors = turn.zones_of("vendor")
+    funded = _fundable_purchase(
+        turn, worker, available_gold, clock, deadline, max_expansions,
+    )
+    if funded is not None:
+        item, hard_deadline, route = funded
+        candidate = _funding_action(
+            turn,
+            worker,
+            item,
+            hard_deadline,
+            clock,
+            deadline,
+            max_expansions,
+            verified_route=route,
+        )
+        if candidate is not None:
+            return candidate
     if minerals and vendors:
         adjacent = next((pos for pos in vendors if distance(worker.pos, pos) == 1), None)
         if adjacent is not None:
@@ -423,6 +531,710 @@ def _trade_or_mine(
     return _collect_or_move(
         turn, worker, target, clock, deadline, max_expansions,
     )
+
+
+def _fundable_purchase(
+    turn: Turn,
+    worker: Unit,
+    available_gold: int,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[str, int, FundingRoute] | None:
+    if not turn.is_day or worker.backpack_full:
+        return None
+    inventory_value = sum(
+        turn.vendor_prices.get(item, 0)
+        for item in worker.backpack
+        if item in MINERALS
+    )
+    for item in _purchase_candidates(turn, worker):
+        price = turn.weapon_prices.get(item)
+        if (
+            price is None
+            or price <= available_gold
+            or price > available_gold + inventory_value
+        ):
+            continue
+        route = _funding_chain(
+            turn,
+            worker,
+            item,
+            price - available_gold,
+            clock,
+            deadline,
+            max_expansions,
+        )
+        if route is not None and route.rounds <= turn.rounds_until_night:
+            return item, turn.round_no + turn.rounds_until_night - 1, route
+    return None
+
+
+def _funding_build_action(
+    turn: Turn,
+    worker: Unit,
+    target: Pos,
+    kind: str,
+    hard_deadline: int | None,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    verified_route: BuildingFundingRoute | None = None,
+) -> PlannedAction | None:
+    reason = f"fund:build:{kind}"
+    if (
+        not turn.is_day
+        or turn.station() is None
+        or len(turn.weapons()) >= MAX_WEAPONS
+        or not _build_target_available(turn, target)
+        or hard_deadline is None
+        or turn.round_no > hard_deadline
+    ):
+        return None
+    if turn.gold >= 25:
+        build_route = _best_adjacent_route(
+            turn, worker, target, clock, deadline, max_expansions,
+        )
+        if build_route is None or build_route[1] + 1 > turn.rounds_until_night:
+            return None
+        build_stand, route_cost = build_route
+        proposal = (
+            ActionProposal(
+                worker.unit_id,
+                worker.unit_id,
+                build_command(target, kind),
+                destination=target,
+            )
+            if worker.pos == build_stand
+            else _move_to_stand(
+                turn,
+                worker,
+                build_stand,
+                clock,
+                deadline,
+                max_expansions,
+            )
+        )
+        if proposal is None:
+            return None
+        return PlannedAction(
+            proposal, target, reason, hard_deadline,
+            route_cost + 1,
+        )
+    minerals = Counter(entry for entry in worker.backpack if entry in MINERALS)
+    chain_rounds = _building_funding_chain(
+        turn,
+        worker,
+        target,
+        25 - turn.gold,
+        clock,
+        deadline,
+        max_expansions,
+    )
+    route = verified_route or chain_rounds
+    if route is None or route.rounds > turn.rounds_until_night:
+        return None
+    sale = _sale_for_deficit(turn, minerals, 25 - turn.gold)
+    if sale is None:
+        return None
+    name, quantity = sale
+    vendor = route.vendor
+    if worker.pos == route.vendor_stand:
+        return PlannedAction(
+            ActionProposal(
+                worker.unit_id,
+                worker.unit_id,
+                sell_command(name, quantity),
+            ),
+            target,
+            reason,
+            hard_deadline,
+            route.rounds,
+        )
+    proposal = _move_to_stand(
+        turn,
+        worker,
+        route.vendor_stand,
+        clock,
+        deadline,
+        max_expansions,
+    )
+    if proposal is None:
+        return None
+    return PlannedAction(
+        proposal,
+        target,
+        reason,
+        hard_deadline,
+        route.rounds,
+    )
+
+
+def _building_funding_chain(
+    turn: Turn,
+    worker: Unit,
+    target: Pos,
+    deficit: int,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> BuildingFundingRoute | None:
+    minerals = Counter(entry for entry in worker.backpack if entry in MINERALS)
+    sale_actions = 0
+    remaining = deficit
+    for name in sorted(
+        minerals,
+        key=lambda entry: (turn.vendor_prices.get(entry, 0), entry),
+        reverse=True,
+    ):
+        price = turn.vendor_prices.get(name, 0)
+        if price <= 0:
+            continue
+        used = min(minerals[name], (remaining + price - 1) // price)
+        if used:
+            remaining -= used * price
+            sale_actions += 1
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        return None
+    best = None
+    for vendor in turn.zones_of("vendor"):
+        vendor_route = _best_adjacent_route(
+            turn, worker, vendor, clock, deadline, max_expansions,
+        )
+        if vendor_route is None:
+            continue
+        vendor_stand, vendor_cost = vendor_route
+        from_vendor = replace(worker, pos=vendor_stand)
+        build_route = _best_adjacent_route(
+            turn,
+            from_vendor,
+            target,
+            clock,
+            deadline,
+            max_expansions,
+        )
+        if build_route is None:
+            continue
+        build_stand, build_cost = build_route
+        rounds = vendor_cost + sale_actions + build_cost + 1
+        candidate = BuildingFundingRoute(
+            rounds, vendor, vendor_stand, build_stand,
+        )
+        if best is None or (
+            candidate.rounds, candidate.vendor.x, candidate.vendor.y
+        ) < (
+            best.rounds, best.vendor.x, best.vendor.y
+        ):
+            best = candidate
+    return best
+
+
+def _funding_action(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    hard_deadline: int | None,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    preferred_post_id: int | None = None,
+    preferred_use_target_id: int | None = None,
+    verified_route: FundingRoute | None = None,
+) -> PlannedAction | None:
+    if hard_deadline is not None and turn.round_no > hard_deadline:
+        return None
+    if (
+        item not in worker.backpack
+        and preferred_post_id is not None
+        and not _fund_target_still_needs(
+            turn, worker, item, preferred_use_target_id,
+        )
+    ):
+        return _post_action(
+            turn,
+            worker,
+            item,
+            preferred_post_id,
+            hard_deadline,
+            clock,
+            deadline,
+            max_expansions,
+        )
+    if item in worker.backpack:
+        route = _held_item_route(
+            turn,
+            worker,
+            item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=preferred_post_id,
+            preferred_use_target_id=preferred_use_target_id,
+        )
+        if route is None or route.rounds > turn.rounds_until_night:
+            return None
+        reason = _fund_reason(item, route)
+        target = turn.unit(route.use_target_id) if route.use_target_id else None
+        if item == "Medicine" and worker.pos == route.use_stand:
+            if worker.health >= _max_role_health(worker):
+                return None
+            return PlannedAction(
+                ActionProposal(
+                    worker.unit_id,
+                    worker.unit_id,
+                    use_command(item),
+                    item_costs=(item,),
+                ),
+                worker.pos,
+                reason,
+                hard_deadline,
+                route.rounds,
+            )
+        if worker.pos == route.use_stand:
+            return PlannedAction(
+                ActionProposal(
+                    worker.unit_id,
+                    worker.unit_id,
+                    use_command(item, target.pos),
+                    item_costs=(item,),
+                ),
+                target.pos,
+                reason,
+                hard_deadline,
+                route.rounds,
+            )
+        proposal = _move_to_stand(
+            turn,
+            worker,
+            route.use_stand,
+            clock,
+            deadline,
+            max_expansions,
+        )
+        if proposal is None:
+            return None
+        return PlannedAction(
+            proposal,
+            target.pos,
+            reason,
+            hard_deadline,
+            route.rounds,
+        )
+
+    price = turn.weapon_prices.get(item)
+    if price is None:
+        return None
+    if turn.gold >= price:
+        route = _purchase_route(
+            turn,
+            worker,
+            item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=preferred_post_id,
+            preferred_use_target_id=preferred_use_target_id,
+        )
+        if route is None or route.rounds > turn.rounds_until_night:
+            return None
+        reason = _fund_reason(item, route)
+        if worker.pos == route.shop_stand:
+            proposal = ActionProposal(
+                worker.unit_id,
+                worker.unit_id,
+                buy_command(item),
+            )
+        else:
+            proposal = _move_to_stand(
+                turn,
+                worker,
+                route.shop_stand,
+                clock,
+                deadline,
+                max_expansions,
+            )
+        if proposal is None:
+            return None
+        return PlannedAction(
+            proposal,
+            route.shop,
+            reason,
+            hard_deadline,
+            route.rounds,
+        )
+
+    minerals = Counter(entry for entry in worker.backpack if entry in MINERALS)
+    if not minerals:
+        return None
+    chain = _funding_chain(
+        turn,
+        worker,
+        item,
+        price - turn.gold,
+        clock,
+        deadline,
+        max_expansions,
+        preferred_post_id=preferred_post_id,
+    )
+    route = verified_route or chain
+    if route is None or route.rounds > turn.rounds_until_night:
+        return None
+    reason = _fund_reason(item, route)
+    sale = _sale_for_deficit(turn, minerals, price - turn.gold)
+    if sale is None:
+        return None
+    name, quantity = sale
+    vendor = route.vendor
+    if vendor is None:
+        return None
+    if worker.pos == route.vendor_stand:
+        return PlannedAction(
+            ActionProposal(
+                worker.unit_id,
+                worker.unit_id,
+                sell_command(name, quantity),
+            ),
+            vendor,
+            reason,
+            hard_deadline,
+            route.rounds,
+        )
+    proposal = _move_to_stand(
+        turn,
+        worker,
+        route.vendor_stand,
+        clock,
+        deadline,
+        max_expansions,
+    )
+    if proposal is None:
+        return None
+    return PlannedAction(
+        proposal,
+        vendor,
+        reason,
+        hard_deadline,
+        route.rounds,
+    )
+
+
+def _sale_for_deficit(
+    turn: Turn,
+    minerals: Counter[str],
+    deficit: int,
+) -> tuple[str, int] | None:
+    choices = sorted(
+        (
+            (turn.vendor_prices.get(name, 0), name, count)
+            for name, count in minerals.items()
+        ),
+        reverse=True,
+    )
+    for price, name, count in choices:
+        if price <= 0:
+            continue
+        quantity = min(count, (deficit + price - 1) // price)
+        if quantity:
+            return name, quantity
+    return None
+
+
+def _funding_chain(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    deficit: int,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    preferred_post_id: int | None = None,
+    preferred_use_target_id: int | None = None,
+) -> FundingRoute | None:
+    minerals = Counter(entry for entry in worker.backpack if entry in MINERALS)
+    sale_actions = 0
+    remaining = deficit
+    for name in sorted(
+        minerals,
+        key=lambda entry: (turn.vendor_prices.get(entry, 0), entry),
+        reverse=True,
+    ):
+        price = turn.vendor_prices.get(name, 0)
+        if price <= 0:
+            continue
+        used = min(minerals[name], (remaining + price - 1) // price)
+        if used:
+            remaining -= used * price
+            sale_actions += 1
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        return None
+
+    best: FundingRoute | None = None
+    for vendor in turn.zones_of("vendor"):
+        vendor_route = _best_adjacent_route(
+            turn, worker, vendor, clock, deadline, max_expansions,
+        )
+        if vendor_route is None:
+            continue
+        vendor_stand, vendor_cost = vendor_route
+        at_vendor = replace(worker, pos=vendor_stand)
+        purchase = _purchase_route(
+            turn,
+            at_vendor,
+            item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=preferred_post_id,
+            preferred_use_target_id=preferred_use_target_id,
+        )
+        if purchase is None:
+            continue
+        candidate = FundingRoute(
+            vendor_cost + sale_actions + purchase.rounds,
+            vendor,
+            vendor_stand,
+            purchase.shop,
+            purchase.shop_stand,
+            purchase.use_target_id,
+            purchase.use_stand,
+            purchase.post_weapon_id,
+            purchase.post_stand,
+        )
+        if best is None or _funding_route_key(candidate) < _funding_route_key(best):
+            best = candidate
+    return best
+
+
+def _purchase_route(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    preferred_post_id: int | None = None,
+    preferred_use_target_id: int | None = None,
+) -> FundingRoute | None:
+    best = None
+    for shop in turn.zones_of("weaponShop"):
+        shop_route = _best_adjacent_route(
+            turn, worker, shop, clock, deadline, max_expansions,
+        )
+        if shop_route is None:
+            continue
+        shop_stand, shop_cost = shop_route
+        at_shop = replace(worker, pos=shop_stand)
+        held = _held_item_route(
+            turn,
+            at_shop,
+            item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=preferred_post_id,
+            preferred_use_target_id=preferred_use_target_id,
+        )
+        if held is None:
+            continue
+        candidate = FundingRoute(
+            shop_cost + 1 + held.rounds,
+            None,
+            None,
+            shop,
+            shop_stand,
+            held.use_target_id,
+            held.use_stand,
+            held.post_weapon_id,
+            held.post_stand,
+        )
+        if best is None or _funding_route_key(candidate) < _funding_route_key(best):
+            best = candidate
+    return best
+
+
+def _held_item_route(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    preferred_post_id: int | None = None,
+    preferred_use_target_id: int | None = None,
+) -> FundingRoute | None:
+    target = (
+        turn.unit(preferred_use_target_id)
+        if preferred_use_target_id is not None
+        else _item_target(turn, item)
+    )
+    if item == "Medicine":
+        use_routes = ((worker.pos, 0, None),)
+    elif target is None or not _fund_target_still_needs(
+        turn, worker, item, target.unit_id,
+    ):
+        return None
+    else:
+        use_routes = tuple(
+            (stand, cost, target.unit_id)
+            for stand, cost in _routes_to_adjacent(
+                turn, worker, target.pos, clock, deadline, max_expansions,
+            )
+        )
+    best = None
+    for use_stand, use_cost, target_id in use_routes:
+        at_use = replace(worker, pos=use_stand)
+        for weapon, post_stand, post_cost in _post_routes(
+            turn,
+            at_use,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=preferred_post_id,
+        ):
+            candidate = FundingRoute(
+                use_cost + 1 + post_cost,
+                None,
+                None,
+                None,
+                None,
+                target_id,
+                use_stand,
+                weapon.unit_id,
+                post_stand,
+            )
+            if best is None or _funding_route_key(candidate) < _funding_route_key(best):
+                best = candidate
+    return best
+
+
+def _post_routes(
+    turn: Turn,
+    worker: Unit,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    preferred_post_id: int | None = None,
+) -> tuple[tuple[Unit, Pos, int], ...]:
+    result = []
+    for weapon in turn.weapons():
+        if preferred_post_id is not None and weapon.unit_id != preferred_post_id:
+            continue
+        staffed_by_other = any(
+            role.unit_id != worker.unit_id
+            and distance(role.pos, weapon.pos) == 1
+            for role in turn.controllable()
+        )
+        if staffed_by_other:
+            continue
+        for stand, cost in _routes_to_adjacent(
+            turn, worker, weapon.pos, clock, deadline, max_expansions,
+        ):
+            result.append((weapon, stand, cost))
+    return tuple(result)
+
+
+def _post_action(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    post_weapon_id: int | None,
+    hard_deadline: int | None,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    routes = _post_routes(
+        turn,
+        worker,
+        clock,
+        deadline,
+        max_expansions,
+        preferred_post_id=post_weapon_id,
+    )
+    if not routes:
+        return None
+    weapon, stand, route_cost = min(
+        routes,
+        key=lambda route: (route[2], route[0].unit_id, route[1].x, route[1].y),
+    )
+    if route_cost > turn.rounds_until_night or worker.pos == stand:
+        return None
+    path = next_step(
+        turn,
+        worker,
+        stand,
+        clock=clock,
+        deadline=deadline,
+        max_expansions=max_expansions,
+    )
+    if path.status != "found" or path.step is None:
+        return None
+    return PlannedAction(
+        ActionProposal(
+            worker.unit_id,
+            worker.unit_id,
+            move_command(path.step),
+            destination=path.step,
+        ),
+        weapon.pos,
+        f"fund:{item}:{weapon.unit_id}",
+        hard_deadline,
+        route_cost,
+    )
+
+
+def _funding_route_key(route: FundingRoute) -> tuple[int, int, int, int, int]:
+    vendor = route.vendor or Pos(10**9, 10**9)
+    shop = route.shop or Pos(10**9, 10**9)
+    return (
+        route.rounds,
+        vendor.x,
+        vendor.y,
+        shop.x,
+        shop.y,
+    )
+
+
+def _fund_reason(item: str, route: FundingRoute) -> str:
+    return (
+        f"fund:{item}:{route.post_weapon_id}:"
+        f"{route.use_target_id or 0}"
+    )
+
+
+def _fund_target_still_needs(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    target_id: int | None,
+) -> bool:
+    if item == "Medicine":
+        return worker.health < _max_role_health(worker)
+    target = turn.unit(target_id) if target_id is not None else None
+    if target is None:
+        return False
+    if item == "WallFixer":
+        return target.kind == WALL and target.health < _max_building_health(target)
+    if not item.endswith(("1", "2")):
+        return False
+    required_level = int(item[-1])
+    if item.startswith("WeaponUpgradeVoucher"):
+        return target.kind in TOWER_TYPES and target.level == required_level
+    if item.startswith("StationUpgradeVoucher"):
+        return target.kind == STATION and target.level == required_level
+    if item.startswith("WallUpgradeVoucher"):
+        return target.kind == WALL and target.level == required_level
+    return False
 
 
 def _collect_or_move(
@@ -580,7 +1392,21 @@ def _route_cost_to_adjacent(
     deadline: float,
     max_expansions: int,
 ) -> int | None:
-    costs = []
+    routes = _routes_to_adjacent(
+        turn, worker, target, clock, deadline, max_expansions,
+    )
+    return min((cost for _, cost in routes), default=None)
+
+
+def _routes_to_adjacent(
+    turn: Turn,
+    worker: Unit,
+    target: Pos,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[tuple[Pos, int], ...]:
+    routes = []
     for stand in _adjacent_stands(turn, worker, target):
         path = next_step(
             turn,
@@ -591,12 +1417,58 @@ def _route_cost_to_adjacent(
             max_expansions=max_expansions,
         )
         if path.status == "already_there":
-            costs.append(0)
+            routes.append((stand, 0))
         elif path.status == "found" and path.cost is not None:
-            costs.append(path.cost)
+            routes.append((stand, path.cost))
         elif path.status in ("deadline", "expansion_limit"):
-            return None
-    return min(costs) if costs else None
+            return ()
+    return tuple(routes)
+
+
+def _best_adjacent_route(
+    turn: Turn,
+    worker: Unit,
+    target: Pos,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[Pos, int] | None:
+    routes = _routes_to_adjacent(
+        turn, worker, target, clock, deadline, max_expansions,
+    )
+    return min(
+        routes,
+        key=lambda route: (route[1], route[0].x, route[0].y),
+        default=None,
+    )
+
+
+def _move_to_stand(
+    turn: Turn,
+    worker: Unit,
+    stand: Pos | None,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> ActionProposal | None:
+    if stand is None or worker.pos == stand:
+        return None
+    path = next_step(
+        turn,
+        worker,
+        stand,
+        clock=clock,
+        deadline=deadline,
+        max_expansions=max_expansions,
+    )
+    if path.status != "found" or path.step is None:
+        return None
+    return ActionProposal(
+        worker.unit_id,
+        worker.unit_id,
+        move_command(path.step),
+        destination=path.step,
+    )
 
 
 def _item_target(turn: Turn, item: str) -> Unit | None:

@@ -44,6 +44,7 @@ class PlannedAction:
     plan_target: Pos | None = None
     plan_reason: str | None = None
     deadline_round: int | None = None
+    estimated_rounds: int | None = None
 
 
 class ActionAllocator:

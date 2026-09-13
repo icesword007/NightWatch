@@ -65,11 +65,14 @@ class TaskMemory:
     solver_history_truncated: bool = False
     solver_stopped_reason: str | None = None
     last_tool_result_fingerprint: str | None = None
+    last_accepted_cmd_result_round: int | None = None
     repeated_tool_result_count: int = 0
     last_command: str | None = None
     last_cycle_fingerprint: str | None = None
     repeated_cycle_count: int = 0
     final_answer_requested: bool = False
+    coordination_final_requested: bool = False
+    coordination_deadline_round: int | None = None
     abandon_move_attempted: bool = False
     end_reason: str | None = None
 
@@ -100,12 +103,14 @@ class SessionState:
     history: list[HistoricalFact] = field(default_factory=list)
     late_tool_results: int = 0
     wall_trial_started: bool = False
+    last_trace: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ObservationResult:
     cached_response: dict[str, Any] | None
     boundary: str | None = None
+    cached_trace: dict[str, Any] | None = None
 
 
 class StateStore:
@@ -140,7 +145,10 @@ class StateStore:
             and state.last_fingerprint == fingerprint
             and state.last_response is not None
         ):
-            return ObservationResult(copy.deepcopy(state.last_response))
+            return ObservationResult(
+                copy.deepcopy(state.last_response),
+                cached_trace=copy.deepcopy(state.last_trace),
+            )
 
         state.observation_count += 1
         self._apply_feedback(turn, payload)
@@ -158,12 +166,14 @@ class StateStore:
         turn: Turn,
         fingerprint: str,
         response: dict[str, Any],
+        trace: dict[str, Any] | None = None,
     ) -> None:
         state = self._require_state()
         self._withdraw_round(turn.round_no)
         state.last_round_no = turn.round_no
         state.last_fingerprint = fingerprint
         state.last_response = copy.deepcopy(response)
+        state.last_trace = copy.deepcopy(trace)
         active_task_id = (
             state.active_task.instance_id if state.active_task is not None else None
         )
@@ -281,7 +291,12 @@ class StateStore:
             state.pending_actions.pop(owner_id)
             state.action_history.append(CompletedAction(pending, success))
             plan = state.plans.get(pending.actor_id)
-            if (
+            keep_funding = (
+                plan is not None
+                and plan.reason.startswith("fund:")
+                and success is not False
+            )
+            if not keep_funding and (
                 pending.action != "move"
                 or (
                     success is True
@@ -350,6 +365,12 @@ class StateStore:
                 or role.backpack_full
                 or turn.weapon_prices.get(reason.split(":", 1)[1], turn.gold + 1)
                 > turn.gold
+            ):
+                state.plans.pop(role_id)
+            elif reason.startswith("fund:") and (
+                role is None
+                or plan.deadline_round is None
+                or turn.round_no > plan.deadline_round
             ):
                 state.plans.pop(role_id)
             elif reason.startswith("build:"):
@@ -486,6 +507,8 @@ class StateStore:
         if accept_result and pending_round == round_no - 1:
             task.tool_results.append((kind, result))
             task.phase = "solving"
+            if kind == "cmd":
+                task.last_accepted_cmd_result_round = round_no
         elif result:
             state.late_tool_results += 1
         if pending_round is not None and pending_round < round_no:

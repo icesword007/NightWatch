@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import threading
 import time
 from typing import Any, Callable
@@ -8,12 +9,13 @@ from .defense import (
     DUSK_POSITIONING_ROUNDS,
     propose_defense,
     protected_gunners,
+    task_pioneer_day_return_action,
     task_pioneer_recall_action,
 )
 from .economy import propose_economy
 from .protocol import Pos, Turn, Unit, distance, move_command
 from .state import StateStore, request_fingerprint
-from .tasks import propose_tasks
+from .tasks import TaskTurnProposal, propose_tasks
 
 _NEIGHBOUR_STEPS = (
     (-1, -1),
@@ -41,7 +43,12 @@ class DecisionEngine:
         self.state = StateStore()
         self._lock = threading.Lock()
 
-    def decide(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def decide(
+        self,
+        payload: dict[str, Any],
+        *,
+        trace_sink: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         """Build the S0 probe through the B-batch state and constraint path."""
         started = self.clock()
         deadline = started + self.budget_seconds
@@ -55,10 +62,17 @@ class DecisionEngine:
 
         lock_budget = deadline - self.clock()
         if lock_budget <= 0 or not self._lock.acquire(timeout=lock_budget):
+            self._emit_trace(
+                trace_sink,
+                self._decision_trace(
+                    turn, payload, fallback, (), None, "budget_fallback",
+                ),
+            )
             return fallback
         try:
             observation = self.state.observe(turn, payload, fingerprint)
             if observation.cached_response is not None:
+                self._emit_trace(trace_sink, observation.cached_trace)
                 return observation.cached_response
 
             allocator = ActionAllocator(turn)
@@ -67,6 +81,27 @@ class DecisionEngine:
             task_pioneer = next((
                 turn.unit(role_id) for role_id in task_role_ids
             ), None)
+            day_return = (
+                task_pioneer_day_return_action(
+                    turn,
+                    state,
+                    task_pioneer,
+                    clock=self.clock,
+                    deadline=deadline,
+                    max_expansions=self.max_search_expansions,
+                )
+                if task_pioneer is not None
+                else None
+            )
+            if state.active_task is not None:
+                state.active_task.coordination_deadline_round = (
+                    turn.round_no + max(day_return[1], 0)
+                    if day_return is not None and day_return[1] > 1
+                    else None
+                )
+                state.active_task.coordination_final_requested = (
+                    day_return is not None and day_return[1] <= 2
+                )
             urgent_recall = (
                 task_pioneer_recall_action(
                     turn,
@@ -93,8 +128,6 @@ class DecisionEngine:
                     else unavailable_for_defense
                 ),
             )
-            if urgent_recall is not None:
-                defense_candidates = (urgent_recall, *defense_candidates)
             task_turn = propose_tasks(
                 turn,
                 state,
@@ -102,20 +135,53 @@ class DecisionEngine:
                 deadline=deadline,
                 max_expansions=self.max_search_expansions,
             )
+            if day_return is not None and day_return[1] <= 1:
+                submits_now = any(
+                    candidate.proposal.command.get("action") == "submitAnswer"
+                    for candidate in task_turn.actions
+                )
+                if not (day_return[1] == 1 and submits_now):
+                    urgent_recall = day_return[0]
+                    task_turn = TaskTurnProposal()
+                if state.active_task is not None:
+                    state.active_task.coordination_deadline_round = (
+                        turn.round_no + max(day_return[1], 0)
+                    )
+            if urgent_recall is not None:
+                defense_candidates = (urgent_recall, *defense_candidates)
+            economy_candidates = propose_economy(
+                turn,
+                state,
+                clock=self.clock,
+                deadline=deadline,
+                max_expansions=self.max_search_expansions,
+                need_wall=self._needs_wall_trial(turn, state),
+                reserved_role_ids=task_role_ids,
+            )
+            critical_economy = tuple(
+                candidate for candidate in economy_candidates
+                if candidate.plan_reason
+                and candidate.plan_reason.startswith("fund:")
+            )
+            ordinary_economy = tuple(
+                candidate for candidate in economy_candidates
+                if candidate not in critical_economy
+            )
             defense_first = (
                 not turn.is_day
                 or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
                 or bool(defense_candidates)
             )
             domains = (
+                ("economy", critical_economy),
                 ("defense", defense_candidates),
                 ("tasks", task_turn.actions),
-                ("economy", None),
+                ("economy", ordinary_economy),
             )
             if not defense_first:
                 domains = (
                     ("tasks", task_turn.actions),
-                    ("economy", None),
+                    ("economy", economy_candidates),
                     ("defense", defense_candidates),
                 )
             protected = protected_gunners(turn) if defense_first else frozenset()
@@ -123,18 +189,7 @@ class DecisionEngine:
             for domain, prepared_candidates in domains:
                 if self.clock() >= deadline:
                     break
-                if domain == "economy":
-                    candidates = propose_economy(
-                        turn,
-                        state,
-                        clock=self.clock,
-                        deadline=deadline,
-                        max_expansions=self.max_search_expansions,
-                        need_wall=self._needs_wall_trial(turn, state),
-                        reserved_role_ids=task_role_ids,
-                    )
-                else:
-                    candidates = prepared_candidates or ()
+                candidates = prepared_candidates or ()
                 for candidate in candidates:
                     if self.clock() >= deadline:
                         break
@@ -145,10 +200,18 @@ class DecisionEngine:
                             candidate.proposal.command.get("action") == "use"
                             and candidate.proposal.command.get("name") == "Medicine"
                         )
+                        and not (
+                            turn.is_day
+                            and candidate.plan_reason is not None
+                            and candidate.plan_reason.startswith("fund:")
+                            and candidate.estimated_rounds is not None
+                            and candidate.estimated_rounds
+                            <= turn.rounds_until_night
+                        )
                     ):
                         continue
                     if allocator.try_add(candidate.proposal):
-                        accepted.append(candidate)
+                        accepted.append((domain, candidate))
 
             last_valid = allocator.complete_response(
                 prompt=task_turn.prompt,
@@ -162,8 +225,19 @@ class DecisionEngine:
             ):
                 last_valid = fallback
 
-            self.state.record_response(turn, fingerprint, last_valid)
-            for candidate in accepted:
+            coordination_reason = self._coordination_reason(
+                accepted, urgent_recall, task_turn,
+            )
+            trace = self._decision_trace(
+                turn,
+                payload,
+                last_valid,
+                accepted,
+                state,
+                coordination_reason,
+            )
+            self.state.record_response(turn, fingerprint, last_valid, trace)
+            for _, candidate in accepted:
                 actor_id = candidate.proposal.actor_id
                 if (
                     candidate.plan_target is not None
@@ -177,9 +251,146 @@ class DecisionEngine:
                     )
                 else:
                     self.state.clear_plan(actor_id)
+            self._emit_trace(trace_sink, trace)
             return copy.deepcopy(last_valid)
         finally:
             self._lock.release()
+
+    @staticmethod
+    def _emit_trace(
+        trace_sink: Callable[[dict[str, Any]], None] | None,
+        trace: dict[str, Any] | None,
+    ) -> None:
+        if trace_sink is not None and trace is not None:
+            trace_sink(copy.deepcopy(trace))
+
+    @staticmethod
+    def _coordination_reason(
+        accepted: list[Any],
+        urgent_recall: Any,
+        task_turn: TaskTurnProposal,
+    ) -> str:
+        if urgent_recall is not None and any(
+            candidate == urgent_recall for _, candidate in accepted
+        ):
+            return "task_defense_return"
+        if any(
+            candidate.plan_reason
+            and candidate.plan_reason.startswith("fund:")
+            for _, candidate in accepted
+        ):
+            return "critical_funding"
+        if task_turn.actions or task_turn.prompt or task_turn.execute_cmd:
+            return "task_active"
+        return "normal"
+
+    @staticmethod
+    def _decision_trace(
+        turn: Turn,
+        payload: dict[str, Any],
+        response: dict[str, Any],
+        accepted: tuple[Any, ...] | list[Any],
+        state: Any,
+        coordination_reason: str,
+    ) -> dict[str, Any]:
+        task = state.active_task if state is not None else None
+        remaining = None
+        solver_state = "idle"
+        solver_reason = None
+        leave_reason = None
+        task_instance_id = None
+        cycle_fingerprint = None
+        if task is not None:
+            task_instance_id = task.instance_id
+            solver_state = task.phase
+            task_deadlines = tuple(
+                deadline for deadline in (
+                    task.timeout_round, task.coordination_deadline_round,
+                )
+                if deadline is not None
+            )
+            if task_deadlines:
+                remaining = max(0, min(task_deadlines) - turn.round_no)
+            if task.solver_stopped_reason is not None:
+                solver_reason = task.solver_stopped_reason
+            elif task.pending_cmd_round is not None:
+                solver_reason = "command_pending"
+            elif task.pending_llm_round is not None:
+                solver_reason = "llm_pending"
+            elif task.deferred_answer is not None:
+                solver_reason = "answer_ready"
+            else:
+                solver_reason = "solving"
+            if response.get("executeCmd"):
+                solver_reason = "command_requested"
+            elif response.get("prompt"):
+                solver_reason = "llm_requested"
+            elif any(
+                command.get("action") == "submitAnswer"
+                for command in response.get("roleCommandMap", {}).values()
+                if isinstance(command, dict)
+            ):
+                solver_reason = "submit_requested"
+            leave_reason = task.end_reason
+            cycle_fingerprint = DecisionEngine._short_fingerprint(
+                task.last_cycle_fingerprint,
+            )
+        actions = []
+        for domain, candidate in accepted:
+            actions.append({
+                "roleId": str(candidate.proposal.actor_id),
+                "domain": domain,
+                "reason": DecisionEngine._safe_action_reason(candidate),
+                "estimatedRounds": candidate.estimated_rounds or 1,
+                "deadlineRound": candidate.deadline_round,
+            })
+        return {
+            "roundNo": turn.round_no,
+            "taskInstanceId": task_instance_id,
+            "taskRemainingRounds": remaining,
+            "solverState": solver_state,
+            "solverReason": solver_reason,
+            "leaveReason": leave_reason,
+            "commandFingerprint": DecisionEngine._short_fingerprint(
+                response.get("executeCmd"),
+            ),
+            "resultFingerprint": DecisionEngine._short_fingerprint(
+                payload.get("lastCmdResult")
+                if task is not None
+                and task.last_accepted_cmd_result_round == turn.round_no
+                else None,
+            ),
+            "cycleFingerprint": cycle_fingerprint,
+            "coordinationReason": coordination_reason,
+            "actions": actions,
+        }
+
+    @staticmethod
+    def _short_fingerprint(value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        if len(value) == 64 and all(char in "0123456789abcdef" for char in value):
+            return value[:16]
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _safe_action_reason(candidate: Any) -> str:
+        reason = candidate.plan_reason
+        if isinstance(reason, str):
+            if reason.startswith("task:"):
+                return "task_route"
+            prefix = reason.split(":", 1)[0]
+            if prefix in {"build", "fund", "gunner", "mine", "shop", "use"}:
+                return prefix
+            if reason in {"vendor", "s0_probe"}:
+                return reason
+        action = candidate.proposal.command.get("action")
+        if action in {
+            "acceptTask", "attack", "build", "buy", "collect", "move",
+            "sell", "submitAnswer", "use",
+        }:
+            return str(action)
+        return "unknown"
 
     def _task_reserved_roles(
         self,
@@ -273,5 +484,9 @@ class DecisionEngine:
 ENGINE = DecisionEngine()
 
 
-def decide(payload: dict[str, Any]) -> dict[str, Any]:
-    return ENGINE.decide(payload)
+def decide(
+    payload: dict[str, Any],
+    *,
+    trace_sink: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    return ENGINE.decide(payload, trace_sink=trace_sink)

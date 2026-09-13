@@ -184,7 +184,7 @@ def _continue_active_task(
                     "The previous LLM response violated the JSON envelope.",
                 ))
             if envelope.kind == "command":
-                if task.final_answer_requested or (
+                if _final_answer_required(task) or (
                     remaining is not None and remaining < 2
                 ):
                     task.solver_stopped_reason = "command_after_final_request"
@@ -285,15 +285,16 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
     context_text = _bounded(context, MAX_TOOL_CONTEXT_CHARS)
     history_text = _solver_history_text(task)
     remaining = _remaining_rounds(turn, task)
+    effective_deadline = _effective_deadline(task)
     if remaining is None:
         budget_text = "Known remaining task rounds: unknown."
     else:
         budget_text = (
             f"Known remaining task rounds: {remaining} "
-            f"(current round {turn.round_no}, deadline round {task.timeout_round})."
+            f"(current round {turn.round_no}, deadline round {effective_deadline})."
         )
     command_allowed = (
-        not task.final_answer_requested
+        not _final_answer_required(task)
         and (remaining is None or remaining >= 3)
     )
     command_text = (
@@ -317,9 +318,24 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
 
 
 def _remaining_rounds(turn: Turn, task: TaskMemory) -> int | None:
-    if task.timeout_round is None:
+    deadline = _effective_deadline(task)
+    if deadline is None:
         return None
-    return max(0, task.timeout_round - turn.round_no)
+    return max(0, deadline - turn.round_no)
+
+
+def _effective_deadline(task: TaskMemory) -> int | None:
+    deadlines = tuple(
+        deadline for deadline in (
+            task.timeout_round, task.coordination_deadline_round,
+        )
+        if deadline is not None
+    )
+    return min(deadlines) if deadlines else None
+
+
+def _final_answer_required(task: TaskMemory) -> bool:
+    return task.final_answer_requested or task.coordination_final_requested
 
 
 def _leave_task(

@@ -84,6 +84,101 @@ def state_for(payload):
 
 
 class TaskTests(unittest.TestCase):
+    def _third_post_payload(self, round_no):
+        payload = task_payload(
+            round_no=round_no,
+            pioneer_pos=(15, 16),
+            phase_task="active task",
+        )
+        payload["teamOur"]["roles"].extend([
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+            unit(10040, "rocket", 12, 6, health=1000),
+        ])
+        return payload
+
+    def test_task_keeps_working_with_margin_but_returns_for_required_third_post(self):
+        enough = self._third_post_payload(50)
+        response = DecisionEngine().decide(enough)
+        self.assertTrue(response["prompt"])
+        self.assertIn("Known remaining task rounds: 12", response["prompt"])
+        self.assertNotIn("10011", response["roleCommandMap"])
+
+        tight = self._third_post_payload(62)
+        engine = DecisionEngine()
+        response = engine.decide(tight)
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertEqual(engine.state.state.plans[10011].reason, "gunner:10040")
+        self.assertEqual(response["prompt"], "")
+
+    def test_reliable_task_answer_submits_before_last_feasible_return(self):
+        engine = DecisionEngine()
+        first = self._third_post_payload(60)
+        engine.decide(first)
+
+        answer = self._third_post_payload(61)
+        answer["llmResp"] = (
+            '{"kind":"answer","content":"supported","complete":false}'
+        )
+        response = engine.decide(answer)
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "supported",
+        })
+
+        return_turn = self._third_post_payload(62)
+        return_turn["lastRoundRoleActionResults"] = {"10011": True}
+        response = engine.decide(return_turn)
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertEqual(engine.state.state.plans[10011].reason, "gunner:10040")
+
+    def test_disappeared_third_post_releases_task_pioneer(self):
+        engine = DecisionEngine()
+        tight = self._third_post_payload(62)
+        engine.decide(tight)
+
+        changed = self._third_post_payload(63)
+        changed["teamOur"]["roles"] = [
+            role for role in changed["teamOur"]["roles"]
+            if role["id"] != 10040
+        ]
+        changed["lastRoundRoleActionResults"] = {"10011": True}
+        response = engine.decide(changed)
+
+        self.assertTrue(response["prompt"])
+        self.assertNotIn("10011", response["roleCommandMap"])
+
+    def test_disappeared_third_post_revokes_only_coordination_final_request(self):
+        engine = DecisionEngine()
+        constrained = self._third_post_payload(60)
+        first = engine.decide(constrained)
+        self.assertTrue(first["prompt"])
+
+        changed = self._third_post_payload(61)
+        changed["teamOur"]["roles"] = [
+            role for role in changed["teamOur"]["roles"]
+            if role["id"] != 10040
+        ]
+        changed["llmResp"] = (
+            '{"kind":"command","content":"safe private command"}'
+        )
+        response = engine.decide(changed)
+
+        self.assertEqual(response["executeCmd"], "safe private command")
+
+    def test_remote_workers_projected_to_two_posts_start_pioneer_budget_early(self):
+        payload = self._third_post_payload(50)
+        payload["teamOur"]["teamId"] = "task-projected-workers"
+        payload["teamOur"]["roles"][1]["pos"] = {"x": 1, "y": 1}
+        payload["teamOur"]["roles"][2]["pos"] = {"x": 2, "y": 1}
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertTrue(response["prompt"])
+        self.assertNotIn("Known remaining task rounds: unknown", response["prompt"])
+
     def test_allocator_requires_pioneer_and_own_valid_task_point(self):
         # Break caught: acceptTask is only format-checked by the B allocator.
         adjacent = task_payload(pioneer_pos=(3, 3))

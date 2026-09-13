@@ -99,6 +99,166 @@ def task_pioneer_recall_action(
     return None
 
 
+def task_pioneer_day_return_action(
+    turn: Turn,
+    state: SessionState,
+    pioneer: Unit,
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[PlannedAction, int] | None:
+    if not turn.is_day or len(turn.weapons()) < 3:
+        return None
+    committed_roles: set[int] = set()
+    staffed_weapons: set[int] = set()
+    for weapon in turn.weapons():
+        controller = _adjacent_controller(turn, weapon, committed_roles)
+        if controller is not None and controller.unit_id != pioneer.unit_id:
+            committed_roles.add(controller.unit_id)
+            staffed_weapons.add(weapon.unit_id)
+    for role_id, plan in state.plans.items():
+        if role_id == pioneer.unit_id or not plan.reason.startswith("gunner:"):
+            continue
+        try:
+            weapon_id = int(plan.reason.split(":", 1)[1])
+        except ValueError:
+            continue
+        if turn.unit(role_id) is not None and turn.unit(weapon_id) is not None:
+            committed_roles.add(role_id)
+            staffed_weapons.add(weapon_id)
+    projected_roles, projected_weapons = _project_daytime_gunners(
+        turn,
+        pioneer,
+        committed_roles,
+        staffed_weapons,
+        clock,
+        deadline,
+        max_expansions,
+    )
+    committed_roles.update(projected_roles)
+    staffed_weapons.update(projected_weapons)
+    if len(staffed_weapons) < 2:
+        return None
+
+    planned = state.plans.get(pioneer.unit_id)
+    planned_weapon_id = None
+    if planned is not None and planned.reason.startswith("gunner:"):
+        try:
+            planned_weapon_id = int(planned.reason.split(":", 1)[1])
+        except ValueError:
+            planned_weapon_id = None
+    options = []
+    for weapon in turn.weapons():
+        if weapon.unit_id in staffed_weapons:
+            continue
+        route = _gunner_route(
+            turn, pioneer, weapon, clock, deadline, max_expansions,
+        )
+        if route is None or route[1] is None:
+            continue
+        other_can_arrive = False
+        for role in turn.controllable():
+            if role.unit_id == pioneer.unit_id or role.unit_id in committed_roles:
+                continue
+            other_route = _gunner_route(
+                turn, role, weapon, clock, deadline, max_expansions,
+            )
+            if (
+                other_route is not None
+                and other_route[2] <= turn.rounds_until_night
+            ):
+                other_can_arrive = True
+                break
+        if other_can_arrive:
+            continue
+        options.append((weapon, route))
+    if not options:
+        return None
+    weapon, route = min(
+        options,
+        key=lambda item: (
+            item[0].unit_id != planned_weapon_id,
+            item[1][2],
+            item[0].unit_id,
+        ),
+    )
+    stand, step, route_cost = route
+    return PlannedAction(
+        ActionProposal(
+            pioneer.unit_id,
+            pioneer.unit_id,
+            move_command(step),
+            destination=step,
+        ),
+        stand,
+        f"gunner:{weapon.unit_id}",
+        turn.round_no + max(turn.rounds_until_night, route_cost, 1),
+        route_cost,
+    ), turn.rounds_until_night - route_cost
+
+
+def _project_daytime_gunners(
+    turn: Turn,
+    pioneer: Unit,
+    committed_roles: set[int],
+    staffed_weapons: set[int],
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[set[int], set[int]]:
+    roles = tuple(
+        role for role in turn.controllable()
+        if role.unit_id != pioneer.unit_id
+        and role.unit_id not in committed_roles
+    )
+    weapons = tuple(
+        weapon for weapon in turn.weapons()
+        if weapon.unit_id not in staffed_weapons
+    )
+    routes: dict[tuple[int, int], int] = {}
+    for role in roles:
+        for weapon in weapons:
+            route = _gunner_route(
+                turn, role, weapon, clock, deadline, max_expansions,
+            )
+            if route is not None and route[2] <= turn.rounds_until_night:
+                routes[(role.unit_id, weapon.unit_id)] = route[2]
+
+    best_roles: set[int] = set()
+    best_weapons: set[int] = set()
+    best_cost: int | None = None
+
+    def search(index: int, used_roles: set[int], used_weapons: set[int], cost: int) -> None:
+        nonlocal best_roles, best_weapons, best_cost
+        if index == len(roles):
+            if (
+                len(used_weapons) > len(best_weapons)
+                or (
+                    len(used_weapons) == len(best_weapons)
+                    and (best_cost is None or cost < best_cost)
+                )
+            ):
+                best_roles = set(used_roles)
+                best_weapons = set(used_weapons)
+                best_cost = cost
+            return
+        role = roles[index]
+        search(index + 1, used_roles, used_weapons, cost)
+        for weapon in weapons:
+            route_cost = routes.get((role.unit_id, weapon.unit_id))
+            if route_cost is None or weapon.unit_id in used_weapons:
+                continue
+            used_roles.add(role.unit_id)
+            used_weapons.add(weapon.unit_id)
+            search(index + 1, used_roles, used_weapons, cost + route_cost)
+            used_roles.remove(role.unit_id)
+            used_weapons.remove(weapon.unit_id)
+
+    search(0, set(), set(), 0)
+    return best_roles, best_weapons
+
+
 def propose_defense(
     turn: Turn,
     state: SessionState,

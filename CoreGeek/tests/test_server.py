@@ -124,7 +124,7 @@ class ServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(record["buildId"], "nightwatch-s1-r1")
+        self.assertEqual(record["buildId"], "nightwatch-s1-r2")
         self.assertEqual(
             record["team"], {"type": "challenger", "id": "s0-our"}
         )
@@ -295,6 +295,50 @@ class ServerTests(unittest.TestCase):
         for private in (
             "private task text",
             "private answer",
+            "private prompt",
+            "private command",
+        ):
+            self.assertNotIn(private, encoded)
+
+    def test_turn_log_records_bounded_decision_trace_without_private_text(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["phaseTask"] = "private task text"
+        payload["lastCmdResult"] = "private command output"
+        response = {
+            "roleCommandMap": {},
+            "prompt": "private prompt",
+            "executeCmd": "private command",
+        }
+        trace = {
+            "roundNo": payload["roundNo"],
+            "taskInstanceId": "task-7",
+            "taskRemainingRounds": 4,
+            "solverState": "solving",
+            "solverReason": "awaiting_result",
+            "leaveReason": None,
+            "commandFingerprint": "a1b2c3d4e5f6",
+            "resultFingerprint": "0f1e2d3c4b5a",
+            "cycleFingerprint": "112233445566",
+            "coordinationReason": "task_active",
+            "actions": [{
+                "roleId": "10010",
+                "domain": "tasks",
+                "reason": "task:task-7",
+                "estimatedRounds": 1,
+                "deadlineRound": 9,
+            }],
+        }
+
+        record = server_module.turn_log_record(
+            payload, response, {}, decision_trace=trace,
+        )
+        encoded = json.dumps(record, ensure_ascii=False)
+
+        self.assertEqual(record["decision"], trace)
+        self.assertEqual(set(response), {"roleCommandMap", "prompt", "executeCmd"})
+        for private in (
+            "private task text",
+            "private command output",
             "private prompt",
             "private command",
         ):

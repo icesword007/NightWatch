@@ -82,6 +82,398 @@ def state_for(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    def test_underfilled_worker_sells_early_to_fund_reachable_upgrade(self):
+        engine = DecisionEngine()
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(2, 1),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith("fund:")
+        )
+
+    def test_funding_executes_vendor_from_the_verified_complete_route(self):
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(2, 2),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-bound-vendor"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 6, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 5, "y": 8}, "neutralType": "vendor"},
+            {"pos": {"x": 1, "y": 9}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(5, 8))
+
+    def test_funding_executes_shop_from_the_verified_complete_route(self):
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(3, 2),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-bound-shop"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 1, "y": 2}, "neutralType": "weaponShop"},
+            {"pos": {"x": 6, "y": 6}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        engine = DecisionEngine()
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10010"]["action"],
+            "sell",
+        )
+
+        funded = copy.deepcopy(payload)
+        funded["roundNo"] = 31
+        funded["teamOur"]["roles"][0]["backpack"] = []
+        funded["teamOur"]["goldNum"] = 100
+        funded["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(funded)
+
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(6, 6))
+
+    def test_underfilled_worker_sells_early_to_fund_required_third_tower(self):
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(3, 2),
+            items=("copper",) * 5,
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-fund-third-tower"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "sell", "name": "copper", "num": 5,
+        })
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith("fund:build:")
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = []
+        payload["teamOur"]["goldNum"] = 25
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        built = None
+        for round_no in range(31, 43):
+            payload["roundNo"] = round_no
+            command = engine.decide(payload)["roleCommandMap"]["10010"]
+            if command["action"] == "build":
+                built = command
+                break
+            self.assertEqual(command["action"], "move")
+            payload["teamOur"]["roles"][0]["pos"] = copy.deepcopy(
+                command["targetPos"][0]
+            )
+        self.assertIsNotNone(built)
+        self.assertEqual(built["name"], "rocket")
+
+    def test_third_tower_funding_uses_vendor_from_verified_build_route(self):
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(2, 2),
+            items=("copper",) * 5,
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-bound-build-vendor"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": 4}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 6}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "move", "targetPos": [{"x": 3, "y": 3}],
+        })
+
+    def test_underfilled_worker_keeps_mining_when_inventory_cannot_fund_need(self):
+        engine = DecisionEngine()
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(2, 1),
+            items=("copper",),
+            gold=0,
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"],
+            {"action": "collect", "targetPos": [{"x": 2, "y": 2}]},
+        )
+
+    def test_funding_sell_uses_only_quantity_needed_for_current_deficit(self):
+        engine = DecisionEngine()
+        payload = economy_payload(
+            round_no=40,
+            worker_pos=(3, 2),
+            items=("copper",) * 10,
+            gold=70,
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "sell", "name": "copper", "num": 3,
+        })
+
+    def test_feasible_funding_chain_beats_ordinary_recall_until_hard_cutoff(self):
+        feasible = economy_payload(
+            round_no=60,
+            worker_pos=(3, 2),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        feasible["vendorShopList"] = [{"name": "copper", "price": 10}]
+        engine = DecisionEngine()
+
+        response = engine.decide(feasible)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "sell")
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+        late = copy.deepcopy(feasible)
+        late["teamOur"]["teamId"] = "economy-hard-cutoff"
+        late["roundNo"] = 66
+        late_engine = DecisionEngine()
+        response = late_engine.decide(late)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertTrue(
+            late_engine.state.state.plans[10010].reason.startswith("gunner:")
+        )
+
+    def test_temporary_gunner_can_leave_only_for_full_timely_funding_route(self):
+        payload = economy_payload(
+            round_no=60,
+            worker_pos=(7, 2),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-temporary-gunner-fund"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertIn(
+            response["roleCommandMap"]["10010"]["action"], {"move", "sell"},
+        )
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+    def test_shared_gold_allows_only_one_real_engine_purchase(self):
+        payload = economy_payload(round_no=30, worker_pos=(5, 2), gold=10)
+        payload["teamOur"]["teamId"] = "economy-shared-gold"
+        payload["teamOur"]["roles"][0]["health"] = 100
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 5, 3, health=100),
+        )
+        payload["weaponShopList"] = [{"name": "Medicine", "price": 10}]
+
+        response = DecisionEngine().decide(payload)
+
+        buys = [
+            command for command in response["roleCommandMap"].values()
+            if command.get("action") == "buy"
+        ]
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0]["name"], "Medicine")
+
+    def test_failed_sell_feedback_never_assumes_shared_gold_arrived(self):
+        engine = DecisionEngine()
+        first = economy_payload(
+            round_no=40,
+            worker_pos=(3, 2),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        first["vendorShopList"] = [{"name": "copper", "price": 10}]
+        self.assertEqual(
+            engine.decide(first)["roleCommandMap"]["10010"]["action"],
+            "sell",
+        )
+
+        failed = copy.deepcopy(first)
+        failed["roundNo"] = 41
+        failed["lastRoundRoleActionResults"] = {"10010": False}
+        response = engine.decide(failed)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "sell")
+        self.assertNotEqual(response["roleCommandMap"]["10010"]["action"], "buy")
+
+    def test_disappeared_upgrade_target_cancels_funding_plan(self):
+        engine = DecisionEngine()
+        first = economy_payload(
+            round_no=30,
+            worker_pos=(2, 1),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        first["vendorShopList"] = [{"name": "copper", "price": 10}]
+        engine.decide(first)
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+        disappeared = copy.deepcopy(first)
+        disappeared["roundNo"] = 31
+        disappeared["teamOur"]["roles"] = disappeared["teamOur"]["roles"][:2]
+        response = engine.decide(disappeared)
+
+        self.assertNotEqual(
+            engine.state.state.plans.get(10010).reason,
+            "fund:WeaponUpgradeVoucher1",
+        )
+        self.assertNotEqual(response["roleCommandMap"]["10010"]["action"], "buy")
+
+    def test_dead_funding_worker_releases_plan(self):
+        engine = DecisionEngine()
+        first = economy_payload(
+            round_no=30,
+            worker_pos=(2, 1),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        first["vendorShopList"] = [{"name": "copper", "price": 10}]
+        engine.decide(first)
+
+        dead = copy.deepcopy(first)
+        dead["roundNo"] = 31
+        dead["teamOur"]["roles"][0]["health"] = 0
+        response = engine.decide(dead)
+
+        self.assertNotIn(10010, engine.state.state.plans)
+        self.assertNotIn("10010", response["roleCommandMap"])
+
+    def test_funding_plan_observes_sell_then_buy_then_use_feedback(self):
+        engine = DecisionEngine()
+        payload = economy_payload(
+            round_no=40,
+            worker_pos=(3, 2),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-full-funding-chain"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        actions = []
+
+        for _ in range(12):
+            response = engine.decide(payload)
+            command = response["roleCommandMap"].get("10010")
+            self.assertIsNotNone(command)
+            action = command["action"]
+            actions.append(action)
+            if "buy" in actions and action != "use":
+                self.assertTrue(
+                    engine.state.state.plans[10010].reason.startswith("fund:")
+                )
+            worker = payload["teamOur"]["roles"][0]
+            if action == "move":
+                worker["pos"] = copy.deepcopy(command["targetPos"][0])
+            elif action == "sell":
+                worker["backpack"] = []
+                payload["teamOur"]["goldNum"] = 100
+            elif action == "buy":
+                self.assertEqual(command["name"], "WeaponUpgradeVoucher1")
+                worker["backpack"] = ["WeaponUpgradeVoucher1"]
+                payload["teamOur"]["goldNum"] = 0
+            elif action == "use":
+                self.assertEqual(command["name"], "WeaponUpgradeVoucher1")
+                worker["backpack"] = []
+                payload["teamOur"]["roles"][2]["level"] = 2
+                break
+            payload["roundNo"] += 1
+            payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        self.assertIn("sell", actions)
+        self.assertIn("buy", actions)
+        self.assertEqual(actions[-1], "use")
+
+        payload["roundNo"] = 71
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        payload["teamOur"]["roles"][2]["attackRange"] = 3
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 9, "y": 3},
+            "roleType": "smallRobot",
+            "health": 40,
+            "attackPower": 5,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+        response = engine.decide(payload)
+        self.assertEqual(
+            response["roleCommandMap"]["10020"]["controllerId"], "10010",
+        )
+
+    def test_funding_that_cannot_return_from_wall_repair_to_post_is_rejected(self):
+        payload = economy_payload(
+            round_no=65,
+            worker_pos=(3, 2),
+            items=("copper",),
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-repair-misses-post"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 3, 3, health=100)
+        )
+
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("fund:"))
+
+    def test_blocked_vendor_route_cannot_start_funding_plan(self):
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(2, 1),
+            items=("copper",) * 10,
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-blocked-funding"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        blockers = (
+            (3, 1), (3, 2), (3, 3), (4, 1),
+            (4, 3), (5, 1), (5, 2), (5, 3),
+        )
+        payload["teamOur"]["roles"].extend(
+            role(10100 + index, "wall", x, y, health=1000)
+            for index, (x, y) in enumerate(blockers)
+        )
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("fund:"))
+        self.assertNotIn(
+            response["roleCommandMap"]["10010"]["action"], {"sell", "buy"},
+        )
+
     def test_night_worker_adjacent_to_shop_can_buy_needed_medicine(self):
         # Break caught: rounds_until_night=0 suppresses every nighttime purchase.
         payload = economy_payload(round_no=71, worker_pos=(5, 2), gold=10)
@@ -300,7 +692,7 @@ class EconomyTests(unittest.TestCase):
         )
         self.assertEqual(
             engine.state.state.plans[10010].reason,
-            "use:WeaponUpgradeVoucher1:10020",
+            "fund:WeaponUpgradeVoucher1:10020:10020",
         )
 
         fifth = economy_payload(

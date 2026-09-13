@@ -10,7 +10,7 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s1-r1"
+BUILD_ID = "nightwatch-s1-r2"
 MAX_LOG_ITEMS = 16
 MAX_LOG_TARGETS = 3
 LOG_INVENTORY_ITEMS = (
@@ -33,6 +33,8 @@ def turn_log_record(
     payload: dict[str, Any],
     response: dict[str, Any],
     timing_ms: dict[str, float],
+    *,
+    decision_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     team = payload.get("teamOur")
     if not isinstance(team, dict):
@@ -124,6 +126,7 @@ def turn_log_record(
             "points": _task_points(team),
             "tool": _task_tool_shape(payload, response),
         },
+        "decision": decision_trace,
         "timingMs": timing_ms,
         "timingScope": "server-side only; not judger end-to-end",
     }
@@ -336,7 +339,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("request body must be a JSON object")
             parsed = time.monotonic()
-            response = decide(payload)
+            decision_traces = []
+            response = decide(payload, trace_sink=decision_traces.append)
             decided = time.monotonic()
             body = json.dumps(
                 response, ensure_ascii=False, separators=(",", ":"),
@@ -360,7 +364,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send_body(200, body)
         sent = time.monotonic()
         processing_ms["serverWriteComplete"] = (sent - started) * 1000
-        record = turn_log_record(payload, response, processing_ms)
+        decision_trace = decision_traces[0] if decision_traces else None
+        record = turn_log_record(
+            payload,
+            response,
+            processing_ms,
+            decision_trace=decision_trace,
+        )
         LOGGER.info(
             "%s", json.dumps(record, ensure_ascii=False, separators=(",", ":")),
         )
