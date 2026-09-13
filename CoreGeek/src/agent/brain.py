@@ -192,6 +192,7 @@ class DecisionEngine:
                 )
             protected = protected_gunners(turn) if defense_first else frozenset()
             accepted = []
+            blocked_new_task_by_gunner = False
             for domain, prepared_candidates in domains:
                 if self.clock() >= deadline:
                     break
@@ -199,6 +200,13 @@ class DecisionEngine:
                 for candidate in candidates:
                     if self.clock() >= deadline:
                         break
+                    if (
+                        domain == "tasks"
+                        and not turn.phase_task
+                        and candidate.proposal.actor_id in protected
+                    ):
+                        blocked_new_task_by_gunner = True
+                        continue
                     if (
                         domain == "economy"
                         and candidate.proposal.actor_id in protected
@@ -232,7 +240,10 @@ class DecisionEngine:
                 last_valid = fallback
 
             coordination_reason = self._coordination_reason(
-                accepted, urgent_recall, task_turn,
+                accepted,
+                urgent_recall,
+                task_turn,
+                blocked_new_task_by_gunner,
             )
             trace = self._decision_trace(
                 turn,
@@ -275,6 +286,7 @@ class DecisionEngine:
         accepted: list[Any],
         urgent_recall: Any,
         task_turn: TaskTurnProposal,
+        blocked_new_task_by_gunner: bool = False,
     ) -> str:
         if urgent_recall is not None and any(
             candidate == urgent_recall for _, candidate in accepted
@@ -286,6 +298,8 @@ class DecisionEngine:
             for _, candidate in accepted
         ):
             return "critical_funding"
+        if blocked_new_task_by_gunner:
+            return "gunner_hold"
         if task_turn.actions or task_turn.prompt or task_turn.execute_cmd:
             return "task_active"
         return "normal"

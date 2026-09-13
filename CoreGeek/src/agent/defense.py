@@ -12,7 +12,9 @@ TASK_RECALL_THREAT_DISTANCE = 3
 
 
 def protected_gunners(turn: Turn) -> frozenset[int]:
-    assignments = _adjacent_assignments(turn, set())
+    assignments = _adjacent_assignments(
+        turn, set(), include_emergency_medicine=True,
+    )
     return frozenset(role.unit_id for role in assignments.values())
 
 
@@ -398,11 +400,15 @@ def _adjacent_assignments(
     excluded_role_ids: set[int],
     state: SessionState | None = None,
     excluded_weapon_ids: frozenset[int] = frozenset(),
+    include_emergency_medicine: bool = False,
 ) -> dict[int, Unit]:
     roles = tuple(
         role for role in turn.controllable()
         if role.unit_id not in excluded_role_ids
-        and not _needs_emergency_medicine(role)
+        and (
+            include_emergency_medicine
+            or not _needs_emergency_medicine(role)
+        )
     )
     weapons = tuple(
         weapon for weapon in turn.weapons()

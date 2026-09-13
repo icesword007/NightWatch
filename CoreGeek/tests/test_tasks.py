@@ -84,6 +84,112 @@ def state_for(payload):
 
 
 class TaskTests(unittest.TestCase):
+    def _idle_third_gunner_payload(self, round_no=65, *, rocket_cooldown=0):
+        payload = task_payload(round_no=round_no, pioneer_pos=(12, 5))
+        payload["teamOur"]["teamId"] = "task-idle-third-gunner"
+        payload["teamOur"]["roles"].extend([
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+            unit(
+                10040, "rocket", 12, 6,
+                health=1000, cooldown=rocket_cooldown,
+            ),
+        ])
+        return payload
+
+    def test_required_third_gunner_stays_at_post_without_targets_across_dusk(self):
+        # Break caught: idle defense releases the pioneer to a distant task every round.
+        engine = DecisionEngine()
+        payload = self._idle_third_gunner_payload()
+        traces = []
+
+        for round_no in range(65, 75):
+            payload["roundNo"] = round_no
+            response = engine.decide(payload, trace_sink=traces.append)
+            self.assertNotIn("10011", response["roleCommandMap"])
+            self.assertEqual(traces[-1]["coordinationReason"], "gunner_hold")
+            for role_id, command in response["roleCommandMap"].items():
+                if command["action"] != "move":
+                    continue
+                role = next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == int(role_id)
+                )
+                role["pos"] = copy.deepcopy(command["targetPos"][0])
+            payload["lastRoundRoleActionResults"] = {
+                role_id: True for role_id in response["roleCommandMap"]
+            }
+
+        pioneer = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10011
+        )
+        self.assertEqual(pioneer["pos"], {"x": 12, "y": 5})
+
+    def test_required_third_gunner_attacks_when_target_appears(self):
+        payload = self._idle_third_gunner_payload(round_no=71)
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 12, "y": 8},
+            "roleType": "smallRobot",
+            "health": 40,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10040"], {
+            "action": "attack",
+            "controllerId": "10011",
+            "targetPos": [{"x": 12, "y": 8}],
+        })
+
+    def test_cooling_required_third_gunner_stays_at_post(self):
+        payload = self._idle_third_gunner_payload(
+            round_no=71, rocket_cooldown=2,
+        )
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotIn("10011", response["roleCommandMap"])
+
+    def test_required_third_gunner_uses_medicine_instead_of_leaving_for_task(self):
+        payload = self._idle_third_gunner_payload(round_no=71)
+        pioneer = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10011
+        )
+        pioneer["health"] = 40
+        pioneer["backpack"] = ["Medicine"]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "use", "name": "Medicine",
+        })
+
+    def test_dawn_releases_idle_third_gunner_for_new_task(self):
+        payload = self._idle_third_gunner_payload(round_no=1)
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+
+    def test_two_worker_staffed_towers_leave_pioneer_free_for_new_task(self):
+        payload = self._idle_third_gunner_payload()
+        payload["teamOur"]["roles"] = [
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] != 10040
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+
     def _third_post_payload(self, round_no):
         payload = task_payload(
             round_no=round_no,
