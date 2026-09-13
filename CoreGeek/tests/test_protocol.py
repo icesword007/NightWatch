@@ -16,8 +16,8 @@ def load_fixture():
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_minimal_decision_moves_first_role_to_observed_empty_neighbour(self):
-        # Break caught: enabling the old demo strategy or choosing an observed blocker.
+    def test_c_decision_collects_an_observed_adjacent_mine(self):
+        # Break caught: the HTTP coordinator still emits only the S0 probe.
         response = decide(load_fixture())
 
         self.assertEqual(
@@ -25,8 +25,8 @@ class ProtocolTests(unittest.TestCase):
             {
                 "roleCommandMap": {
                     "10010": {
-                        "action": "move",
-                        "targetPos": [{"x": 2, "y": 1}],
+                        "action": "collect",
+                        "targetPos": [{"x": 1, "y": 1}],
                     }
                 },
                 "prompt": "",
@@ -50,6 +50,73 @@ class ProtocolTests(unittest.TestCase):
         enemies = getattr(turn, "enemies", ())
         self.assertTrue(enemies, "visible enemy roles were not parsed")
         self.assertIn(enemies[0].pos, turn.blocked(worker))
+
+    def test_economy_prices_and_robot_threat_fields_are_parsed(self):
+        # Break caught: C planners guess prices or lose robot target identity.
+        payload = load_fixture()
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        payload["weaponShopList"] = [{"name": "Medicine", "price": 10}]
+
+        turn = Turn.load(payload)
+
+        self.assertEqual(turn.vendor_prices, {"copper": 5})
+        self.assertEqual(turn.weapon_prices, {"Medicine": 10})
+        self.assertEqual(turn.robots[0].kind, "smallRobot")
+        self.assertEqual(turn.robots[0].target_team, "challenger")
+        self.assertEqual(turn.robots[0].abnormal_state, "")
+
+    def test_missing_robot_target_team_remains_unknown(self):
+        # Break caught: official sample omits targetTeam despite the field table.
+        payload = load_fixture()
+        del payload["robot"]["roles"][0]["targetTeam"]
+
+        turn = Turn.load(payload)
+
+        self.assertEqual(turn.robots[0].target_team, "")
+
+    def test_player_task_timeout_is_optional_but_preserved_when_present(self):
+        # Break caught: the field table and official sample disagree on timeoutRounds.
+        payload = load_fixture()
+        payload["teamOur"]["playerTasks"] = [
+            {
+                "taskType": "自进化类1",
+                "taskPosition": {"x": 4, "y": 4},
+                "coldDownRounds": 0,
+                "scoreReward": 50,
+                "goldReward": 30,
+                "isValid": True,
+                "timeoutRounds": 20,
+            },
+            {
+                "taskType": "自进化类2",
+                "taskPosition": {"x": 7, "y": 7},
+                "coldDownRounds": 0,
+                "scoreReward": 60,
+                "goldReward": 40,
+                "isValid": True,
+            },
+        ]
+
+        turn = Turn.load(payload)
+
+        self.assertEqual(turn.player_tasks[0].timeout_rounds, 20)
+        self.assertIsNone(turn.player_tasks[1].timeout_rounds)
+        self.assertEqual(turn.phase_task, "")
+
+    def test_player_task_validity_rejects_non_boolean_values(self):
+        # Break caught: the string "false" is truthy and makes an invalid task selectable.
+        payload = load_fixture()
+        payload["teamOur"]["playerTasks"] = [{
+            "taskType": "自进化类1",
+            "taskPosition": {"x": 4, "y": 4},
+            "coldDownRounds": 0,
+            "scoreReward": 50,
+            "goldReward": 30,
+            "isValid": "false",
+        }]
+
+        with self.assertRaises(ValueError):
+            Turn.load(payload)
 
     def test_missing_role_id_is_rejected_instead_of_becoming_zero(self):
         # Break caught: a missing critical identifier silently becomes role ID 0.

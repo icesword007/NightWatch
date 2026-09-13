@@ -6,6 +6,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -85,7 +86,10 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(payload["executeCmd"], "")
                 self.assertEqual(
                     payload["roleCommandMap"]["10010"]["targetPos"],
-                    [{"x": 2, "y": 1}],
+                    [{"x": 1, "y": 1}],
+                )
+                self.assertEqual(
+                    payload["roleCommandMap"]["10010"]["action"], "collect"
                 )
 
     def test_malformed_json_is_not_disguised_as_a_legal_empty_turn(self):
@@ -120,26 +124,31 @@ class ServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(record["buildId"], "nightwatch-s0-a2")
+        self.assertEqual(record["buildId"], "nightwatch-s1-d1")
         self.assertEqual(
             record["team"], {"type": "challenger", "id": "s0-our"}
         )
         self.assertEqual(
             record["commands"],
-            [
-                {
+            {
+                "items": [{
                     "roleId": "10010",
-                    "action": "move",
-                    "targetPos": [{"x": 2, "y": 1}],
-                }
-            ],
+                    "action": "collect",
+                    "targetPos": [{"x": 1, "y": 1}],
+                    "targetPosTruncated": False,
+                }],
+                "truncated": False,
+            },
         )
         self.assertEqual(
             record["actionFeedback"],
-            [
-                {"roleId": "10010", "ok": True},
-                {"roleId": "10011", "ok": False},
-            ],
+            {
+                "items": [
+                    {"roleId": "10010", "ok": True},
+                    {"roleId": "10011", "ok": False},
+                ],
+                "truncated": False,
+            },
         )
         self.assertEqual(
             record["timingScope"],
@@ -148,11 +157,320 @@ class ServerTests(unittest.TestCase):
         serialized = json.dumps(record, ensure_ascii=False)
         for sensitive_field in (
             "phaseTask",
-            "llmResp",
             "worldNews",
             "lastCmdResult",
         ):
             self.assertNotIn(sensitive_field, serialized)
+
+    def test_turn_log_records_utc_roles_and_both_base_states(self):
+        # Break caught: platform logs cannot reconstruct positions or base survival.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["teamOur"]["roles"].append({
+            "id": 10013,
+            "pos": {"x": 0, "y": 4},
+            "roleType": "station",
+            "health": 1400,
+            "attackPower": 0,
+            "attackRange": 0,
+            "backPackCapability": 0,
+            "backpack": [],
+            "level": 1,
+        })
+        payload["teamEnemy"]["roles"].append({
+            "id": 20013,
+            "pos": {"x": 4, "y": 4},
+            "roleType": "station",
+            "health": 1300,
+            "attackPower": 0,
+            "attackRange": 0,
+            "level": 1,
+        })
+        response = decide(payload)
+
+        record = server_module.turn_log_record(payload, response, {})
+
+        self.assertIn("timestampUtc", record)
+        timestamp = datetime.fromisoformat(record["timestampUtc"])
+        self.assertIsNotNone(timestamp.tzinfo)
+        self.assertEqual(timestamp.utcoffset().total_seconds(), 0)
+        self.assertEqual(record["controlledRoles"], {
+            "items": [{
+                "id": "10010",
+                "type": "worker",
+                "pos": {"x": 2, "y": 2},
+                "health": 220,
+                "capacity": 100,
+                "backpack": {},
+            }],
+            "truncated": False,
+        })
+        self.assertEqual(record["bases"], {
+            "our": {
+                "present": True,
+                "id": "10013",
+                "pos": {"x": 0, "y": 4},
+                "health": 1400,
+            },
+            "enemy": {
+                "present": True,
+                "id": "20013",
+                "pos": {"x": 4, "y": 4},
+                "health": 1300,
+            },
+        })
+
+    def test_turn_log_marks_missing_bases_without_crashing(self):
+        # Break caught: station absence crashes logging or is mistaken for zero HP.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+        record = server_module.turn_log_record(payload, decide(payload), {})
+
+        self.assertEqual(record["bases"], {
+            "our": {"present": False},
+            "enemy": {"present": False},
+        })
+
+    def test_turn_log_keeps_c_action_name_and_quantity(self):
+        # Break caught: build/trade evidence loses the tested item and quantity.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        response = {
+            "roleCommandMap": {
+                "10010": {
+                    "action": "buy",
+                    "name": "Medicine",
+                    "num": 2,
+                }
+            },
+            "prompt": "",
+            "executeCmd": "",
+        }
+
+        record = server_module.turn_log_record(payload, response, {})
+
+        self.assertEqual(record["commands"], {
+            "items": [{
+                "roleId": "10010",
+                "action": "buy",
+                "name": "Medicine",
+                "num": 2,
+            }],
+            "truncated": False,
+        })
+
+    def test_turn_log_exposes_task_phase_without_private_contents(self):
+        # Break caught: task observability logs the prompt, command, or answer text.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["phaseTask"] = "private task text"
+        response = {
+            "roleCommandMap": {
+                "10011": {
+                    "action": "submitAnswer",
+                    "taskAnswer": "private answer",
+                }
+            },
+            "prompt": "private prompt",
+            "executeCmd": "private command",
+        }
+
+        record = server_module.turn_log_record(
+            payload, response, {"processing": 1.0},
+        )
+        encoded = json.dumps(record)
+
+        self.assertEqual(record["task"], {
+            "phase": "active",
+            "active": True,
+            "promptRequested": True,
+            "commandRequested": True,
+            "points": {"items": [], "truncated": False},
+            "tool": {
+                "llmResponsePresent": False,
+                "envelopeKind": None,
+                "answerComplete": None,
+                "commandResultClass": "none",
+                "commandResultTruncated": False,
+                "answerSubmitted": True,
+            },
+        })
+        for private in (
+            "private task text",
+            "private answer",
+            "private prompt",
+            "private command",
+        ):
+            self.assertNotIn(private, encoded)
+
+    def test_turn_log_has_bounded_s1_evidence_without_sensitive_text(self):
+        # Break caught: intranet cannot verify economy, defense, or task tool shape.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["teamOur"].update({
+            "goldNum": 37,
+            "totalScore": 81,
+            "playerTasks": [
+                {
+                    "taskType": f"自进化类{index}",
+                    "taskPosition": {"x": index, "y": 4},
+                    "coldDownRounds": index,
+                    "scoreReward": 50,
+                    "goldReward": 30,
+                    "isValid": True,
+                    "timeoutRounds": 20,
+                }
+                for index in range(server_module.MAX_LOG_ITEMS + 1)
+            ],
+        })
+        payload["teamOur"]["roles"][0].update({
+            "backPackCapability": 8,
+            "backpack": ["stone", "stone", "Medicine", "private-item"],
+        })
+        payload["teamOur"]["roles"].extend([
+            {
+                "id": 10013,
+                "pos": {"x": 0, "y": 4},
+                "roleType": "station",
+                "health": 1400,
+                "level": 2,
+                "cooldown": 0,
+            },
+            {
+                "id": 10020,
+                "pos": {"x": 2, "y": 4},
+                "roleType": "gatling",
+                "health": 900,
+                "level": 1,
+                "cooldown": 2,
+            },
+            {
+                "id": 10030,
+                "pos": {"x": 3, "y": 4},
+                "roleType": "wall",
+                "health": 700,
+                "level": 1,
+                "cooldown": 0,
+            },
+        ])
+        payload["robot"]["roles"] = [
+            {
+                "id": 30000 + index,
+                "pos": {"x": index, "y": 8},
+                "roleType": "smallRobot",
+                "health": 40,
+                "attackPower": 5,
+                "abnormalState": "Dizzy" if index == 0 else "",
+                "targetTeam": "challenger",
+            }
+            for index in range(server_module.MAX_LOG_ITEMS + 1)
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 4},
+            {"name": "private-good", "price": 999},
+        ]
+        payload["weaponShopList"] = [
+            {"name": "Medicine", "price": 10},
+            {"name": "WeaponUpgradeVoucher1", "price": 20},
+            {"name": "private-tool", "price": 999},
+        ]
+        payload["phaseTask"] = "private task text"
+        payload["llmResp"] = (
+            '{"kind":"command","content":"private command"}'
+        )
+        payload["lastCmdResult"] = "[exitCode:0]\nprivate output"
+        response = {
+            "roleCommandMap": {
+                "10011": {
+                    "action": "submitAnswer",
+                    "taskAnswer": "private answer",
+                }
+            },
+            "prompt": "private prompt",
+            "executeCmd": "private execute",
+        }
+
+        record = server_module.turn_log_record(payload, response, {})
+        encoded = json.dumps(record, ensure_ascii=False)
+
+        self.assertIn("economy", record)
+        self.assertEqual(record["economy"], {"gold": 37, "score": 81})
+        worker = record["controlledRoles"]["items"][0]
+        self.assertEqual(worker["capacity"], 8)
+        self.assertEqual(worker["backpack"], {"Medicine": 1, "stone": 2})
+        self.assertFalse(record["controlledRoles"]["truncated"])
+        self.assertEqual(
+            {item["type"] for item in record["ourStructures"]["items"]},
+            {"station", "gatling", "wall"},
+        )
+        tower = next(
+            item for item in record["ourStructures"]["items"]
+            if item["type"] == "gatling"
+        )
+        self.assertEqual(tower, {
+            "id": "10020",
+            "type": "gatling",
+            "pos": {"x": 2, "y": 4},
+            "health": 900,
+            "level": 1,
+            "cooldown": 2,
+        })
+        self.assertTrue(record["robots"]["truncated"])
+        self.assertEqual(record["robots"]["items"][0]["targetTeam"], "challenger")
+        self.assertEqual(record["shops"], {
+            "vendor": {"stone": 4},
+            "weapon": {"Medicine": 10, "WeaponUpgradeVoucher1": 20},
+        })
+        self.assertTrue(record["task"]["points"]["truncated"])
+        self.assertEqual(record["task"]["points"]["items"][0], {
+            "type": "自进化类0",
+            "pos": {"x": 0, "y": 4},
+            "cooldownRounds": 0,
+            "scoreReward": 50,
+            "goldReward": 30,
+            "valid": True,
+            "timeoutRounds": 20,
+        })
+        self.assertEqual(record["task"]["tool"], {
+            "llmResponsePresent": True,
+            "envelopeKind": "command",
+            "answerComplete": None,
+            "commandResultClass": "success",
+            "commandResultTruncated": False,
+            "answerSubmitted": True,
+        })
+        answer_payload = dict(payload)
+        answer_payload["llmResp"] = (
+            '{"kind":"answer","content":"private llm answer",'
+            '"complete":false}'
+        )
+        answer_record = server_module.turn_log_record(
+            answer_payload, response, {},
+        )
+        self.assertEqual(answer_record["task"]["tool"]["envelopeKind"], "answer")
+        self.assertFalse(answer_record["task"]["tool"]["answerComplete"])
+        self.assertNotIn(
+            "private llm answer",
+            json.dumps(answer_record, ensure_ascii=False),
+        )
+        for raw, expected in (
+            ("", "none"),
+            ("[exitCode:1]\nprivate", "failed"),
+            ("[TIMEOUT]\nprivate", "timeout"),
+            ("[JUDGER_ERROR]\nprivate", "judger_error"),
+            ("other private output", "unknown"),
+            ("[exitCode:not-an-int]\nprivate", "unknown"),
+            ("[exitCode:0]\nprivate\n[TRUNCATED]", "truncated"),
+        ):
+            self.assertEqual(server_module._command_result_class(raw), expected)
+        for private in (
+            "private-item",
+            "private-good",
+            "private-tool",
+            "private task text",
+            "private command",
+            "private output",
+            "private answer",
+            "private prompt",
+            "private execute",
+        ):
+            self.assertNotIn(private, encoded)
 
     def test_slow_turn_log_runs_after_response_is_sent(self):
         # Break caught: synchronous log output delays the response write.

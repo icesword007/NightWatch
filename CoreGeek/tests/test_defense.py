@@ -1,0 +1,318 @@
+import importlib
+import json
+import unittest
+from pathlib import Path
+
+from agent.actions import ActionAllocator, ActionProposal
+from agent.brain import DecisionEngine
+from agent.protocol import Pos, Turn
+from agent.state import StateStore, request_fingerprint
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
+
+
+def load_fixture():
+    return json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+
+def unit(unit_id, kind, x, y, *, health=220, level=1, cooldown=0):
+    attack = {"gatling": 10, "railgun": 10 * level, "rocket": 20}.get(kind, 0)
+    return {
+        "id": unit_id,
+        "pos": {"x": x, "y": y},
+        "roleType": kind,
+        "health": health,
+        "attackPower": attack,
+        "attackRange": 0,
+        "backPackCapability": 100 if kind == "worker" else 40,
+        "backpack": [],
+        "level": level,
+        "cooldown": cooldown,
+    }
+
+
+def robot(robot_id, kind, x, y, health, *, target="challenger"):
+    return {
+        "id": robot_id,
+        "pos": {"x": x, "y": y},
+        "roleType": kind,
+        "health": health,
+        "abnormalState": "",
+        "targetTeam": target,
+    }
+
+
+def defense_payload(*, round_no=71):
+    payload = load_fixture()
+    payload["roundNo"] = round_no
+    payload["mapInfo"].update({"width": 20, "height": 20, "zones": []})
+    payload["teamOur"].update({
+        "teamId": "defense-tests",
+        "roles": [
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10011, "pioneer", 12, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000, level=2),
+            unit(10030, "railgun", 9, 6, health=1000, level=3),
+            unit(10040, "rocket", 12, 6, health=1000, level=2, cooldown=2),
+        ],
+    })
+    payload["teamEnemy"]["roles"] = []
+    payload["robot"]["roles"] = [
+        robot(30001, "smallRobot", 6, 9, 10),
+        robot(30002, "middleRobot", 9, 10, 60),
+        robot(30003, "largeRobot", 12, 10, 500),
+    ]
+    return payload
+
+
+def state_for(payload):
+    store = StateStore()
+    turn = Turn.load(payload)
+    store.observe(turn, payload, request_fingerprint(payload))
+    return store.state
+
+
+def proposals(payload):
+    defense = importlib.import_module("agent.defense")
+    turn = Turn.load(payload)
+    return defense.propose_defense(
+        turn,
+        state_for(payload),
+        clock=lambda: 0.0,
+        deadline=1.0,
+        max_expansions=64,
+    )
+
+
+class DefenseTests(unittest.TestCase):
+    def test_allocator_enforces_attack_phase_range_controller_and_count(self):
+        # Break caught: domain mistakes escape the shared action gate.
+        payload = defense_payload()
+        turn = Turn.load(payload)
+        base = {
+            "action": "attack",
+            "controllerId": "10010",
+            "targetPos": [{"x": 6, "y": 9}, {"x": 6, "y": 9}],
+        }
+        self.assertTrue(ActionAllocator(turn).try_add(ActionProposal(
+            10020, 10010, base,
+        )))
+
+        wrong_count = dict(base, targetPos=[{"x": 6, "y": 9}])
+        self.assertFalse(ActionAllocator(turn).try_add(ActionProposal(
+            10020, 10010, wrong_count,
+        )))
+        daylight = defense_payload(round_no=70)
+        self.assertFalse(ActionAllocator(Turn.load(daylight)).try_add(
+            ActionProposal(10020, 10010, base)
+        ))
+        far_controller = defense_payload()
+        far_controller["teamOur"]["roles"][0]["pos"] = {"x": 0, "y": 0}
+        self.assertFalse(ActionAllocator(Turn.load(far_controller)).try_add(
+            ActionProposal(10020, 10010, base)
+        ))
+
+    def test_weapon_level_target_count_and_cooldown(self):
+        # Break caught: upgraded target count or rocket cooldown is ignored.
+        candidates = proposals(defense_payload())
+        attacks = {
+            item.proposal.command_owner_id: item.proposal.command
+            for item in candidates
+            if item.proposal.command["action"] == "attack"
+        }
+
+        self.assertEqual(len(attacks[10020]["targetPos"]), 2)
+        self.assertEqual(len(attacks[10030]["targetPos"]), 1)
+        self.assertNotIn(10040, attacks)
+
+    def test_daylight_and_out_of_range_targets_are_not_attacked(self):
+        # Break caught: a structurally valid attack violates phase or range.
+        daylight = defense_payload(round_no=70)
+        self.assertFalse(any(
+            item.proposal.command["action"] == "attack"
+            for item in proposals(daylight)
+        ))
+
+        distant = defense_payload()
+        distant["robot"]["roles"] = [
+            robot(30001, "smallRobot", 19, 19, 40),
+        ]
+        self.assertFalse(any(
+            item.proposal.command["action"] == "attack"
+            for item in proposals(distant)
+        ))
+
+    def test_multi_tower_coordination_avoids_already_covered_kill(self):
+        # Break caught: both towers waste their full volley on a 10 HP target.
+        payload = defense_payload()
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = [
+            robot(30001, "smallRobot", 7, 8, 10),
+            robot(30002, "middleRobot", 9, 10, 60, target="defender"),
+        ]
+
+        attacks = [
+            item.proposal.command for item in proposals(payload)
+            if item.proposal.command["action"] == "attack"
+        ]
+
+        self.assertEqual(len(attacks), 2)
+        self.assertNotEqual(attacks[0]["targetPos"], attacks[1]["targetPos"])
+
+    def test_two_staffed_towers_do_not_recall_pioneer_without_third_job(self):
+        # Break caught: pioneer returns even though both available guns are staffed.
+        payload = defense_payload(round_no=65)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10011, "pioneer", 18, 18),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+        ]
+
+        candidates = proposals(payload)
+
+        self.assertFalse(any(
+            item.proposal.actor_id == 10011 for item in candidates
+        ))
+
+    def test_third_weapon_can_create_a_bounded_pioneer_gunner_plan(self):
+        # Break caught: the third tower exists but no third controller is assigned.
+        payload = defense_payload(round_no=65)
+        payload["teamOur"]["roles"][2]["pos"] = {"x": 17, "y": 6}
+
+        candidates = proposals(payload)
+        pioneer = [
+            item for item in candidates if item.proposal.actor_id == 10011
+        ]
+
+        self.assertEqual(len(pioneer), 1)
+        self.assertEqual(pioneer[0].proposal.command["action"], "move")
+        self.assertEqual(pioneer[0].plan_reason, "gunner:10040")
+
+    def test_enemy_occupied_gunner_stand_is_avoided(self):
+        # Break caught: an occupied gunner route is still scheduled.
+        occupied = defense_payload(round_no=65)
+        occupied["teamOur"]["roles"][2]["pos"] = {"x": 17, "y": 6}
+        occupied["teamEnemy"]["roles"] = [
+            unit(20010, "worker", 13, 6),
+        ]
+        pioneer = next(
+            item for item in proposals(occupied)
+            if item.proposal.actor_id == 10011
+        )
+        self.assertNotEqual(pioneer.plan_target, Turn.load(occupied).enemies[0].pos)
+        self.assertNotEqual(
+            pioneer.proposal.command["targetPos"], [{"x": 13, "y": 6}]
+        )
+
+    def test_missing_or_zero_health_station_does_not_disable_remaining_weapon(self):
+        # Break caught: loss of base crashes or suppresses a valid remaining gun.
+        for keep_zero_station in (False, True):
+            payload = defense_payload()
+            roles = payload["teamOur"]["roles"]
+            if keep_zero_station:
+                for entry in roles:
+                    if entry["roleType"] == "station":
+                        entry["health"] = 0
+            else:
+                payload["teamOur"]["roles"] = [
+                    entry for entry in roles if entry["roleType"] != "station"
+                ]
+
+            attacks = [
+                item for item in proposals(payload)
+                if item.proposal.command["action"] == "attack"
+            ]
+            self.assertTrue(attacks)
+
+    def test_distant_gunners_start_returning_even_if_they_miss_dusk(self):
+        # Break caught: every unstaffed tower retries one late worker then gives up.
+        payload = defense_payload(round_no=59)
+        payload["mapInfo"].update({"width": 41, "height": 32})
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 35, "y": 30}
+        payload["teamOur"]["roles"][1]["pos"] = {"x": 34, "y": 30}
+        payload["teamOur"]["roles"][2]["pos"] = {"x": 7, "y": 5}
+
+        moves = [
+            item for item in proposals(payload)
+            if item.proposal.command["action"] == "move"
+        ]
+
+        self.assertEqual({item.proposal.actor_id for item in moves}, {10010, 10012})
+        self.assertTrue(all(item.deadline_round > 70 for item in moves))
+
+        response = DecisionEngine().decide(payload)
+        self.assertEqual(
+            {
+                int(role_id)
+                for role_id, command in response["roleCommandMap"].items()
+                if command["action"] == "move"
+            },
+            {10010, 10012},
+        )
+
+    def test_route_cost_can_start_recall_before_fixed_dusk_window(self):
+        # Break caught: the fixed 12-round gate hides a 28-step return route.
+        payload = defense_payload(round_no=45)
+        payload["mapInfo"].update({"width": 41, "height": 32})
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 35, 30),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertEqual(engine.state.state.plans[10010].reason, "gunner:10020")
+
+        shorter = defense_payload(round_no=45)
+        shorter["teamOur"]["roles"] = [
+            unit(10010, "worker", 16, 6),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+        self.assertFalse(any(
+            item.plan_reason == "gunner:10020" for item in proposals(shorter)
+        ))
+
+    def test_railgun_conservatively_spends_energy_on_current_health(self):
+        # Break caught: another tower's forecast makes railgun energy pass through.
+        defense = importlib.import_module("agent.defense")
+        payload = defense_payload()
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 5),
+            unit(10030, "railgun", 6, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = [
+            robot(30001, "smallRobot", 7, 7, 10),
+            robot(30002, "smallRobot", 8, 8, 10),
+        ]
+        turn = Turn.load(payload)
+        projected = {30001: 10}
+
+        defense._apply_projected_damage(
+            turn,
+            turn.weapons()[0],
+            turn.robots[1],
+            1,
+            projected,
+        )
+
+        self.assertNotIn(30002, projected)
+
+
+if __name__ == "__main__":
+    unittest.main()

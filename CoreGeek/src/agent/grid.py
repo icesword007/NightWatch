@@ -1,5 +1,8 @@
+import time
+from dataclasses import dataclass
 from heapq import heappop, heappush
 from itertools import count
+from typing import Callable
 
 from .protocol import Pos, Turn, Unit, distance
 
@@ -10,8 +13,29 @@ _STEPS = (
 )
 
 
-def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
-    blocked = turn.blocked(moving)
+@dataclass(frozen=True, slots=True)
+class PathResult:
+    status: str
+    step: Pos | None
+    expansions: int
+    cost: int | None
+
+
+def next_step(
+    turn: Turn,
+    moving: Unit,
+    goal: Pos,
+    *,
+    reserved: frozenset[Pos] = frozenset(),
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float | None = None,
+    max_expansions: int = 256,
+) -> PathResult:
+    if moving.pos == goal:
+        return PathResult("already_there", None, 0, 0)
+    blocked = set(turn.blocked(moving))
+    blocked.update(reserved)
+    blocked.discard(moving.pos)
     order = count()
     frontier: list[tuple[int, int, int, Pos]] = [
         (distance(moving.pos, goal), 0, next(order), moving.pos)
@@ -19,14 +43,25 @@ def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
     came_from: dict[Pos, Pos] = {}
     best = {moving.pos: 0}
     seen: set[Pos] = set()
+    expansions = 0
 
     while frontier:
+        if deadline is not None and clock() >= deadline:
+            return PathResult("deadline", None, expansions, None)
+        if expansions >= max_expansions:
+            return PathResult("expansion_limit", None, expansions, None)
         _, cost, _, current = heappop(frontier)
         if current in seen:
             continue
         if current == goal:
-            return _first_step(came_from, moving.pos, goal)
+            return PathResult(
+                "found",
+                _first_step(came_from, moving.pos, goal),
+                expansions,
+                cost,
+            )
         seen.add(current)
+        expansions += 1
         for dx, dy in _STEPS:
             step = Pos(current.x + dx, current.y + dy)
             if step in blocked or not turn.land(step):
@@ -45,7 +80,7 @@ def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
                     step,
                 ),
             )
-    return None
+    return PathResult("unreachable", None, expansions, None)
 
 
 def _first_step(came_from: dict[Pos, Pos], start: Pos, goal: Pos) -> Pos:
