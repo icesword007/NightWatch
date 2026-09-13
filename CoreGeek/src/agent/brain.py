@@ -380,13 +380,16 @@ class DecisionEngine:
             )
         actions = []
         for domain, candidate in accepted:
-            actions.append({
+            action = {
                 "roleId": str(candidate.proposal.actor_id),
                 "domain": domain,
                 "reason": DecisionEngine._safe_action_reason(candidate),
                 "estimatedRounds": candidate.estimated_rounds or 1,
                 "deadlineRound": candidate.deadline_round,
-            })
+            }
+            if candidate.diagnostic is not None:
+                action["economy"] = copy.deepcopy(candidate.diagnostic)
+            actions.append(action)
         return {
             "roundNo": turn.round_no,
             "taskInstanceId": task_instance_id,

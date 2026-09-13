@@ -45,6 +45,7 @@ class PlannedAction:
     plan_reason: str | None = None
     deadline_round: int | None = None
     estimated_rounds: int | None = None
+    diagnostic: dict[str, Any] | None = None
 
 
 class ActionAllocator:

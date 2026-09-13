@@ -171,7 +171,10 @@ class EconomyTests(unittest.TestCase):
         )
         payload["teamOur"]["roles"][0]["backpack"] = []
         payload["teamOur"]["goldNum"] = 25
-        payload["lastRoundRoleActionResults"] = {"10010": True}
+        payload["lastRoundRoleActionResults"] = {
+            "10010": True,
+            "10012": False,
+        }
         built = None
         for round_no in range(31, 43):
             payload["roundNo"] = round_no
@@ -223,6 +226,180 @@ class EconomyTests(unittest.TestCase):
             response["roleCommandMap"]["10010"],
             {"action": "collect", "targetPos": [{"x": 2, "y": 2}]},
         )
+
+    def test_mining_prefers_higher_realizable_value_per_round_over_nearest(self):
+        # Break caught: nearest-first spends the day on low-value stone.
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-mine-yield"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 0}, "neutralType": "copper"},
+            {"pos": {"x": 6, "y": 0}, "neutralType": "vendor"},
+            {"pos": {"x": 8, "y": 0}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 1},
+            {"name": "copper", "price": 20},
+        ]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(4, 0))
+
+    def test_mining_reselects_when_current_quote_loses_realizable_value(self):
+        # Break caught: an in-transit mine plan ignores a changed official quote.
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-mine-reprice"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 0}, "neutralType": "copper"},
+            {"pos": {"x": 6, "y": 0}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 20},
+            {"name": "copper", "price": 1},
+        ]
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(10010, Pos(4, 0), "mine:copper", None)
+
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"],
+            {"action": "collect", "targetPos": [{"x": 1, "y": 1}]},
+        )
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(1, 1))
+
+    def test_mining_keeps_current_target_for_only_marginal_improvement(self):
+        # Break caught: tiny quote changes make the worker oscillate between mines.
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-mine-stable"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 0}, "neutralType": "copper"},
+            {"pos": {"x": 6, "y": 0}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 10},
+            {"name": "copper", "price": 11},
+        ]
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(10010, Pos(1, 1), "mine:stone", None)
+
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"],
+            {"action": "collect", "targetPos": [{"x": 1, "y": 1}]},
+        )
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(1, 1))
+
+    def test_mining_ignores_unreachable_high_value_mine(self):
+        # Break caught: quoted value is ranked without a legal collection stand.
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-mine-blocked"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 4}, "neutralType": "copper"},
+            {"pos": {"x": 6, "y": 0}, "neutralType": "vendor"},
+        ]
+        payload["teamOur"]["roles"].extend(
+            role(10100 + index, "wall", x, y, health=1000)
+            for index, (x, y) in enumerate(
+                (x, y)
+                for x in range(3, 6)
+                for y in range(3, 6)
+                if (x, y) != (4, 4)
+            )
+        )
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 1},
+            {"name": "copper", "price": 100},
+        ]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"],
+            {"action": "collect", "targetPos": [{"x": 1, "y": 1}]},
+        )
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(1, 1))
+
+    def test_mining_without_market_data_keeps_legal_nearest_behavior(self):
+        # Break caught: incomplete market data suppresses all basic collection.
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-mine-no-market"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 0}, "neutralType": "copper"},
+        ]
+        payload["vendorShopList"] = []
+        payload["weaponShopList"] = []
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"],
+            {"action": "collect", "targetPos": [{"x": 1, "y": 1}]},
+        )
+
+    def test_failed_collection_reselects_another_visible_mine(self):
+        # Break caught: a failed mine remains the best target and is retried forever.
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-mine-failed"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "copper"},
+            {"pos": {"x": 2, "y": 0}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 0}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 1},
+            {"name": "copper", "price": 20},
+        ]
+        engine = DecisionEngine()
+        first = engine.decide(payload)
+        self.assertEqual(
+            first["roleCommandMap"]["10010"],
+            {"action": "collect", "targetPos": [{"x": 1, "y": 1}]},
+        )
+
+        failed = copy.deepcopy(payload)
+        failed["roundNo"] = 31
+        failed["lastRoundRoleActionResults"] = {"10010": False}
+        response = engine.decide(failed)
+
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(2, 0))
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"].get("targetPos"),
+            [{"x": 1, "y": 1}],
+        )
+
+    def test_far_high_value_mine_is_rejected_when_liquidation_misses_dusk(self):
+        # Break caught: raw mineral price outranks a realizable near-dusk route.
+        payload = economy_payload(round_no=65, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-mine-dusk"
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 8, "y": 0}, "neutralType": "copper"},
+            {"pos": {"x": 3, "y": 0}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 1},
+            {"name": "copper", "price": 100},
+        ]
+
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or plan.target != Pos(8, 0))
 
     def test_funding_sell_uses_only_quantity_needed_for_current_deficit(self):
         engine = DecisionEngine()
@@ -301,6 +478,470 @@ class EconomyTests(unittest.TestCase):
         ]
         self.assertEqual(len(buys), 1)
         self.assertEqual(buys[0]["name"], "Medicine")
+
+    def test_two_workers_jointly_sell_buy_use_and_return_to_distinct_posts(self):
+        # Break caught: two real inventories are never coordinated when each is short.
+        payload = economy_payload(round_no=30, worker_pos=(1, 1))
+        payload["teamOur"]["teamId"] = "economy-joint-full-chain"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 1, 3, items=("copper",) * 6),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+        actions = []
+
+        for _ in range(35):
+            response = engine.decide(payload)
+            commands = response["roleCommandMap"]
+            actions.extend(command["action"] for command in commands.values())
+            self.assertLessEqual(sum(
+                command["action"] == "buy" for command in commands.values()
+            ), 1)
+            for raw_id, command in commands.items():
+                role_id = int(raw_id)
+                actor = next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == role_id
+                )
+                action = command["action"]
+                if action == "move":
+                    actor["pos"] = copy.deepcopy(command["targetPos"][0])
+                elif action == "sell":
+                    quantity = command["num"]
+                    for _ in range(quantity):
+                        actor["backpack"].remove(command["name"])
+                    payload["teamOur"]["goldNum"] += 10 * quantity
+                elif action == "buy":
+                    payload["teamOur"]["goldNum"] -= 100
+                    actor["backpack"].append(command["name"])
+                elif action == "use":
+                    actor["backpack"].remove(command["name"])
+                    target_pos = command["targetPos"][0]
+                    target = next(
+                        entry for entry in payload["teamOur"]["roles"]
+                        if entry["pos"] == target_pos
+                    )
+                    target["level"] += 1
+            payload["lastRoundRoleActionResults"] = {
+                role_id: True for role_id in commands
+            }
+            payload["roundNo"] += 1
+            workers = payload["teamOur"]["roles"][:2]
+            staffed = {
+                tower["id"]
+                for tower in payload["teamOur"]["roles"]
+                if tower["roleType"] in ("gatling", "railgun", "rocket")
+                and any(max(
+                    abs(worker["pos"]["x"] - tower["pos"]["x"]),
+                    abs(worker["pos"]["y"] - tower["pos"]["y"]),
+                ) == 1 for worker in workers)
+            }
+            if "use" in actions and len(staffed) == 2:
+                break
+
+        self.assertIn("sell", actions)
+        self.assertIn("buy", actions)
+        self.assertIn("use", actions)
+        self.assertEqual(len(staffed), 2)
+
+    def test_joint_funding_waits_for_confirmed_shared_gold(self):
+        # Break caught: the buyer spends a collaborator's expected sale proceeds.
+        payload = economy_payload(round_no=30, worker_pos=(3, 1))
+        payload["teamOur"]["teamId"] = "economy-joint-confirmed-gold"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",) * 6),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)
+        self.assertEqual(
+            {command["action"] for command in first["roleCommandMap"].values()},
+            {"sell"},
+        )
+        joint_plans = [
+            plan for role_id, plan in engine.state.state.plans.items()
+            if role_id in (10010, 10012) and ":joint:" in plan.reason
+        ]
+        self.assertEqual(len(joint_plans), 2)
+
+        buyer_command = first["roleCommandMap"]["10010"]
+        buyer = payload["teamOur"]["roles"][0]
+        for _ in range(buyer_command["num"]):
+            buyer["backpack"].remove("copper")
+        payload["teamOur"]["goldNum"] = buyer_command["num"] * 10
+        payload["roundNo"] = 31
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        second = engine.decide(payload)
+
+        self.assertFalse(any(
+            command["action"] == "buy"
+            for command in second["roleCommandMap"].values()
+        ))
+        self.assertEqual(
+            second["roleCommandMap"]["10012"]["action"], "sell",
+        )
+        self.assertLess(payload["teamOur"]["goldNum"], 100)
+
+    def test_joint_funding_rejects_insufficient_or_late_combined_value(self):
+        # Break caught: an incomplete or untimely pair is protected as critical funding.
+        base = economy_payload(round_no=30, worker_pos=(1, 1))
+        base["teamOur"]["teamId"] = "economy-joint-reject"
+        base["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 1, 3, items=("copper",) * 4),
+        )
+        base["teamOur"]["roles"][0]["backpack"] = ["copper"] * 4
+        base["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        base["vendorShopList"] = [{"name": "copper", "price": 10}]
+        base["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+
+        insufficient_engine = DecisionEngine()
+        insufficient_engine.decide(base)
+        self.assertFalse(any(
+            ":joint:" in plan.reason
+            for plan in insufficient_engine.state.state.plans.values()
+        ))
+
+        late = copy.deepcopy(base)
+        late["teamOur"]["teamId"] = "economy-joint-late"
+        late["roundNo"] = 65
+        late["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        late["teamOur"]["roles"][1]["backpack"] = ["copper"] * 6
+        late["teamOur"]["roles"][1]["pos"] = {"x": 11, "y": 11}
+        late_engine = DecisionEngine()
+        late_engine.decide(late)
+        self.assertFalse(any(
+            ":joint:" in plan.reason
+            for plan in late_engine.state.state.plans.values()
+        ))
+
+    def test_joint_upgrade_does_not_preempt_missing_third_tower(self):
+        # Break caught: a combined upgrade commitment outranks the core tower line.
+        payload = economy_payload(round_no=30, worker_pos=(1, 1))
+        payload["teamOur"]["teamId"] = "economy-joint-after-towers"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 1, 3, items=("copper",)),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"]
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 15}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 20},
+        ]
+
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        self.assertFalse(any(
+            ":joint:" in plan.reason
+            for plan in engine.state.state.plans.values()
+        ))
+
+    def test_accepted_mining_and_joint_actions_emit_bounded_diagnostics(self):
+        # Break caught: an accepted economic choice cannot be reconstructed from trace.
+        mining = economy_payload(round_no=30, worker_pos=(0, 0))
+        mining["teamOur"]["teamId"] = "economy-mining-trace"
+        mining["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 0}, "neutralType": "copper"},
+            {"pos": {"x": 6, "y": 0}, "neutralType": "vendor"},
+        ]
+        mining["vendorShopList"] = [
+            {"name": "stone", "price": 1},
+            {"name": "copper", "price": 20},
+        ]
+        mining_trace = []
+        DecisionEngine().decide(mining, trace_sink=mining_trace.append)
+        mining_action = next(
+            action for action in mining_trace[0]["actions"]
+            if action["roleId"] == "10010"
+        )
+        self.assertEqual(mining_action["economy"], {
+            "kind": "mining",
+            "mineral": "copper",
+            "target": {"x": 4, "y": 0},
+            "estimatedValue": 20,
+            "estimatedRounds": 7,
+        })
+
+        joint = economy_payload(round_no=30, worker_pos=(3, 1))
+        joint["teamOur"]["teamId"] = "economy-joint-trace"
+        joint["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",) * 6),
+        )
+        joint["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        joint["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        joint["vendorShopList"] = [{"name": "copper", "price": 10}]
+        joint["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        joint_trace = []
+        DecisionEngine().decide(joint, trace_sink=joint_trace.append)
+        details = [action["economy"] for action in joint_trace[0]["actions"]]
+        self.assertEqual(len(details), 2)
+        self.assertTrue(all(detail["kind"] == "jointFunding" for detail in details))
+        self.assertTrue(all(detail["purchase"] == "WeaponUpgradeVoucher1" for detail in details))
+        self.assertTrue(all(detail["participants"] == ["10010", "10012"] for detail in details))
+        self.assertTrue(all(detail["currentGold"] == 0 for detail in details))
+        self.assertEqual(
+            {tuple(sorted(detail["expectedContribution"].items())) for detail in details},
+            {(('10010', 60), ('10012', 40))},
+        )
+
+    def test_cancelled_joint_plan_reports_reason_on_accepted_fallback(self):
+        # Break caught: a stale joint commitment disappears without a bounded reason.
+        payload = economy_payload(round_no=30, worker_pos=(3, 1))
+        payload["teamOur"]["teamId"] = "economy-joint-cancel-trace"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",) * 6),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+            {"pos": {"x": 1, "y": 1}, "neutralType": "copper"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        changed = copy.deepcopy(payload)
+        changed["roundNo"] = 31
+        changed["weaponShopList"][0]["price"] = 130
+        changed["lastRoundRoleActionResults"] = {}
+        traces = []
+        engine.decide(changed, trace_sink=traces.append)
+
+        reasons = {
+            action.get("economy", {}).get("jointCancelReason")
+            for action in traces[0]["actions"]
+        }
+        self.assertIn("combined_value_insufficient", reasons)
+
+    def test_successful_joint_use_finishes_with_distinct_bound_posts(self):
+        # Break caught: completed joint use is mistaken for target invalidation.
+        payload = economy_payload(round_no=41, worker_pos=(1, 1))
+        payload["teamOur"]["teamId"] = "economy-joint-return"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 10, 8),
+        )
+        next(
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["id"] == 10020
+        )["level"] = 2
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10010,
+            Pos(8, 2),
+            "fund:WeaponUpgradeVoucher1:10030:10020:joint:10010",
+            69,
+        )
+        engine.state.set_plan(
+            10012,
+            Pos(8, 8),
+            "fund:WeaponUpgradeVoucher1:10040:10020:joint:10010",
+            69,
+        )
+        engine.state.state.action_history.append(CompletedAction(
+            PendingAction(
+                40,
+                10010,
+                10010,
+                "use",
+                Pos(8, 2),
+                source_session=engine.state.state.session_index,
+                name="WeaponUpgradeVoucher1",
+            ),
+            True,
+        ))
+
+        bound_posts = {10010: 10030, 10012: 10040}
+        for _ in range(20):
+            response = engine.decide(payload)
+            commands = response["roleCommandMap"]
+            if _ == 0:
+                self.assertNotIn("10012", commands)
+            for worker_id, post_id in bound_posts.items():
+                worker = next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == worker_id
+                )
+                post = next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == post_id
+                )
+                at_post = max(
+                    abs(worker["pos"]["x"] - post["pos"]["x"]),
+                    abs(worker["pos"]["y"] - post["pos"]["y"]),
+                ) == 1
+                if not at_post:
+                    self.assertEqual(commands[str(worker_id)]["action"], "move")
+                    self.assertIn(
+                        ":joint:", engine.state.state.plans[worker_id].reason,
+                    )
+            for raw_id, command in commands.items():
+                self.assertEqual(command["action"], "move")
+                worker = next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == int(raw_id)
+                )
+                worker["pos"] = copy.deepcopy(command["targetPos"][0])
+            payload["lastRoundRoleActionResults"] = {
+                role_id: True for role_id in commands
+            }
+            payload["roundNo"] += 1
+            if all(
+                max(
+                    abs(next(
+                        entry for entry in payload["teamOur"]["roles"]
+                        if entry["id"] == worker_id
+                    )["pos"][axis] - next(
+                        entry for entry in payload["teamOur"]["roles"]
+                        if entry["id"] == post_id
+                    )["pos"][axis])
+                    for axis in ("x", "y")
+                ) == 1
+                for worker_id, post_id in bound_posts.items()
+            ):
+                break
+
+        self.assertGreater(_, 0)
+        self.assertLess(_, 19)
+
+    def test_joint_route_with_colliding_first_steps_is_not_partly_committed(self):
+        # Break caught: only one side of a coordinated route reaches the response.
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-joint-collision"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 0, 2, items=("copper",) * 6),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": 1}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["teamOur"]["roles"].extend(
+            role(11000 + index, "wall", x, y, health=1000)
+            for index, (x, y) in enumerate(
+                ((1, 0), (2, 0), (3, 0), (3, 1),
+                 (3, 2), (2, 2), (1, 2))
+            )
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+
+        response = engine.decide(payload)
+
+        destinations = [
+            tuple(command["targetPos"][0].values())
+            for command in response["roleCommandMap"].values()
+            if command["action"] == "move"
+        ]
+        self.assertEqual(len(destinations), len(set(destinations)))
+        self.assertFalse(any(
+            ":joint:" in plan.reason
+            for plan in engine.state.state.plans.values()
+        ))
+
+    def test_missing_joint_feedback_allows_self_care_without_prepayment(self):
+        payload = economy_payload(round_no=30, worker_pos=(3, 1))
+        payload["teamOur"]["teamId"] = "economy-joint-self-care"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",) * 6),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        changed = copy.deepcopy(payload)
+        changed["roundNo"] = 31
+        changed["teamOur"]["roles"][0]["health"] = 100
+        changed["teamOur"]["roles"][0]["backpack"].append("Medicine")
+        changed["lastRoundRoleActionResults"] = {}
+        response = engine.decide(changed)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"],
+            {"action": "use", "name": "Medicine"},
+        )
+        self.assertFalse(any(
+            command["action"] == "buy"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertFalse(any(
+            ":joint:" in plan.reason
+            for plan in engine.state.state.plans.values()
+        ))
+
+    def test_dead_joint_contributor_releases_survivor_without_prepayment(self):
+        payload = economy_payload(round_no=30, worker_pos=(3, 1))
+        payload["teamOur"]["teamId"] = "economy-joint-death"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",) * 6),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        changed = copy.deepcopy(payload)
+        changed["roundNo"] = 31
+        changed["teamOur"]["roles"][1]["health"] = 0
+        changed["lastRoundRoleActionResults"] = {}
+        response = engine.decide(changed)
+
+        self.assertFalse(any(
+            command["action"] == "buy"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertFalse(any(
+            ":joint:" in plan.reason
+            for plan in engine.state.state.plans.values()
+        ))
 
     def test_failed_sell_feedback_never_assumes_shared_gold_arrived(self):
         engine = DecisionEngine()
