@@ -88,6 +88,71 @@ def proposals(payload):
 
 
 class DefenseTests(unittest.TestCase):
+    def _limited_route_payload(self):
+        payload = defense_payload(round_no=65)
+        payload["mapInfo"].update({
+            "width": 12,
+            "height": 12,
+            "zones": [
+                {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            ],
+        })
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 0, 0),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = []
+        payload["robot"]["roles"] = []
+        return payload
+
+    def test_gunner_route_continues_after_local_expansion_limit(self):
+        # Break caught: one hard stand hides another reachable gunner stand.
+        defense = importlib.import_module("agent.defense")
+        payload = self._limited_route_payload()
+        turn = Turn.load(payload)
+
+        candidates = defense.propose_defense(
+            turn,
+            state_for(payload),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=7,
+        )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].proposal.command, {
+            "action": "move", "targetPos": [{"x": 0, "y": 1}],
+        })
+        self.assertEqual(candidates[0].plan_target, Pos(5, 6))
+        self.assertEqual(candidates[0].plan_reason, "gunner:10020")
+
+    def test_gunner_route_stops_after_global_deadline(self):
+        defense = importlib.import_module("agent.defense")
+        turn = Turn.load(self._limited_route_payload())
+        worker = turn.unit(10010)
+        weapon = turn.unit(10020)
+
+        class ExpiredClock:
+            calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                return 10.0
+
+        clock = ExpiredClock()
+        route = defense._gunner_route(
+            turn,
+            worker,
+            weapon,
+            clock,
+            5.0,
+            7,
+        )
+
+        self.assertIsNone(route)
+        self.assertEqual(clock.calls, 1)
+
     def test_allocator_enforces_attack_phase_range_controller_and_count(self):
         # Break caught: domain mistakes escape the shared action gate.
         payload = defense_payload()

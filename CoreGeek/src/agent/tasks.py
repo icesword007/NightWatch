@@ -312,6 +312,10 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         "for a complete answer, or complete:false for a reliable partial answer. "
         'Use {"kind":"abandon","reason":"<why evidence is insufficient>"} '
         "instead of fabricating an answer. "
+        "If the task gives an explicit file path, inspect that exact path directly. "
+        "If it gives only a filename, use a bounded filename search. "
+        "If it names no file, use a single input only when exactly one task-relevant input "
+        "is evident. Do not assume the entire sandbox contains only one file. "
         "Never claim success from an empty, failed, timed-out, or truncated result.\n"
         f"{context_text}\nSolver history:\n{history_text}\nTask:\n{task_text}"
     )

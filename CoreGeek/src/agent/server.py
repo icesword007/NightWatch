@@ -10,7 +10,7 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s1-r6"
+BUILD_ID = "nightwatch-s1-r7"
 MAX_LOG_ITEMS = 16
 MAX_LOG_TARGETS = 3
 LOG_INVENTORY_ITEMS = (

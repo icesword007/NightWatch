@@ -84,6 +84,203 @@ def state_for(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    def test_real_economy_entry_uses_reachable_funding_route_after_local_limit(self):
+        # Break caught: the real planner mines stone when one hard vendor stand
+        # hides other reachable stands for a fully funded upgrade route.
+        payload = economy_payload(
+            worker_pos=(0, 0),
+            items=("copper",) * 20,
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 6, "y": 6}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 8}, "neutralType": "weaponShop"},
+        ]
+        turn = Turn.load(payload)
+
+        candidates = economy.propose_economy(
+            turn,
+            state_for(payload),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=7,
+        )
+
+        funding = [
+            candidate for candidate in candidates
+            if candidate.plan_reason
+            == "fund:WeaponUpgradeVoucher1:10020:10020"
+        ]
+        self.assertEqual(len(funding), 1)
+        self.assertEqual(funding[0].proposal.command_owner_id, 10010)
+        self.assertEqual(funding[0].proposal.actor_id, 10010)
+        self.assertEqual(funding[0].proposal.command, {
+            "action": "move", "targetPos": [{"x": 0, "y": 1}],
+        })
+        self.assertEqual(funding[0].proposal.destination, Pos(0, 1))
+        self.assertTrue(ActionAllocator(turn).try_add(funding[0].proposal))
+
+    def test_real_economy_entry_moves_to_vendor_after_local_limit(self):
+        # Break caught: the execution move gives up after one hard vendor stand.
+        payload = economy_payload(
+            worker_pos=(0, 0),
+            items=("copper",) * 100,
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 6, "y": 6}, "neutralType": "vendor"},
+        ]
+        payload["weaponShopList"] = []
+        turn = Turn.load(payload)
+
+        candidates = economy.propose_economy(
+            turn,
+            state_for(payload),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=7,
+        )
+
+        vendor_moves = [
+            candidate for candidate in candidates
+            if candidate.plan_reason == "vendor"
+        ]
+        self.assertEqual(len(vendor_moves), 1)
+        self.assertEqual(vendor_moves[0].proposal.command, {
+            "action": "move", "targetPos": [{"x": 0, "y": 1}],
+        })
+        self.assertEqual(vendor_moves[0].proposal.destination, Pos(0, 1))
+        self.assertEqual(vendor_moves[0].plan_target, Pos(6, 6))
+        self.assertTrue(ActionAllocator(turn).try_add(vendor_moves[0].proposal))
+
+    def test_economy_move_adjacent_stops_after_global_deadline(self):
+        payload = economy_payload(worker_pos=(0, 0))
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+        ]
+        turn = Turn.load(payload)
+        worker = turn.workers()[0]
+
+        class ExpiredClock:
+            calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                return 10.0
+
+        clock = ExpiredClock()
+        candidate = economy._move_adjacent(
+            turn,
+            worker,
+            Pos(6, 6),
+            "vendor",
+            None,
+            clock,
+            5.0,
+            7,
+        )
+
+        self.assertIsNone(candidate)
+        self.assertEqual(clock.calls, 1)
+
+    def test_real_economy_entry_checks_other_timely_shop_stands(self):
+        # Break caught: purchase timing rejects the shop after one hard stand.
+        payload = economy_payload(worker_pos=(0, 0), gold=100)
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 6, "y": 6}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = []
+        turn = Turn.load(payload)
+
+        candidates = economy.propose_economy(
+            turn,
+            state_for(payload),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=7,
+        )
+
+        shop_moves = [
+            candidate for candidate in candidates
+            if candidate.plan_reason == "shop:WeaponUpgradeVoucher1"
+        ]
+        self.assertEqual(len(shop_moves), 1)
+        self.assertEqual(shop_moves[0].proposal.command, {
+            "action": "move", "targetPos": [{"x": 0, "y": 1}],
+        })
+        self.assertEqual(shop_moves[0].proposal.destination, Pos(0, 1))
+        self.assertEqual(shop_moves[0].plan_target, Pos(6, 6))
+        self.assertTrue(ActionAllocator(turn).try_add(shop_moves[0].proposal))
+
+    def test_purchase_timeliness_stops_after_global_deadline(self):
+        payload = economy_payload(worker_pos=(0, 0), gold=100)
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 6, "y": 6}, "neutralType": "weaponShop"},
+        ]
+        turn = Turn.load(payload)
+        worker = turn.workers()[0]
+
+        class ExpiredClock:
+            calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                return 10.0
+
+        clock = ExpiredClock()
+        timely = economy._purchase_is_timely(
+            turn,
+            worker,
+            Pos(6, 6),
+            "WeaponUpgradeVoucher1",
+            clock,
+            5.0,
+            7,
+        )
+
+        self.assertFalse(timely)
+        self.assertEqual(clock.calls, 1)
+
+    def test_adjacent_route_keeps_found_stands_after_local_expansion_limit(self):
+        # Break caught: one hard stand discards other reachable target stands.
+        payload = economy_payload(worker_pos=(0, 0))
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [payload["teamOur"]["roles"][0]]
+        turn = Turn.load(payload)
+        worker = turn.workers()[0]
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            first = economy._routes_to_adjacent(
+                turn,
+                worker,
+                Pos(6, 6),
+                lambda: 0.0,
+                1.0,
+                7,
+            )
+            searches_after_first = context.path_searches
+            second = economy._routes_to_adjacent(
+                turn,
+                worker,
+                Pos(6, 6),
+                lambda: 0.0,
+                1.0,
+                7,
+            )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertEqual(first, ((Pos(5, 6), 6), (Pos(6, 5), 6)))
+        self.assertEqual(second, first)
+        self.assertEqual(context.truncated_reason, "expansion_limit")
+        self.assertEqual(context.cache_hits, 0)
+        self.assertGreater(context.path_searches, searches_after_first)
+
     def test_joint_planning_reuses_paths_and_keeps_real_actions(self):
         # Break caught: equivalent joint subroutes repeat thousands of searches.
         payload = economy_payload(
@@ -879,11 +1076,15 @@ class EconomyTests(unittest.TestCase):
         late["teamOur"]["roles"][1]["backpack"] = ["copper"] * 6
         late["teamOur"]["roles"][1]["pos"] = {"x": 11, "y": 11}
         late_engine = DecisionEngine()
-        late_engine.decide(late)
+        traces = []
+        late_engine.decide(late, trace_sink=traces.append)
         self.assertFalse(any(
             ":joint:" in plan.reason
             for plan in late_engine.state.state.plans.values()
         ))
+        self.assertEqual(
+            traces[0]["economyPlanning"]["jointStatus"], "return_deadline",
+        )
 
     def test_joint_upgrade_does_not_preempt_missing_third_tower(self):
         # Break caught: a combined upgrade commitment outranks the core tower line.

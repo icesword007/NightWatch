@@ -625,6 +625,23 @@ class TaskTests(unittest.TestCase):
         self.assertIn("python3 solve.py --stage one", prompt)
         self.assertIn("[exitCode:0]\nvalue=42", prompt)
 
+    def test_solver_prompt_gives_unambiguous_file_location_rules(self):
+        # Break caught: the solver scans broadly despite an explicit input path.
+        payload = task_payload(
+            round_no=1,
+            pioneer_pos=(3, 3),
+            phase_task="Read /sandbox/input/data.csv and compute the total.",
+        )
+
+        prompt = DecisionEngine().decide(payload)["prompt"]
+
+        self.assertIn("explicit file path", prompt)
+        self.assertIn("inspect that exact path directly", prompt)
+        self.assertIn("only a filename", prompt)
+        self.assertIn("bounded filename search", prompt)
+        self.assertIn("exactly one task-relevant input", prompt)
+        self.assertIn("Do not assume the entire sandbox contains only one file", prompt)
+
     def test_known_deadline_is_in_every_prompt_and_blocks_late_commands(self):
         # Break caught: normal command/result branches bypass the deadline policy.
         engine = DecisionEngine()

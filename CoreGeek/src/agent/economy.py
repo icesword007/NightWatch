@@ -96,6 +96,7 @@ class RouteSearchContext:
     cache_hits: int = 0
     truncated_reason: str | None = None
     joint_status: str | None = None
+    joint_blocker: str | None = None
 
 
 _ROUTE_SEARCH_CONTEXT: ContextVar[RouteSearchContext | None] = ContextVar(
@@ -820,6 +821,7 @@ def _joint_funding_actions(
             if action.proposal.destination is not None
         ]
         if len(destinations) != len(set(destinations)):
+            _note_joint_blocker(context, "action_conflict")
             continue
         if context is not None:
             context.joint_status = "accepted"
@@ -836,6 +838,8 @@ def _joint_funding_actions(
             context.joint_status = reason
         elif _joint_actual_funds_insufficient(turn, workers):
             context.joint_status = "actual_funds_insufficient"
+        elif context.joint_blocker is not None:
+            context.joint_status = context.joint_blocker
         else:
             context.joint_status = reason
     return (), frozenset(), {
@@ -859,6 +863,25 @@ def _joint_actual_funds_insufficient(
     return bool(prices) and actual_funds < min(prices)
 
 
+def _note_joint_blocker(
+    context: RouteSearchContext | None,
+    blocker: str,
+) -> None:
+    if context is None:
+        return
+    priority = {
+        "target_unavailable": 1,
+        "sale_route_unavailable": 2,
+        "purchase_route_unavailable": 3,
+        "distinct_post_unavailable": 4,
+        "return_deadline": 5,
+        "action_conflict": 6,
+    }
+    current = priority.get(context.joint_blocker or "", 0)
+    if priority.get(blocker, 0) > current:
+        context.joint_blocker = blocker
+
+
 def _joint_funding_route(
     turn: Turn,
     buyer: Unit,
@@ -869,11 +892,13 @@ def _joint_funding_route(
     deadline: float,
     max_expansions: int,
 ) -> JointFundingRoute | None:
+    context = _ROUTE_SEARCH_CONTEXT.get()
     price = turn.weapon_prices.get(item)
     if price is None:
         return None
     target = _item_target(turn, item)
     if item != "Medicine" and target is None:
+        _note_joint_blocker(context, "target_unavailable")
         return None
     use_target_id = target.unit_id if target is not None else None
     if existing is not None and existing[2] != use_target_id:
@@ -909,10 +934,14 @@ def _joint_funding_route(
         max_expansions,
     )
     if not buyer_starts or not contributor_starts:
+        _note_joint_blocker(context, "sale_route_unavailable")
         return None
 
     preferred_buyer_post = existing[1] if existing is not None else None
     best = None
+    purchase_found = False
+    distinct_post_found = False
+    deadline_rejected = False
     for buyer_vendor, buyer_stand, buyer_sale_rounds in buyer_starts:
         at_buyer_start = replace(buyer, pos=buyer_stand)
         purchase = (
@@ -940,6 +969,7 @@ def _joint_funding_route(
         )
         if purchase is None:
             continue
+        purchase_found = True
         for contributor_vendor, contributor_stand, contributor_sale_rounds in (
             contributor_starts
         ):
@@ -953,6 +983,7 @@ def _joint_funding_route(
             ):
                 if weapon.unit_id == purchase.post_weapon_id:
                     continue
+                distinct_post_found = True
                 readiness = max(buyer_sale_rounds, contributor_sale_rounds)
                 buyer_rounds = readiness + purchase.rounds
                 contributor_rounds = contributor_sale_rounds + post_rounds
@@ -960,6 +991,7 @@ def _joint_funding_route(
                     buyer_rounds > turn.rounds_until_night
                     or contributor_rounds > turn.rounds_until_night
                 ):
+                    deadline_rejected = True
                     continue
                 candidate = JointFundingRoute(
                     buyer.unit_id,
@@ -989,6 +1021,13 @@ def _joint_funding_route(
                 )
                 if best is None or key < best[0]:
                     best = (key, candidate)
+    if best is None:
+        if deadline_rejected:
+            _note_joint_blocker(context, "return_deadline")
+        elif purchase_found and not distinct_post_found:
+            _note_joint_blocker(context, "distinct_post_unavailable")
+        elif not purchase_found:
+            _note_joint_blocker(context, "purchase_route_unavailable")
     return best[1] if best is not None else None
 
 
@@ -2378,7 +2417,7 @@ def _purchase_is_timely(
         elif path.status == "found" and path.cost is not None:
             shop_rounds = path.cost
         else:
-            if path.status in ("deadline", "expansion_limit"):
+            if path.status == "deadline":
                 return False
             continue
 
@@ -2433,6 +2472,7 @@ def _routes_to_adjacent(
         context.cache_hits += 1
         return context.routes[cache_key]
     routes = []
+    complete = True
     for stand in _adjacent_stands(turn, worker, target):
         if (
             context is not None
@@ -2454,12 +2494,17 @@ def _routes_to_adjacent(
             routes.append((stand, 0))
         elif path.status == "found" and path.cost is not None:
             routes.append((stand, path.cost))
-        elif path.status in ("deadline", "expansion_limit"):
+        elif path.status == "deadline":
             if context is not None:
                 context.truncated_reason = path.status
             return ()
+        elif path.status == "expansion_limit":
+            if context is not None:
+                context.truncated_reason = path.status
+            complete = False
+            continue
     result = tuple(routes)
-    if context is not None:
+    if context is not None and complete:
         context.routes[cache_key] = result
     return result
 
@@ -2565,8 +2610,10 @@ def _move_adjacent(
                 reason,
                 deadline_round,
             )
-        if path.status in ("deadline", "expansion_limit"):
+        if path.status == "deadline":
             return None
+        if path.status == "expansion_limit":
+            continue
     return None
 
 

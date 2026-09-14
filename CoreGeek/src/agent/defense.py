@@ -634,8 +634,10 @@ def _gunner_route(
             and path.cost is not None
         ):
             return stand, path.step, path.cost
-        if path.status in ("deadline", "expansion_limit"):
+        if path.status == "deadline":
             return None
+        if path.status == "expansion_limit":
+            continue
     return None
 
 
