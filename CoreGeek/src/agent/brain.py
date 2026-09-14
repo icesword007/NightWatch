@@ -12,8 +12,9 @@ from .defense import (
     task_pioneer_day_return_action,
     task_pioneer_recall_action,
 )
-from .economy import propose_economy
-from .protocol import Pos, Turn, Unit, distance, move_command
+from .economy import propose_economy, wall_build_positions
+from .fortification import fortification_diagnostic, prepare_fortification
+from .protocol import TOWER_TYPES, Pos, Turn, Unit, distance, move_command
 from .state import StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
 
@@ -87,16 +88,35 @@ class DecisionEngine:
                 deadline,
                 started + self.budget_seconds * ECONOMY_BUDGET_FRACTION,
             )
+            if turn.is_day and turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS:
+                fortification_builder_id = None
+                state.fortification_phase = "waiting"
+                state.fortification_skip_reason = "dusk_positioning"
+            else:
+                fortification_builder_id = prepare_fortification(
+                    turn,
+                    state,
+                    wall_build_positions(turn),
+                    reserved_role_ids=task_role_ids,
+                    clock=self.clock,
+                    deadline=economy_deadline,
+                    max_expansions=self.max_search_expansions,
+                )
             economy_candidates = propose_economy(
                 turn,
                 state,
                 clock=self.clock,
                 deadline=economy_deadline,
                 max_expansions=self.max_search_expansions,
-                need_wall=self._needs_wall_trial(turn, state),
+                need_wall=self._needs_fortification(turn, state),
+                fortification_builder_id=fortification_builder_id,
                 reserved_role_ids=task_role_ids,
                 diagnostic_sink=economy_diagnostics.append,
             )
+            if economy_diagnostics:
+                economy_diagnostics[0]["fortification"] = (
+                    fortification_diagnostic(turn, state)
+                )
             critical_economy = tuple(
                 candidate for candidate in economy_candidates
                 if self._is_critical_economy(candidate)
@@ -107,6 +127,9 @@ class DecisionEngine:
             )
             funding_roles, funding_posts = self._funding_reservations(
                 critical_economy if turn.is_day else (),
+                state,
+                turn,
+                include_existing=turn.is_day,
             )
             day_return = (
                 task_pioneer_day_return_action(
@@ -340,6 +363,10 @@ class DecisionEngine:
     @staticmethod
     def _funding_reservations(
         candidates: tuple[Any, ...],
+        state: Any,
+        turn: Turn,
+        *,
+        include_existing: bool = True,
     ) -> tuple[frozenset[int], frozenset[int]]:
         roles: set[int] = set()
         weapons: set[int] = set()
@@ -357,6 +384,31 @@ class DecisionEngine:
             if weapon_id <= 0:
                 continue
             roles.add(candidate.proposal.actor_id)
+            weapons.add(weapon_id)
+        for role_id, plan in state.plans.items() if include_existing else ():
+            if (
+                not plan.reason.startswith("fund:")
+                or plan.reason.startswith("fund:build:")
+            ):
+                continue
+            parts = plan.reason.split(":")
+            if len(parts) < 3:
+                continue
+            try:
+                weapon_id = int(parts[2])
+            except ValueError:
+                continue
+            if weapon_id <= 0:
+                continue
+            role = turn.unit(role_id)
+            weapon = turn.unit(weapon_id)
+            if (
+                role is None
+                or weapon is None
+                or weapon.kind not in TOWER_TYPES
+            ):
+                continue
+            roles.add(role_id)
             weapons.add(weapon_id)
         return frozenset(roles), frozenset(weapons)
 
@@ -523,24 +575,14 @@ class DecisionEngine:
         return False
 
     @staticmethod
-    def _needs_wall_trial(turn: Turn, state: Any) -> bool:
+    def _needs_fortification(turn: Turn, state: Any) -> bool:
         if (
             not turn.is_day
             or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
             or len(turn.weapons()) < 3
-            or turn.walls()
-            or state.wall_trial_started
-            or any(plan.reason == "build:wall" for plan in state.plans.values())
         ):
             return False
-        if any(
-            completed.pending.action == "build"
-            and completed.pending.name == "wall"
-            and completed.pending.source_session == state.session_index
-            for completed in state.action_history
-        ):
-            return False
-        return any("stone" in worker.backpack for worker in turn.workers())
+        return bool(state.fortification_targets)
 
     def _basic_probe(
         self,

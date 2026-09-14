@@ -88,6 +88,33 @@ def proposals(payload):
 
 
 class DefenseTests(unittest.TestCase):
+    def test_daytime_gunner_route_prefers_back_side_of_tower(self):
+        # Break caught: nearest front-side stands ignore the directional wall plan.
+        defense = importlib.import_module("agent.defense")
+        payload = defense_payload(round_no=5)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 10, 3),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 10, 5, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 1, 9, health=1500),
+        ]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+
+        route = defense._gunner_route(
+            turn,
+            turn.unit(10010),
+            turn.unit(10020),
+            lambda: 0.0,
+            1.0,
+            64,
+        )
+
+        self.assertIsNotNone(route)
+        self.assertEqual(route[0], Pos(11, 4))
+
     def _limited_route_payload(self):
         payload = defense_payload(round_no=65)
         payload["mapInfo"].update({
@@ -122,9 +149,9 @@ class DefenseTests(unittest.TestCase):
 
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].proposal.command, {
-            "action": "move", "targetPos": [{"x": 0, "y": 1}],
+            "action": "move", "targetPos": [{"x": 1, "y": 0}],
         })
-        self.assertEqual(candidates[0].plan_target, Pos(5, 6))
+        self.assertEqual(candidates[0].plan_target, Pos(6, 5))
         self.assertEqual(candidates[0].plan_reason, "gunner:10020")
 
     def test_gunner_route_stops_after_global_deadline(self):
@@ -192,6 +219,45 @@ class DefenseTests(unittest.TestCase):
         self.assertEqual(len(attacks[10020]["targetPos"]), 2)
         self.assertEqual(len(attacks[10030]["targetPos"]), 1)
         self.assertNotIn(10040, attacks)
+
+    def test_night_defense_ignores_stale_daytime_funding_reservation(self):
+        # Break caught: a retained daytime fund plan suppresses a live night gun.
+        payload = defense_payload()
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10010,
+            Pos(6, 6),
+            "fund:WeaponUpgradeVoucher1:10020:10020",
+            80,
+        )
+
+        response = engine.decide(payload)
+
+        self.assertIn("10020", response["roleCommandMap"])
+        self.assertEqual(
+            response["roleCommandMap"]["10020"]["action"], "attack",
+        )
+
+    def test_invalid_daytime_funding_post_does_not_block_gunner_return(self):
+        payload = self._limited_route_payload()
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10010,
+            Pos(6, 6),
+            "fund:WeaponUpgradeVoucher1:99999:99999",
+            70,
+        )
+
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"]["action"], "move",
+        )
+        self.assertEqual(engine.state.state.plans[10010].reason, "gunner:10020")
 
     def test_daylight_and_out_of_range_targets_are_not_attacked(self):
         # Break caught: a structurally valid attack violates phase or range.

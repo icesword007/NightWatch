@@ -41,6 +41,348 @@ def base_payload(*, round_no, team_id):
 
 
 class TeamTurnTests(unittest.TestCase):
+    def test_completed_tower_line_actively_collects_stone_for_fortification(self):
+        # Break caught: ordinary high-value mining can starve the approved wall line.
+        payload = base_payload(round_no=5, team_id="brain-r8-active-stone")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+            {"pos": {"x": 5, "y": 10}, "neutralType": "copper"},
+            {"pos": {"x": 2, "y": 2}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 100}]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10011, "worker", 15, 15),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "collect", "targetPos": [{"x": 5, "y": 8}],
+        })
+
+    def test_extra_far_stone_does_not_consume_build_and_return_search_budget(self):
+        payload = base_payload(round_no=5, team_id="brain-r8-stone-budget")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+            {"pos": {"x": 3, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "collect", "targetPos": [{"x": 5, "y": 8}],
+        })
+        self.assertIsNone(
+            traces[0]["economyPlanning"]["fortification"]["skipReason"],
+        )
+
+    def test_left_base_uses_enemy_facing_wall_targets_not_nearest_back_cell(self):
+        # Break caught: worker proximity overrides the observed horizontal attack side.
+        payload = base_payload(round_no=5, team_id="brain-r8-left-front")
+        worker = unit(10010, "worker", 6, 8)
+        worker["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"]["action"], "move",
+        )
+
+    def test_successful_wall_continues_to_a_second_fixed_target(self):
+        # Break caught: the former one-shot wall flag ends construction after one wall.
+        payload = base_payload(round_no=5, team_id="brain-r8-wall-chain")
+        worker = unit(10010, "worker", 11, 8)
+        worker["backpack"] = ["stone", "stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first["action"], "build")
+        first_target = first["targetPos"][0]
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        following["teamOur"]["roles"].append(
+            unit(10050, "wall", first_target["x"], first_target["y"], health=1000),
+        )
+        second = engine.decide(following)["roleCommandMap"]["10010"]
+
+        self.assertEqual(second["action"], "build")
+        self.assertEqual(second["name"], "wall")
+        self.assertNotEqual(second["targetPos"][0], first_target)
+
+    def test_collected_stone_switches_from_mining_to_wall_construction(self):
+        # Break caught: the ordinary mine plan keeps collecting after stone arrives.
+        payload = base_payload(round_no=5, team_id="brain-r8-mine-build")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first["action"], "collect")
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        second = engine.decide(following)["roleCommandMap"]["10010"]
+
+        self.assertIn(second["action"], ("move", "build"))
+        self.assertNotEqual(second["action"], "collect")
+
+    def test_failed_fortification_mine_moves_to_another_visible_stone(self):
+        # Break caught: dedicated stone mining retries one failed mine forever.
+        payload = base_payload(round_no=5, team_id="brain-r8-mine-failure")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+            {"pos": {"x": 5, "y": 10}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first["targetPos"], [{"x": 5, "y": 8}])
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {"10010": False}
+        second = engine.decide(following)["roleCommandMap"]["10010"]
+
+        self.assertEqual(second, {
+            "action": "collect", "targetPos": [{"x": 5, "y": 10}],
+        })
+
+    def test_old_wall_plan_stops_when_current_safety_check_rejects(self):
+        payload = base_payload(round_no=5, team_id="brain-r8-wall-safety-stop")
+        worker = unit(10010, "worker", 6, 8)
+        worker["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first["action"], "move")
+        self.assertEqual(engine.state.state.plans[10010].reason, "build:wall")
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["pos"] = {"x": 11, "y": 8}
+        with mock.patch(
+            "agent.fortification.safe_wall_targets", return_value=(),
+        ):
+            response = engine.decide(following)
+
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_old_wall_plan_stops_when_return_deadline_check_rejects(self):
+        payload = base_payload(round_no=5, team_id="brain-r8-wall-deadline-stop")
+        worker = unit(10010, "worker", 6, 8)
+        worker["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["pos"] = {"x": 11, "y": 8}
+        with mock.patch(
+            "agent.fortification._can_build_and_return", return_value=False,
+        ):
+            response = engine.decide(following)
+
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_old_wall_target_is_not_revived_when_new_target_has_no_action(self):
+        payload = base_payload(round_no=5, team_id="brain-r8-old-wall-stop")
+        worker = unit(10010, "worker", 6, 8)
+        worker["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+        old_target = engine.state.state.plans[10010].target
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["pos"] = {"x": 11, "y": 8}
+
+        def skip_only_old_target(turn, candidates):
+            return () if candidates == (old_target,) else candidates
+
+        with mock.patch(
+            "agent.fortification.safe_wall_targets",
+            side_effect=skip_only_old_target,
+        ), mock.patch(
+            "agent.fortification._can_build_and_return", return_value=True,
+        ), mock.patch(
+            "agent.economy._wall_action", return_value=None,
+        ):
+            response = engine.decide(following)
+
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_real_engine_completes_two_walls_across_continuous_feedback(self):
+        # Break caught: an in-transit wall plan excludes its own fixed target.
+        payload = base_payload(round_no=5, team_id="brain-r8-wall-continuous")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10011, "worker", 3, 3),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        built = []
+
+        for _ in range(35):
+            response = engine.decide(payload)
+            command = response["roleCommandMap"].get("10010")
+            if command is None:
+                break
+            action = command["action"]
+            worker = payload["teamOur"]["roles"][0]
+            if action == "move":
+                worker["pos"] = json.loads(json.dumps(command["targetPos"][0]))
+            elif action == "collect":
+                worker["backpack"].append("stone")
+            elif action == "build" and command.get("name") == "wall":
+                target = command["targetPos"][0]
+                built.append((target["x"], target["y"]))
+                worker["backpack"].remove("stone")
+                payload["teamOur"]["roles"].append(
+                    unit(10100 + len(built), "wall", target["x"], target["y"], health=1000),
+                )
+            payload["lastRoundRoleActionResults"] = {"10010": True}
+            payload["roundNo"] += 1
+            if len(built) == 2:
+                break
+
+        self.assertEqual(built, [(12, 8), (12, 9)])
+
+    def test_fortification_does_not_start_when_builder_cannot_build_and_return(self):
+        # Break caught: a fixed dusk threshold ignores the real mine/build/return route.
+        payload = base_payload(round_no=57, team_id="brain-r8-wall-deadline")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 0, "y": 1}, "neutralType": "copper"},
+            {"pos": {"x": 2, "y": 2}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 100}]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 0, 0),
+            unit(10013, "station", 17, 9, health=1500),
+            unit(10020, "gatling", 16, 8, health=1000),
+            unit(10030, "railgun", 17, 7, health=1000),
+            unit(10040, "rocket", 18, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 1, 9, health=1500),
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotEqual(response["roleCommandMap"]["10010"], {
+            "action": "collect", "targetPos": [{"x": 1, "y": 1}],
+        })
+
     def test_daytime_http_path_emits_c_batch_build_commands(self):
         # Break caught: economy helpers exist but HTTP still runs the S0 probe.
         payload = base_payload(round_no=1, team_id="http-c-build")
@@ -105,8 +447,8 @@ class TeamTurnTests(unittest.TestCase):
             "targetPos": [{"x": 6, "y": 9}],
         })
 
-    def test_completed_tower_line_can_emit_one_early_wall_trial(self):
-        # Break caught: the wall capability is never reachable from the coordinator.
+    def test_completed_tower_line_starts_one_stable_fortification_builder(self):
+        # Break caught: the active wall capability is never reached by the coordinator.
         payload = base_payload(round_no=5, team_id="brain-c-wall")
         worker = unit(10010, "worker", 6, 9)
         worker["backpack"] = ["stone"]
@@ -121,20 +463,19 @@ class TeamTurnTests(unittest.TestCase):
         engine = DecisionEngine()
         response = engine.decide(payload)
 
-        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "build")
-        self.assertEqual(response["roleCommandMap"]["10010"]["name"], "wall")
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertEqual(engine.state.state.fortification_builder_id, 10010)
+        self.assertEqual(len(engine.state.state.fortification_targets), 6)
 
         following = json.loads(json.dumps(payload))
         following["roundNo"] = 6
         following["lastRoundRoleActionResults"] = {"10010": False}
         response = engine.decide(following)
-        self.assertFalse(any(
-            command.get("action") == "build" and command.get("name") == "wall"
-            for command in response["roleCommandMap"].values()
-        ))
+        self.assertEqual(engine.state.state.fortification_builder_id, 10010)
+        self.assertEqual(len(engine.state.state.fortification_targets), 6)
 
-    def test_two_workers_share_one_wall_trial_reservation(self):
-        # Break caught: each worker starts a different one-time wall experiment.
+    def test_two_workers_share_one_fortification_builder(self):
+        # Break caught: both workers are assigned to the same construction chain.
         payload = base_payload(round_no=5, team_id="brain-c-wall-team-limit")
         payload["teamOur"]["roles"] = [
             unit(10010, "worker", 6, 9),
@@ -155,8 +496,8 @@ class TeamTurnTests(unittest.TestCase):
         ]
         self.assertEqual(len(wall_builds), 1)
 
-    def test_in_transit_wall_trial_survives_unknown_feedback_and_owner_death(self):
-        # Break caught: another worker starts a wall after the reserved move is unknown.
+    def test_in_transit_fortification_keeps_builder_until_owner_death(self):
+        # Break caught: another worker takes over after an in-transit move is unknown.
         payload = base_payload(round_no=5, team_id="brain-c-wall-in-transit")
         payload["teamOur"]["roles"] = [
             unit(10010, "worker", 0, 0),
@@ -206,8 +547,8 @@ class TeamTurnTests(unittest.TestCase):
             for plan in engine.state.state.plans.values()
         ))
 
-    def test_unknown_wall_build_feedback_does_not_open_another_trial(self):
-        # Break caught: missing feedback is treated as permission for another wall.
+    def test_unknown_wall_build_feedback_does_not_duplicate_the_attempt(self):
+        # Break caught: missing build feedback causes an immediate duplicate attempt.
         payload = base_payload(round_no=5, team_id="brain-c-wall-unknown")
         worker = unit(10010, "worker", 6, 9)
         worker["backpack"] = ["stone"]

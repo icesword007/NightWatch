@@ -83,7 +83,82 @@ def state_for(payload):
     return store.state
 
 
+def with_completed_wall_line(payload):
+    payload["teamOur"]["roles"].extend(
+        role(10100 + offset, "wall", offset, 11, health=1000)
+        for offset in range(6)
+    )
+    return payload
+
+
 class EconomyTests(unittest.TestCase):
+    def test_new_joint_funding_does_not_claim_reserved_wall_builder(self):
+        # Break caught: funding arbitration takes the builder selected before economy.
+        payload = economy_payload(round_no=30, worker_pos=(3, 1))
+        payload["teamOur"]["teamId"] = "economy-r8-builder-reservation"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",) * 6),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+
+        response = engine.decide(payload)
+        builder_id = engine.state.state.fortification_builder_id
+
+        self.assertIsNotNone(builder_id)
+        self.assertNotIn(
+            ":joint:", engine.state.state.plans[builder_id].reason,
+        )
+        self.assertIn(
+            response["roleCommandMap"][str(builder_id)]["action"],
+            ("move", "collect", "build"),
+        )
+
+    def test_wall_builder_replaces_old_ordinary_copper_route(self):
+        # Break caught: a preexisting ordinary mine plan starves construction forever.
+        payload = economy_payload(round_no=4, worker_pos=(0, 0))
+        payload["teamOur"]["teamId"] = "economy-r8-old-copper"
+        payload["teamOur"]["roles"] = [
+            payload["teamOur"]["roles"][0],
+            payload["teamOur"]["roles"][1],
+            payload["teamOur"]["roles"][2],
+            payload["teamOur"]["roles"][3],
+        ]
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+            {"pos": {"x": 4, "y": 0}, "neutralType": "copper"},
+            {"pos": {"x": 6, "y": 0}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 1},
+            {"name": "copper", "price": 20},
+        ]
+        engine = DecisionEngine()
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(engine.state.state.plans[10010].target, Pos(4, 0))
+
+        following = copy.deepcopy(payload)
+        following["roundNo"] = 5
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["pos"] = first["targetPos"][0]
+        following["teamOur"]["roles"].append(
+            role(10040, "rocket", 11, 8, health=1000),
+        )
+        second = engine.decide(following)["roleCommandMap"]["10010"]
+
+        self.assertEqual(second, {
+            "action": "collect", "targetPos": [{"x": 1, "y": 1}],
+        })
+
     def test_real_economy_entry_uses_reachable_funding_route_after_local_limit(self):
         # Break caught: the real planner mines stone when one hard vendor stand
         # hides other reachable stands for a fully funded upgrade route.
@@ -612,6 +687,7 @@ class EconomyTests(unittest.TestCase):
             {"name": "stone", "price": 1},
             {"name": "copper", "price": 20},
         ]
+        with_completed_wall_line(payload)
 
         engine = DecisionEngine()
         response = engine.decide(payload)
@@ -734,6 +810,7 @@ class EconomyTests(unittest.TestCase):
             {"name": "stone", "price": 1},
             {"name": "copper", "price": 20},
         ]
+        with_completed_wall_line(payload)
         engine = DecisionEngine()
         first = engine.decide(payload)
         self.assertEqual(
@@ -1125,6 +1202,7 @@ class EconomyTests(unittest.TestCase):
             {"name": "stone", "price": 1},
             {"name": "copper", "price": 20},
         ]
+        with_completed_wall_line(mining)
         mining_trace = []
         DecisionEngine().decide(mining, trace_sink=mining_trace.append)
         mining_action = next(

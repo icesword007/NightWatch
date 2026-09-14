@@ -124,7 +124,7 @@ class ServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(record["buildId"], "nightwatch-s1-r7")
+        self.assertEqual(record["buildId"], "nightwatch-s1-r8")
         self.assertEqual(
             record["team"], {"type": "challenger", "id": "s0-our"}
         )
@@ -299,6 +299,71 @@ class ServerTests(unittest.TestCase):
             "private command",
         ):
             self.assertNotIn(private, encoded)
+
+    def test_task_detail_log_records_whitelisted_interaction_text(self):
+        # Break caught: downloadable logs expose only presence flags, not semantics.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload.update({
+            "phaseTask": "synthetic task body",
+            "llmResp": '{"kind":"command","content":"ls input.txt"}',
+            "lastCmdResult": "[exitCode:0]\nsynthetic result",
+            "privateSecret": "must-not-leak",
+        })
+        payload["errors"] = [{"errorCode": 2, "description": "try again"}]
+        response = {
+            "roleCommandMap": {
+                "10011": {
+                    "action": "submitAnswer",
+                    "taskAnswer": "synthetic answer",
+                },
+            },
+            "prompt": "synthetic solver prompt",
+            "executeCmd": "ls input.txt",
+        }
+        trace = {"taskInstanceId": "task-7"}
+
+        record = server_module.task_detail_log_record(
+            payload, response, decision_trace=trace,
+        )
+
+        self.assertEqual(record["event"], "task_detail")
+        self.assertEqual(record["taskInstanceId"], "task-7")
+        self.assertEqual(record["inputAssociation"], {
+            "phaseTask": "current_active_task",
+            "llmResp": "unknown_previous_request",
+            "lastCmdResult": "unknown_previous_request",
+            "prompt": "current_active_task",
+            "executeCmd": "current_active_task",
+            "submittedAnswers": "current_active_task",
+        })
+        self.assertEqual(record["text"]["phaseTask"]["value"], "synthetic task body")
+        self.assertEqual(record["text"]["prompt"]["value"], "synthetic solver prompt")
+        self.assertEqual(record["text"]["llmResp"]["value"], payload["llmResp"])
+        self.assertEqual(
+            record["text"]["lastCmdResult"]["value"], payload["lastCmdResult"],
+        )
+        self.assertEqual(record["text"]["executeCmd"]["value"], "ls input.txt")
+        self.assertEqual(record["submittedAnswers"]["items"][0]["text"]["value"], "synthetic answer")
+        encoded = json.dumps(record, ensure_ascii=False)
+        self.assertNotIn("must-not-leak", encoded)
+        self.assertNotIn("privateSecret", encoded)
+
+    def test_task_detail_log_marks_own_and_platform_truncation(self):
+        # Break caught: downloaded evidence silently loses the tail of large fields.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["phaseTask"] = "x" * (server_module.MAX_TASK_DETAIL_CHARS + 7)
+        payload["lastCmdResult"] = "[exitCode:0]\nvalue\n[TRUNCATED]"
+
+        record = server_module.task_detail_log_record(
+            payload,
+            {"roleCommandMap": {}, "prompt": "", "executeCmd": ""},
+        )
+
+        phase = record["text"]["phaseTask"]
+        self.assertEqual(len(phase["value"]), server_module.MAX_TASK_DETAIL_CHARS)
+        self.assertEqual(phase["originalLength"], server_module.MAX_TASK_DETAIL_CHARS + 7)
+        self.assertTrue(phase["truncated"])
+        self.assertTrue(record["text"]["lastCmdResult"]["platformTruncated"])
 
     def test_turn_log_records_bounded_decision_trace_without_private_text(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))

@@ -369,6 +369,10 @@ class StateTests(unittest.TestCase):
             deadline_round=20,
             source_session=store.state.session_index,
         )
+        store.state.fortification_initialized = True
+        store.state.fortification_builder_id = 10010
+        store.state.fortification_targets = (Pos(5, 5),)
+        store.state.fortification_completed.add(Pos(5, 5))
         store.record_response(turn, fingerprint, {
             "roleCommandMap": {"10010": {"action": "move"}},
             "prompt": "",
@@ -387,6 +391,10 @@ class StateTests(unittest.TestCase):
         self.assertEqual(store.state.session_index, 2)
         self.assertEqual(store.state.plans, {})
         self.assertEqual(store.state.pending_actions, {})
+        self.assertFalse(store.state.fortification_initialized)
+        self.assertIsNone(store.state.fortification_builder_id)
+        self.assertEqual(store.state.fortification_targets, ())
+        self.assertEqual(store.state.fortification_completed, set())
         self.assertEqual(tuple(store.state.history), old_history)
         self.assertNotEqual(store.state.active_task.instance_id, old_task_id)
 

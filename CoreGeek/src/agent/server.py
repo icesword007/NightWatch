@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import time
@@ -10,7 +11,8 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s1-r7"
+BUILD_ID = "nightwatch-s1-r8"
+MAX_TASK_DETAIL_CHARS = 131_072
 MAX_LOG_ITEMS = 16
 MAX_LOG_TARGETS = 3
 LOG_INVENTORY_ITEMS = (
@@ -27,6 +29,148 @@ LOG_INVENTORY_ITEMS = (
     "WallUpgradeVoucher2",
 )
 LOG_STRUCTURE_TYPES = frozenset(("station", "gatling", "railgun", "rocket", "wall"))
+
+
+def task_detail_log_record(
+    payload: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    decision_trace: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    commands = response.get("roleCommandMap")
+    commands = commands if isinstance(commands, dict) else {}
+    submitted = []
+    for role_id, command in sorted(
+        commands.items(), key=lambda item: str(item[0]),
+    ):
+        if (
+            not isinstance(command, dict)
+            or command.get("action") != "submitAnswer"
+        ):
+            continue
+        submitted.append({
+            "roleId": str(role_id),
+            "text": _detail_text(command.get("taskAnswer")),
+        })
+    trace = decision_trace if isinstance(decision_trace, dict) else {}
+    task_instance_id = trace.get("taskInstanceId")
+    raw_text = {
+        "phaseTask": payload.get("phaseTask"),
+        "llmResp": payload.get("llmResp"),
+        "lastCmdResult": payload.get("lastCmdResult"),
+        "prompt": response.get("prompt"),
+        "executeCmd": response.get("executeCmd"),
+    }
+    relevant = (
+        any(isinstance(value, str) and value for value in raw_text.values())
+        or bool(submitted)
+        or task_instance_id is not None
+        or (
+            isinstance(payload.get("errors"), list)
+            and bool(payload.get("errors"))
+        )
+    )
+    if not relevant:
+        return None
+    team = payload.get("teamOur")
+    team = team if isinstance(team, dict) else {}
+    raw_feedback = payload.get("lastRoundRoleActionResults")
+    raw_feedback = raw_feedback if isinstance(raw_feedback, dict) else {}
+    raw_errors = payload.get("errors")
+    raw_errors = raw_errors if isinstance(raw_errors, list) else []
+    errors = []
+    for error in raw_errors[:MAX_LOG_ITEMS]:
+        if not isinstance(error, dict):
+            continue
+        errors.append({
+            "code": error.get("errorCode"),
+            "description": _detail_text(error.get("description")),
+        })
+    return {
+        "event": "task_detail",
+        "buildId": BUILD_ID,
+        "timestampUtc": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ),
+        "roundNo": payload.get("roundNo"),
+        "team": {"type": team.get("type"), "id": team.get("teamId")},
+        "requestFingerprint": _payload_fingerprint(payload),
+        "taskInstanceId": task_instance_id,
+        "inputAssociation": {
+            "phaseTask": (
+                "current_active_task"
+                if task_instance_id is not None
+                and isinstance(payload.get("phaseTask"), str)
+                and bool(payload.get("phaseTask"))
+                else "unknown"
+            ),
+            "llmResp": "unknown_previous_request",
+            "lastCmdResult": "unknown_previous_request",
+            "prompt": (
+                "current_active_task"
+                if task_instance_id is not None else "unknown"
+            ),
+            "executeCmd": (
+                "current_active_task"
+                if task_instance_id is not None else "unknown"
+            ),
+            "submittedAnswers": (
+                "current_active_task"
+                if task_instance_id is not None else "unknown"
+            ),
+        },
+        "flow": {
+            "phaseTask": "request_current",
+            "llmResp": "request_from_prior_prompt",
+            "lastCmdResult": "request_from_prior_command",
+            "prompt": "response_current",
+            "executeCmd": "response_current",
+            "submittedAnswers": "response_current",
+        },
+        "text": {
+            name: _detail_text(value) for name, value in raw_text.items()
+        },
+        "submittedAnswers": _limited(submitted, len(submitted)),
+        "actionFeedback": _limited([
+            {"roleId": str(role_id), "ok": result}
+            for role_id, result in sorted(
+                raw_feedback.items(), key=lambda item: str(item[0]),
+            )[:MAX_LOG_ITEMS]
+            if isinstance(result, bool)
+        ], len(raw_feedback)),
+        "errors": _limited(errors, len(raw_errors)),
+        "economy": {
+            "gold": team.get("goldNum"),
+            "score": team.get("totalScore"),
+        },
+    }
+
+
+def _detail_text(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        return {
+            "value": None,
+            "inputType": type(raw).__name__,
+            "originalLength": None,
+            "truncated": False,
+            "platformTruncated": False,
+            "fingerprint": None,
+        }
+    return {
+        "value": raw[:MAX_TASK_DETAIL_CHARS],
+        "inputType": "str",
+        "originalLength": len(raw),
+        "truncated": len(raw) > MAX_TASK_DETAIL_CHARS,
+        "platformTruncated": "[TRUNCATED]" in raw,
+        "fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+    }
+
+
+def _payload_fingerprint(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def turn_log_record(
@@ -364,16 +508,30 @@ class Handler(BaseHTTPRequestHandler):
         self._send_body(200, body)
         sent = time.monotonic()
         processing_ms["serverWriteComplete"] = (sent - started) * 1000
-        decision_trace = decision_traces[0] if decision_traces else None
-        record = turn_log_record(
-            payload,
-            response,
-            processing_ms,
-            decision_trace=decision_trace,
-        )
-        LOGGER.info(
-            "%s", json.dumps(record, ensure_ascii=False, separators=(",", ":")),
-        )
+        try:
+            decision_trace = decision_traces[0] if decision_traces else None
+            record = turn_log_record(
+                payload,
+                response,
+                processing_ms,
+                decision_trace=decision_trace,
+            )
+            LOGGER.info(
+                "%s",
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+            )
+            detail = task_detail_log_record(
+                payload, response, decision_trace=decision_trace,
+            )
+            if detail is not None:
+                LOGGER.info(
+                    "%s",
+                    json.dumps(
+                        detail, ensure_ascii=False, separators=(",", ":"),
+                    ),
+                )
+        except Exception:
+            LOGGER.exception("post-response logging failed buildId=%s", BUILD_ID)
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(

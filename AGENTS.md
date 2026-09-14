@@ -81,3 +81,15 @@
 
 - 基于fabcf23，执行外层design/【codex】s1-r7-repair-plan.md。原Sol+medium独占源码，沿现有源码/测试目录。资金邻格搜索局部失败与兑现诊断、任务输入定位约定和有证据的截止边界允许修改；防守只读定位，确定缺陷先交主会话核实。
 - 保持预算、合法性、完整结果缓存边界；不盲调投资/布局/低血撤岗，不扩展S2。全量测试、diff和启动脚本语法检查沿用既有规范。开发会话不commit/push或发起对战，主会话独立验收。
+
+
+## S1主动围墙防线（R095，用户授权）
+
+- 在本地r7提交1cb41a3上实施外层design/【codex】s1-fortification-plan.md，统一候选r8包含r7。原Sol独占源码，可新增src/agent/fortification.py与tests/test_fortification.py，沿既有目录修改brain/economy/defense/state及相关测试/手册。
+- 用有界主动采石/定向多墙施工替代旧单墙试验，联合检查炮手站位与通路、期限，保留夜间守岗与已启动fund/持券；不做复杂仿真、主动进攻、无证据低血撤岗或任务答案硬编码。主会话验收前不commit/push，不发起对战。
+
+
+### R095任务详细取证补充
+
+- 用户确认平台只能下载程序日志；主会话将任务专用详细日志纳入本批定位能力，依据外层design/【codex】s1-task-detail-logging-plan.md。默认任务相关event=task_detail记录白名单交互正文及截断/实例关联，仅留内网，原摘要与裁判响应仍不含正文扩展。此为原“日志不记录正文”规则的限定例外；无关凭据/headers/环境/整包请求禁止记录。
+- 可修改server及必要请求级trace/测试，必须有界、不串并发、响应后记录。内网issue仍只传脱敏分析；不得将真实任务正文入仓库。

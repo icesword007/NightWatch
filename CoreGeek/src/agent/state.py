@@ -102,7 +102,13 @@ class SessionState:
     ended_tasks: list[TaskMemory] = field(default_factory=list)
     history: list[HistoricalFact] = field(default_factory=list)
     late_tool_results: int = 0
-    wall_trial_started: bool = False
+    fortification_initialized: bool = False
+    fortification_builder_id: int | None = None
+    fortification_targets: tuple[Pos, ...] = ()
+    fortification_completed: set[Pos] = field(default_factory=set)
+    fortification_failed: set[Pos] = field(default_factory=set)
+    fortification_phase: str = "idle"
+    fortification_skip_reason: str | None = None
     last_trace: dict[str, Any] | None = None
 
 
@@ -245,8 +251,6 @@ class StateStore:
         deadline_round: int | None,
     ) -> None:
         state = self._require_state()
-        if reason == "build:wall":
-            state.wall_trial_started = True
         state.plans[role_id] = PlanState(
             role_id=role_id,
             target=target,
@@ -290,6 +294,15 @@ class StateStore:
                 success = feedback.get(owner_id)
             state.pending_actions.pop(owner_id)
             state.action_history.append(CompletedAction(pending, success))
+            if (
+                pending.action == "build"
+                and pending.name == "wall"
+                and pending.target in state.fortification_targets
+            ):
+                if success is True:
+                    state.fortification_completed.add(pending.target)
+                else:
+                    state.fortification_failed.add(pending.target)
             plan = state.plans.get(pending.actor_id)
             keep_funding = (
                 plan is not None

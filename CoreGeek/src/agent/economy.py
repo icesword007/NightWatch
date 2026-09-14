@@ -5,6 +5,12 @@ from dataclasses import dataclass, replace
 from typing import Callable
 
 from .actions import ActionProposal, PlannedAction
+from .fortification import (
+    MAX_WALL_TARGETS,
+    fortification_stone_target,
+    ordered_wall_targets,
+    remaining_wall_targets,
+)
 from .grid import next_step
 from .protocol import (
     PIONEER,
@@ -113,6 +119,7 @@ def propose_economy(
     deadline: float,
     max_expansions: int,
     need_wall: bool = False,
+    fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
     diagnostic_sink: Callable[[dict], None] | None = None,
 ) -> tuple[PlannedAction, ...]:
@@ -126,6 +133,7 @@ def propose_economy(
             deadline=deadline,
             max_expansions=max_expansions,
             need_wall=need_wall,
+            fortification_builder_id=fortification_builder_id,
             reserved_role_ids=reserved_role_ids,
         )
         if diagnostic_sink is not None:
@@ -164,15 +172,13 @@ def _propose_economy(
     deadline: float,
     max_expansions: int,
     need_wall: bool = False,
+    fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
 ) -> tuple[PlannedAction, ...]:
     candidates: list[PlannedAction] = []
     maintained_roles: set[int] = set()
     claimed_build_targets: set[Pos] = set()
     claimed_tower_types: set[str] = set()
-    wall_trial_claimed = state.wall_trial_started or any(
-        plan.reason == "build:wall" for plan in state.plans.values()
-    )
     claimed_gold = 0
     failed_builds = {
         completed.pending.target
@@ -190,6 +196,22 @@ def _propose_economy(
         and completed.pending.target is not None
         and completed.pending.source_session == state.session_index
     }
+    direct_wall_request = (
+        need_wall
+        and not state.fortification_targets
+        and state.fortification_builder_id is None
+    )
+    if need_wall and not state.fortification_targets:
+        state.fortification_targets = ordered_wall_targets(
+            turn, wall_build_positions(turn),
+        )[:max(MAX_WALL_TARGETS - len(turn.walls()), 0)]
+    if (
+        direct_wall_request
+        and fortification_builder_id is None
+    ):
+        fortification_builder_id = next(
+            (worker.unit_id for worker in turn.workers()), None,
+        )
 
     for role in turn.controllable():
         if clock() >= deadline:
@@ -227,7 +249,15 @@ def _propose_economy(
     joint_candidates, joint_roles, joint_cancellations = _joint_funding_actions(
         turn,
         state,
-        excluded_role_ids=frozenset(maintained_roles) | reserved_role_ids,
+        excluded_role_ids=(
+            frozenset(maintained_roles)
+            | reserved_role_ids
+            | (
+                frozenset((fortification_builder_id,))
+                if fortification_builder_id is not None
+                else frozenset()
+            )
+        ),
         clock=clock,
         deadline=deadline,
         max_expansions=max_expansions,
@@ -272,21 +302,36 @@ def _propose_economy(
             continue
         if worker.unit_id in reserved_role_ids:
             continue
-        candidate = _continue_plan(
-            turn, state, worker, failed_builds, failed_mines,
-            clock, deadline, max_expansions,
-        )
-        if candidate is None and need_wall and not wall_trial_claimed:
+        candidate = None
+        if (
+            need_wall
+            and worker.unit_id == fortification_builder_id
+        ):
             candidate = _wall_action(
                 turn,
+                state,
                 worker,
                 failed_builds | claimed_build_targets | {
-                    plan.target for plan in state.plans.values()
+                    plan.target for role_id, plan in state.plans.items()
+                    if role_id != worker.unit_id
                 },
+                failed_mines,
                 clock, deadline, max_expansions,
             )
-            if candidate is not None:
-                wall_trial_claimed = True
+        current_plan = state.plans.get(worker.unit_id)
+        managed_wall_plan = (
+            current_plan is not None
+            and current_plan.reason == "build:wall"
+            and state.fortification_initialized
+        )
+        if managed_wall_plan:
+            if candidate is None:
+                state.plans.pop(worker.unit_id, None)
+        elif candidate is None:
+            candidate = _continue_plan(
+                turn, state, worker, failed_builds, failed_mines,
+                clock, deadline, max_expansions,
+            )
         if candidate is None:
             candidate = _tower_action(
                 turn,
@@ -549,17 +594,31 @@ def _continue_plan(
 
 def _wall_action(
     turn: Turn,
+    state: SessionState,
     worker: Unit,
     excluded: set[Pos],
+    failed_mines: set[Pos],
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
 ) -> PlannedAction | None:
-    if not turn.is_day or "stone" not in worker.backpack:
+    if not turn.is_day:
         return None
-    target = _nearest(worker.pos, (
-        pos for pos in wall_build_positions(turn) if pos not in excluded
-    ))
+    if "stone" not in worker.backpack:
+        stone = fortification_stone_target(turn, worker, failed_mines)
+        if stone is None:
+            return None
+        return _collect_or_move(
+            turn, worker, stone, clock, deadline, max_expansions,
+            diagnostic={
+                "kind": "fortification",
+                "phase": "mining",
+                "target": stone.dump(),
+            },
+        )
+    target = next((
+        pos for pos in remaining_wall_targets(state) if pos not in excluded
+    ), None)
     if target is None:
         return None
     return _build_or_move(

@@ -2,6 +2,7 @@ import time
 from typing import Callable
 
 from .actions import ActionProposal, PlannedAction
+from .fortification import gunner_stand_sort_key
 from .grid import next_step
 from .protocol import Pos, Robot, Turn, Unit, distance, move_command
 from .state import SessionState
@@ -617,6 +618,7 @@ def _gunner_route(
         pos for pos in choices if turn.land(pos) and pos not in blocked
     ]
     legal.sort(key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
+    found = []
     for stand in legal:
         path = next_step(
             turn,
@@ -633,12 +635,22 @@ def _gunner_route(
             and path.step is not None
             and path.cost is not None
         ):
-            return stand, path.step, path.cost
+            candidate = (stand, path.step, path.cost)
+            if not turn.is_day:
+                return candidate
+            found.append(candidate)
+            if path.cost == 0:
+                return candidate
         if path.status == "deadline":
             return None
         if path.status == "expansion_limit":
             continue
-    return None
+    if not found:
+        return None
+    return min(found, key=lambda route: (
+        route[2],
+        gunner_stand_sort_key(turn, weapon.pos, route[0]),
+    ))
 
 
 def _needs_emergency_medicine(role: Unit) -> bool:
