@@ -68,3 +68,10 @@
 - 依据外层design/【codex】economy-improvement-plan.md，在a21aeb4上改进有界稳定选矿与两工人共享金币筹资；沿现有源码/测试目录，可修改economy/brain/state与必要诊断及内网手册。不扩展S2/仿真，不改任务求解、攻击协议或低血撤岗。
 - 原Sol+medium在现有checkout独占源码；先失败反例后实现，保留守岗与单人资金链，验证完整兑现和双方回岗、真实到账、候选拒绝及失效撤销。沿用全量测试、diff检查与启动脚本语法检查。
 - 开发会话不commit/push，不触发对战；主会话验收后统一安排。保留缓存/未跟踪文件。
+
+
+## S1资金链正确性与性能（R082，用户授权）
+
+- 基于1929f76，执行外层design/【codex】funding-correctness-performance-plan.md：请求内路线复用、有界规划与交付预算、阵营等价与持券使用链修复、有限诊断。沿现有源码与测试目录，可改economy/brain/grid/state/actions/server及相关测试手册，不改投资偏好、攻击协议、LLM或低血撤岗。
+- 原Sol+medium独占源码，先真实DecisionEngine反例后修复，记录寻路次数与耗时对照、完整回归；主会话独立验收。不得跨请求缓存污染或提前消费预测金币，不以增大超时解决搜索问题。
+- 开发任务不commit/push、不发issue或启动对战；保留缓存/未跟踪文件。

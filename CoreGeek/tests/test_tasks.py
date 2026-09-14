@@ -3,10 +3,12 @@ import importlib
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import agent.economy as economy
 from agent.actions import ActionAllocator, ActionProposal
 from agent.brain import DecisionEngine
-from agent.protocol import Turn
+from agent.protocol import Pos, Turn
 from agent.state import StateStore, request_fingerprint
 
 
@@ -171,6 +173,182 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(response["roleCommandMap"]["10011"], {
             "action": "use", "name": "Medicine",
         })
+
+    def test_night_gunner_immediately_uses_held_upgrade_voucher(self):
+        # Break caught: protected-gunner filtering hides a legal held investment.
+        payload = self._idle_third_gunner_payload(round_no=71)
+        worker = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10010
+        )
+        worker["backpack"] = ["WeaponUpgradeVoucher1"]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use",
+            "name": "WeaponUpgradeVoucher1",
+            "targetPos": [{"x": 6, "y": 6}],
+        })
+
+    def test_immediate_held_voucher_is_not_hidden_by_stale_single_fund_plan(self):
+        # Break caught: an obsolete return post hides a currently legal use.
+        payload = self._idle_third_gunner_payload(round_no=70)
+        worker = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10010
+        )
+        worker["backpack"] = ["WeaponUpgradeVoucher1"]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10010,
+            Pos(6, 6),
+            "fund:WeaponUpgradeVoucher1:10030:10020",
+            70,
+        )
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use",
+            "name": "WeaponUpgradeVoucher1",
+            "targetPos": [{"x": 6, "y": 6}],
+        })
+
+    def test_night_gunner_does_not_chase_remote_held_upgrade_voucher(self):
+        payload = self._idle_third_gunner_payload(round_no=71)
+        worker = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10010
+        )
+        worker["pos"] = {"x": 1, "y": 1}
+        worker["backpack"] = ["WeaponUpgradeVoucher1"]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+
+        engine = DecisionEngine()
+        traces = []
+        response = engine.decide(payload, trace_sink=traces.append)
+
+        plan = engine.state.state.plans.get(10010)
+        self.assertFalse(plan is not None and plan.reason.startswith("use:"))
+        self.assertNotEqual(
+            response["roleCommandMap"].get("10010", {}).get("name"),
+            "WeaponUpgradeVoucher1",
+        )
+        self.assertEqual(
+            traces[0]["economyPlanning"]["heldInvestment"], "pending",
+        )
+
+    def test_held_voucher_arbitration_rejection_is_diagnosed(self):
+        payload = self._idle_third_gunner_payload(round_no=60)
+        worker = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10010
+        )
+        worker["pos"] = {"x": 4, "y": 5}
+        worker["backpack"] = ["StationUpgradeVoucher1"]
+        payload["weaponShopList"] = [
+            {"name": "StationUpgradeVoucher1", "price": 100},
+        ]
+        traces = []
+
+        engine = DecisionEngine()
+        response = engine.decide(payload, trace_sink=traces.append)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith("gunner:"),
+        )
+        self.assertEqual(
+            traces[0]["economyPlanning"]["heldInvestment"], "move",
+        )
+        self.assertGreaterEqual(
+            traces[0]["economyPlanning"]["rejectedActions"], 1,
+        )
+
+    def test_task_defense_return_coexists_with_held_voucher_use(self):
+        payload = self._third_post_payload(62)
+        worker = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10010
+        )
+        worker["pos"] = {"x": 7, "y": 10}
+        worker["backpack"] = ["StationUpgradeVoucher1"]
+        payload["weaponShopList"] = [
+            {"name": "StationUpgradeVoucher1", "price": 100},
+        ]
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use",
+            "name": "StationUpgradeVoucher1",
+            "targetPos": [{"x": 8, "y": 9}],
+        })
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertEqual(traces[-1]["coordinationReason"], "task_defense_return")
+
+    def test_economy_soft_deadline_still_delivers_defense_response(self):
+        payload = self._idle_third_gunner_payload(round_no=60)
+        pioneer = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10011
+        )
+        pioneer["pos"] = {"x": 15, "y": 16}
+        for role in payload["teamOur"]["roles"]:
+            if role["roleType"] == "worker":
+                role["backpack"] = ["copper"] * 10
+        payload["mapInfo"]["zones"].extend([
+            {"pos": {"x": 3, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 5, "y": 2}, "neutralType": "weaponShop"},
+        ])
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+
+        class ControlledClock:
+            now = 10.0
+
+            def __call__(self):
+                return self.now
+
+        clock = ControlledClock()
+        real_next_step = economy.next_step
+        economy_searches = 0
+
+        def exhaust_economy_budget(*args, **kwargs):
+            nonlocal economy_searches
+            economy_searches += 1
+            clock.now = 13.0
+            return real_next_step(*args, **kwargs)
+
+        traces = []
+        with patch.object(economy, "next_step", exhaust_economy_budget):
+            response = DecisionEngine(
+                clock=clock, budget_seconds=4.0,
+            ).decide(payload, trace_sink=traces.append)
+
+        self.assertGreaterEqual(economy_searches, 1)
+        self.assertEqual(
+            traces[0]["economyPlanning"]["truncatedReason"], "deadline",
+        )
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertTrue(any(
+            action["domain"] == "defense"
+            for action in traces[0]["actions"]
+        ))
 
     def test_dawn_releases_idle_third_gunner_for_new_task(self):
         payload = self._idle_third_gunner_payload(round_no=1)

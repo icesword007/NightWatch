@@ -27,6 +27,7 @@ _NEIGHBOUR_STEPS = (
     (1, 0),
     (1, 1),
 )
+ECONOMY_BUDGET_FRACTION = 0.75
 
 
 class DecisionEngine:
@@ -81,19 +82,24 @@ class DecisionEngine:
             task_pioneer = next((
                 turn.unit(role_id) for role_id in task_role_ids
             ), None)
+            economy_diagnostics = []
+            economy_deadline = min(
+                deadline,
+                started + self.budget_seconds * ECONOMY_BUDGET_FRACTION,
+            )
             economy_candidates = propose_economy(
                 turn,
                 state,
                 clock=self.clock,
-                deadline=deadline,
+                deadline=economy_deadline,
                 max_expansions=self.max_search_expansions,
                 need_wall=self._needs_wall_trial(turn, state),
                 reserved_role_ids=task_role_ids,
+                diagnostic_sink=economy_diagnostics.append,
             )
             critical_economy = tuple(
                 candidate for candidate in economy_candidates
-                if candidate.plan_reason
-                and candidate.plan_reason.startswith("fund:")
+                if self._is_critical_economy(candidate)
             )
             ordinary_economy = tuple(
                 candidate for candidate in economy_candidates
@@ -192,6 +198,7 @@ class DecisionEngine:
                 )
             protected = protected_gunners(turn) if defense_first else frozenset()
             accepted = []
+            rejected_economy: set[int] = set()
             blocked_new_task_by_gunner = False
             for domain, prepared_candidates in domains:
                 if self.clock() >= deadline:
@@ -222,10 +229,14 @@ class DecisionEngine:
                             and candidate.estimated_rounds
                             <= turn.rounds_until_night
                         )
+                        and not self._is_immediate_held_investment(candidate)
                     ):
+                        rejected_economy.add(id(candidate))
                         continue
                     if allocator.try_add(candidate.proposal):
                         accepted.append((domain, candidate))
+                    elif domain == "economy":
+                        rejected_economy.add(id(candidate))
 
             last_valid = allocator.complete_response(
                 prompt=task_turn.prompt,
@@ -245,6 +256,12 @@ class DecisionEngine:
                 task_turn,
                 blocked_new_task_by_gunner,
             )
+            economy_planning = (
+                copy.deepcopy(economy_diagnostics[0])
+                if economy_diagnostics else None
+            )
+            if economy_planning is not None:
+                economy_planning["rejectedActions"] = len(rejected_economy)
             trace = self._decision_trace(
                 turn,
                 payload,
@@ -252,6 +269,7 @@ class DecisionEngine:
                 accepted,
                 state,
                 coordination_reason,
+                economy_planning,
             )
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for _, candidate in accepted:
@@ -272,6 +290,21 @@ class DecisionEngine:
             return copy.deepcopy(last_valid)
         finally:
             self._lock.release()
+
+    @staticmethod
+    def _is_immediate_held_investment(candidate: Any) -> bool:
+        return (
+            candidate.proposal.command.get("action") == "use"
+            and isinstance(candidate.diagnostic, dict)
+            and candidate.diagnostic.get("kind") == "heldInvestment"
+        )
+
+    @staticmethod
+    def _is_critical_economy(candidate: Any) -> bool:
+        return (
+            bool(candidate.plan_reason)
+            and candidate.plan_reason.startswith("fund:")
+        ) or DecisionEngine._is_immediate_held_investment(candidate)
 
     @staticmethod
     def _emit_trace(
@@ -335,6 +368,7 @@ class DecisionEngine:
         accepted: tuple[Any, ...] | list[Any],
         state: Any,
         coordination_reason: str,
+        economy_planning: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         task = state.active_task if state is not None else None
         remaining = None
@@ -390,7 +424,7 @@ class DecisionEngine:
             if candidate.diagnostic is not None:
                 action["economy"] = copy.deepcopy(candidate.diagnostic)
             actions.append(action)
-        return {
+        trace = {
             "roundNo": turn.round_no,
             "taskInstanceId": task_instance_id,
             "taskRemainingRounds": remaining,
@@ -410,6 +444,9 @@ class DecisionEngine:
             "coordinationReason": coordination_reason,
             "actions": actions,
         }
+        if economy_planning is not None:
+            trace["economyPlanning"] = copy.deepcopy(economy_planning)
+        return trace
 
     @staticmethod
     def _short_fingerprint(value: Any) -> str | None:

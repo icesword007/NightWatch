@@ -3,7 +3,9 @@ import importlib
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import agent.economy as economy
 from agent.actions import ActionAllocator, ActionProposal
 from agent.brain import DecisionEngine
 from agent.protocol import Pos, Turn
@@ -82,6 +84,178 @@ def state_for(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    def test_joint_planning_reuses_paths_and_keeps_real_actions(self):
+        # Break caught: equivalent joint subroutes repeat thousands of searches.
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(2, 1),
+            items=("copper",) * 10,
+        )
+        payload["teamOur"]["teamId"] = "economy-joint-search-budget"
+        payload["mapInfo"]["width"] = 41
+        payload["mapInfo"]["height"] = 32
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 2, 3, items=("copper",) * 10),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        payload["weaponShopList"] = [
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        real_next_step = economy.next_step
+        search_count = 0
+
+        def counted_next_step(*args, **kwargs):
+            nonlocal search_count
+            search_count += 1
+            return real_next_step(*args, **kwargs)
+
+        with patch.object(economy, "next_step", counted_next_step):
+            response = DecisionEngine().decide(payload)
+
+        self.assertEqual(set(response["roleCommandMap"]), {"10010", "10012"})
+        self.assertTrue(all(
+            command["action"] == "move"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertLessEqual(search_count, 1894)
+
+    def test_route_cache_is_not_reused_across_changed_rounds(self):
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(1, 1),
+            items=("copper",) * 10,
+        )
+        payload["teamOur"]["teamId"] = "economy-request-cache-boundary"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)
+        first_step = first["roleCommandMap"]["10010"]["targetPos"][0]
+        changed = copy.deepcopy(payload)
+        changed["roundNo"] = 31
+        changed["lastRoundRoleActionResults"] = {"10010": False}
+        changed["teamOur"]["roles"].append(
+            role(10050, "wall", first_step["x"], first_step["y"], health=1000),
+        )
+
+        response = engine.decide(changed)
+
+        self.assertNotEqual(
+            response["roleCommandMap"].get("10010", {}).get("targetPos"),
+            [first_step],
+        )
+
+    def test_many_joint_routes_leave_a_bounded_search_delivery_reserve(self):
+        # Break caught: many shops/vendors consume the whole response budget.
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(2, 1),
+            items=("copper",) * 10,
+        )
+        payload["teamOur"]["teamId"] = "economy-joint-search-cap"
+        payload["mapInfo"]["width"] = 41
+        payload["mapInfo"]["height"] = 32
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 2, 3, items=("copper",) * 10),
+        )
+        payload["mapInfo"]["zones"] = [
+            *(
+                {"pos": {"x": x, "y": 5}, "neutralType": "vendor"}
+                for x in range(10, 18)
+            ),
+            *(
+                {"pos": {"x": x, "y": 15}, "neutralType": "weaponShop"}
+                for x in range(20, 28)
+            ),
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        payload["weaponShopList"] = [
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        real_next_step = economy.next_step
+        search_count = 0
+
+        def counted_next_step(*args, **kwargs):
+            nonlocal search_count
+            search_count += 1
+            return real_next_step(*args, **kwargs)
+
+        traces = []
+        with patch.object(economy, "next_step", counted_next_step):
+            response = DecisionEngine(max_search_expansions=64).decide(
+                payload, trace_sink=traces.append,
+            )
+
+        self.assertLessEqual(search_count, 1608)
+        self.assertEqual(response["prompt"], "")
+        self.assertEqual(response["executeCmd"], "")
+        self.assertTrue(all(
+            command["action"] in {"move", "sell", "buy", "use", "collect"}
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertEqual(set(response["roleCommandMap"]), {"10010", "10012"})
+        self.assertTrue(all(
+            command["action"] == "move"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertEqual(traces[0]["economyPlanning"]["pathSearches"], 1600)
+        self.assertEqual(
+            traces[0]["economyPlanning"]["truncatedReason"], "search_limit",
+        )
+        self.assertEqual(
+            traces[0]["economyPlanning"]["jointStatus"], "accepted",
+        )
+
+    def test_economy_uses_only_its_reserved_share_of_request_budget(self):
+        payload = economy_payload(round_no=30)
+        observed = {}
+
+        def capture_economy(*args, **kwargs):
+            observed["deadline"] = kwargs["deadline"]
+            if kwargs.get("diagnostic_sink") is not None:
+                kwargs["diagnostic_sink"]({
+                    "pathSearches": 0,
+                    "cacheHits": 0,
+                    "truncatedReason": None,
+                    "jointStatus": None,
+                    "heldInvestment": None,
+                })
+            return ()
+
+        with patch("agent.brain.propose_economy", side_effect=capture_economy):
+            response = DecisionEngine(
+                clock=lambda: 10.0, budget_seconds=4.0,
+            ).decide(payload)
+
+        self.assertEqual(observed["deadline"], 13.0)
+        self.assertEqual(response["prompt"], "")
+        self.assertEqual(response["executeCmd"], "")
+
+    def test_unfunded_joint_route_reports_actual_funds_blocker(self):
+        payload = economy_payload(
+            round_no=30,
+            worker_pos=(3, 1),
+            items=("copper",),
+        )
+        payload["teamOur"]["teamId"] = "economy-joint-funds-diagnostic"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",)),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        traces = []
+
+        DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        self.assertEqual(
+            traces[0]["economyPlanning"]["jointStatus"],
+            "actual_funds_insufficient",
+        )
+
     def test_underfilled_worker_sells_early_to_fund_reachable_upgrade(self):
         engine = DecisionEngine()
         payload = economy_payload(
@@ -552,6 +726,80 @@ class EconomyTests(unittest.TestCase):
         self.assertIn("use", actions)
         self.assertEqual(len(staffed), 2)
 
+    def test_joint_funding_full_chain_is_faction_equivalent(self):
+        for faction in ("challenger", "defender"):
+            with self.subTest(faction=faction):
+                payload = economy_payload(round_no=30, worker_pos=(1, 1))
+                payload["teamOur"]["type"] = faction
+                payload["teamOur"]["teamId"] = f"economy-joint-{faction}"
+                payload["teamOur"]["roles"].insert(
+                    1, role(10012, "worker", 1, 3, items=("copper",) * 10),
+                )
+                payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 10
+                payload["mapInfo"]["zones"] = [
+                    {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+                    {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+                ]
+                payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+                payload["weaponShopList"] = [
+                    {"name": "WeaponUpgradeVoucher1", "price": 100},
+                ]
+                engine = DecisionEngine()
+                actions = []
+
+                for _ in range(35):
+                    response = engine.decide(payload)
+                    commands = response["roleCommandMap"]
+                    actions.extend(command["action"] for command in commands.values())
+                    self.assertLessEqual(sum(
+                        command["action"] == "buy"
+                        for command in commands.values()
+                    ), 1)
+                    for raw_id, command in commands.items():
+                        actor = next(
+                            entry for entry in payload["teamOur"]["roles"]
+                            if entry["id"] == int(raw_id)
+                        )
+                        action = command["action"]
+                        if action == "move":
+                            actor["pos"] = copy.deepcopy(command["targetPos"][0])
+                        elif action == "sell":
+                            for _ in range(command["num"]):
+                                actor["backpack"].remove(command["name"])
+                            payload["teamOur"]["goldNum"] += 5 * command["num"]
+                        elif action == "buy":
+                            payload["teamOur"]["goldNum"] -= 100
+                            actor["backpack"].append(command["name"])
+                        elif action == "use":
+                            actor["backpack"].remove(command["name"])
+                            target_pos = command["targetPos"][0]
+                            target = next(
+                                entry for entry in payload["teamOur"]["roles"]
+                                if entry["pos"] == target_pos
+                            )
+                            target["level"] += 1
+                    payload["lastRoundRoleActionResults"] = {
+                        role_id: True for role_id in commands
+                    }
+                    payload["roundNo"] += 1
+                    workers = payload["teamOur"]["roles"][:2]
+                    staffed = {
+                        tower["id"]
+                        for tower in payload["teamOur"]["roles"]
+                        if tower["roleType"] in ("gatling", "railgun", "rocket")
+                        and any(max(
+                            abs(worker["pos"]["x"] - tower["pos"]["x"]),
+                            abs(worker["pos"]["y"] - tower["pos"]["y"]),
+                        ) == 1 for worker in workers)
+                    }
+                    if "use" in actions and len(staffed) == 2:
+                        break
+
+                self.assertIn("sell", actions)
+                self.assertIn("buy", actions)
+                self.assertIn("use", actions)
+                self.assertEqual(len(staffed), 2)
+
     def test_joint_funding_waits_for_confirmed_shared_gold(self):
         # Break caught: the buyer spends a collaborator's expected sale proceeds.
         payload = economy_payload(round_no=30, worker_pos=(3, 1))
@@ -914,6 +1162,42 @@ class EconomyTests(unittest.TestCase):
             for plan in engine.state.state.plans.values()
         ))
 
+    def test_cancelled_joint_self_care_is_not_duplicated_or_mislabeled(self):
+        payload = economy_payload(
+            round_no=31,
+            worker_pos=(3, 1),
+            items=("Medicine",),
+        )
+        payload["teamOur"]["roles"][0]["health"] = 100
+        turn = Turn.load(payload)
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010,
+            Pos(8, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020:joint:10010",
+            69,
+            state.session_index,
+        )
+
+        candidates = economy.propose_economy(
+            turn,
+            state,
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=64,
+        )
+        self_care = [
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+            and candidate.proposal.command.get("action") == "use"
+            and candidate.proposal.command.get("name") == "Medicine"
+        ]
+
+        self.assertEqual(len(self_care), 1)
+        self.assertNotEqual(
+            (self_care[0].diagnostic or {}).get("kind"), "heldInvestment",
+        )
+
     def test_dead_joint_contributor_releases_survivor_without_prepayment(self):
         payload = economy_payload(round_no=30, worker_pos=(3, 1))
         payload["teamOur"]["teamId"] = "economy-joint-death"
@@ -942,6 +1226,32 @@ class EconomyTests(unittest.TestCase):
             ":joint:" in plan.reason
             for plan in engine.state.state.plans.values()
         ))
+
+    def test_joint_buyer_uses_held_voucher_after_contributor_disappears(self):
+        # Break caught: losing the contributor hides an already-owned investment.
+        payload = economy_payload(
+            round_no=40,
+            worker_pos=(8, 10),
+            items=("StationUpgradeVoucher1",),
+        )
+        payload["teamOur"]["teamId"] = "economy-held-after-joint"
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10010,
+            Pos(9, 9),
+            "fund:StationUpgradeVoucher1:10020:10013:joint:10010",
+            69,
+        )
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use",
+            "name": "StationUpgradeVoucher1",
+            "targetPos": [{"x": 9, "y": 9}],
+        })
 
     def test_failed_sell_feedback_never_assumes_shared_gold_arrived(self):
         engine = DecisionEngine()

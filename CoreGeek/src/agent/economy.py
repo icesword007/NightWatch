@@ -1,5 +1,6 @@
 import time
 from collections import Counter
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import Callable
 
@@ -28,6 +29,12 @@ TOWER_ORDER = ("gatling", "railgun", "rocket")
 MAX_WEAPONS = 3
 MAX_MINE_CANDIDATES = 16
 MINE_SWITCH_MARGIN_PERCENT = 10
+MAX_ECONOMY_PATH_SEARCHES = 1600
+INVESTMENT_ITEM_PREFIXES = (
+    "StationUpgradeVoucher",
+    "WeaponUpgradeVoucher",
+    "WallUpgradeVoucher",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +86,76 @@ class JointFundingRoute:
     contributor_rounds: int
 
 
+@dataclass(slots=True)
+class RouteSearchContext:
+    routes: dict[
+        tuple[int, Pos, Pos, int],
+        tuple[tuple[Pos, int], ...],
+    ]
+    path_searches: int = 0
+    cache_hits: int = 0
+    truncated_reason: str | None = None
+    joint_status: str | None = None
+
+
+_ROUTE_SEARCH_CONTEXT: ContextVar[RouteSearchContext | None] = ContextVar(
+    "economy_route_search_context",
+    default=None,
+)
+
+
 def propose_economy(
+    turn: Turn,
+    state: SessionState,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float,
+    max_expansions: int,
+    need_wall: bool = False,
+    reserved_role_ids: frozenset[int] = frozenset(),
+    diagnostic_sink: Callable[[dict], None] | None = None,
+) -> tuple[PlannedAction, ...]:
+    context = RouteSearchContext({})
+    token = _ROUTE_SEARCH_CONTEXT.set(context)
+    try:
+        result = _propose_economy(
+            turn,
+            state,
+            clock=clock,
+            deadline=deadline,
+            max_expansions=max_expansions,
+            need_wall=need_wall,
+            reserved_role_ids=reserved_role_ids,
+        )
+        if diagnostic_sink is not None:
+            held = next((
+                candidate for candidate in result
+                if isinstance(candidate.diagnostic, dict)
+                and candidate.diagnostic.get("kind") == "heldInvestment"
+            ), None)
+            held_in_backpack = any(
+                _is_investment_item(item)
+                and _item_target(turn, item) is not None
+                for role in turn.controllable()
+                for item in role.backpack
+            )
+            diagnostic_sink({
+                "pathSearches": context.path_searches,
+                "cacheHits": context.cache_hits,
+                "truncatedReason": context.truncated_reason,
+                "jointStatus": context.joint_status,
+                "heldInvestment": (
+                    held.proposal.command.get("action")
+                    if held is not None
+                    else "pending" if held_in_backpack else None
+                ),
+            })
+        return result
+    finally:
+        _ROUTE_SEARCH_CONTEXT.reset(token)
+
+
+def _propose_economy(
     turn: Turn,
     state: SessionState,
     *,
@@ -118,20 +194,22 @@ def propose_economy(
         if clock() >= deadline:
             break
         plan = state.plans.get(role.unit_id)
-        candidate = None
         joint_plan = _joint_plan(plan.reason) if plan is not None else None
-        if plan is None or not plan.reason.startswith("fund:"):
-            candidate = _maintenance_action(
-                turn, role, clock, deadline, max_expansions,
+        candidate = _maintenance_action(
+            turn, role, clock, deadline, max_expansions,
+        )
+        if plan is not None and plan.reason.startswith("fund:"):
+            self_care = (
+                candidate is not None
+                and candidate.proposal.command.get("action") == "use"
+                and candidate.proposal.command.get("name") == "Medicine"
             )
-        elif (
-            joint_plan is not None
-            and "Medicine" in role.backpack
-            and role.health < _max_role_health(role)
-        ):
-            candidate = _maintenance_action(
-                turn, role, clock, deadline, max_expansions,
+            immediate_investment = (
+                joint_plan is None
+                and _is_immediate_held_investment_action(candidate)
             )
+            if not self_care and not immediate_investment:
+                candidate = None
         if (
             role.unit_id in reserved_role_ids
             and candidate is not None
@@ -155,6 +233,33 @@ def propose_economy(
     )
     candidates.extend(joint_candidates)
     maintained_roles.update(joint_roles)
+    for worker in turn.workers():
+        if (
+            worker.unit_id in maintained_roles
+            or worker.unit_id not in joint_cancellations
+        ):
+            continue
+        plan = state.plans.get(worker.unit_id)
+        if plan is None or _joint_plan(plan.reason) is None:
+            continue
+        held = _maintenance_action(
+            turn, worker, clock, deadline, max_expansions,
+        )
+        if not _is_held_investment_action(held):
+            continue
+        diagnostic = dict(held.diagnostic or {})
+        diagnostic["jointCancelReason"] = joint_cancellations[worker.unit_id]
+        candidates.append(replace(
+            held,
+            estimated_rounds=(
+                1
+                if held.proposal.command.get("action") == "use"
+                else held.estimated_rounds
+            ),
+            diagnostic=diagnostic,
+        ))
+        maintained_roles.add(worker.unit_id)
+        joint_cancellations.pop(worker.unit_id)
     for role_id, plan in tuple(state.plans.items()):
         if _joint_plan(plan.reason) is not None and role_id not in joint_roles:
             state.plans.pop(role_id)
@@ -274,14 +379,23 @@ def _maintenance_action(
         target = _item_target(turn, item)
         if target is None:
             continue
+        held_investment = _is_investment_item(item)
         if distance(worker.pos, target.pos) == 1:
-            return PlannedAction(ActionProposal(
-                worker.unit_id,
-                worker.unit_id,
-                use_command(item, target.pos),
-                item_costs=(item,),
-            ))
-        return _move_adjacent(
+            candidate = PlannedAction(
+                ActionProposal(
+                    worker.unit_id,
+                    worker.unit_id,
+                    use_command(item, target.pos),
+                    item_costs=(item,),
+                ),
+            )
+            return replace(
+                candidate,
+                diagnostic={"kind": "heldInvestment", "item": item},
+            ) if held_investment else candidate
+        if held_investment and not turn.is_day:
+            return None
+        candidate = _move_adjacent(
             turn,
             worker,
             target.pos,
@@ -291,7 +405,33 @@ def _maintenance_action(
             deadline=deadline,
             max_expansions=max_expansions,
         )
+        if candidate is None or not held_investment:
+            return candidate
+        return replace(
+            candidate, diagnostic={"kind": "heldInvestment", "item": item},
+        )
     return None
+
+
+def _is_investment_item(item: str) -> bool:
+    return item.startswith(INVESTMENT_ITEM_PREFIXES)
+
+
+def _is_held_investment_action(candidate: PlannedAction | None) -> bool:
+    return (
+        candidate is not None
+        and isinstance(candidate.diagnostic, dict)
+        and candidate.diagnostic.get("kind") == "heldInvestment"
+    )
+
+
+def _is_immediate_held_investment_action(
+    candidate: PlannedAction | None,
+) -> bool:
+    return (
+        _is_held_investment_action(candidate)
+        and candidate.proposal.command.get("action") == "use"
+    )
 
 
 def _continue_plan(
@@ -543,7 +683,13 @@ def _joint_funding_actions(
         for parsed in (_joint_plan(plan.reason),)
         if parsed is not None
     }
+    context = _ROUTE_SEARCH_CONTEXT.get()
     if not turn.is_day or len(turn.weapons()) < MAX_WEAPONS:
+        if context is not None and existing_plans:
+            context.joint_status = (
+                "deadline_reached" if not turn.is_day
+                else "tower_line_incomplete"
+            )
         return (), frozenset(), {
             role_id: (
                 "deadline_reached"
@@ -557,6 +703,8 @@ def _joint_funding_actions(
         if worker.unit_id not in excluded_role_ids
     )
     if len(workers) != 2:
+        if context is not None and existing_plans:
+            context.joint_status = "participant_unavailable"
         return (), frozenset(), {
             role_id: "participant_unavailable" for role_id in existing_plans
         }
@@ -592,6 +740,8 @@ def _joint_funding_actions(
             max_expansions,
         )
         if completed is not None:
+            if context is not None:
+                context.joint_status = "returning"
             return completed
     buyer_order = sorted(
         workers,
@@ -671,15 +821,42 @@ def _joint_funding_actions(
         ]
         if len(destinations) != len(set(destinations)):
             continue
+        if context is not None:
+            context.joint_status = "accepted"
         return (
             actions,
             frozenset((option.buyer_id, option.contributor_id)),
             {},
         )
     reason = _joint_cancellation_reason(turn, workers, existing)
+    if context is not None:
+        if context.truncated_reason is not None:
+            context.joint_status = "search_truncated"
+        elif existing is not None:
+            context.joint_status = reason
+        elif _joint_actual_funds_insufficient(turn, workers):
+            context.joint_status = "actual_funds_insufficient"
+        else:
+            context.joint_status = reason
     return (), frozenset(), {
         role_id: reason for role_id in existing_plans
     }
+
+
+def _joint_actual_funds_insufficient(
+    turn: Turn,
+    workers: tuple[Unit, ...],
+) -> bool:
+    actual_funds = turn.gold + sum(
+        _inventory_value(turn, worker) for worker in workers
+    )
+    prices = {
+        turn.weapon_prices[item]
+        for worker in workers
+        for item in _purchase_candidates(turn, worker)
+        if item not in worker.backpack and item in turn.weapon_prices
+    }
+    return bool(prices) and actual_funds < min(prices)
 
 
 def _joint_funding_route(
@@ -2250,8 +2427,21 @@ def _routes_to_adjacent(
     deadline: float,
     max_expansions: int,
 ) -> tuple[tuple[Pos, int], ...]:
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    cache_key = (worker.unit_id, worker.pos, target, max_expansions)
+    if context is not None and cache_key in context.routes:
+        context.cache_hits += 1
+        return context.routes[cache_key]
     routes = []
     for stand in _adjacent_stands(turn, worker, target):
+        if (
+            context is not None
+            and context.path_searches >= MAX_ECONOMY_PATH_SEARCHES
+        ):
+            context.truncated_reason = "search_limit"
+            return ()
+        if context is not None:
+            context.path_searches += 1
         path = next_step(
             turn,
             worker,
@@ -2265,8 +2455,13 @@ def _routes_to_adjacent(
         elif path.status == "found" and path.cost is not None:
             routes.append((stand, path.cost))
         elif path.status in ("deadline", "expansion_limit"):
+            if context is not None:
+                context.truncated_reason = path.status
             return ()
-    return tuple(routes)
+    result = tuple(routes)
+    if context is not None:
+        context.routes[cache_key] = result
+    return result
 
 
 def _best_adjacent_route(
