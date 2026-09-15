@@ -43,6 +43,204 @@ def base_payload(*, round_no, team_id):
 
 
 class TeamTurnTests(unittest.TestCase):
+    def test_missing_worker_reappears_with_real_inventory_and_resumes_trade(self):
+        payload = base_payload(
+            round_no=5, team_id="s2-reappeared-worker-trade",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": 2}, "neutralType": "copper"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 25}]
+        payload["teamOur"]["roles"] = [unit(10010, "worker", 2, 1)]
+        engine = DecisionEngine()
+
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10010"]["action"],
+            "collect",
+        )
+        night = json.loads(json.dumps(payload))
+        night["roundNo"] = 71
+        night["lastRoundRoleActionResults"] = {}
+        night["teamOur"]["roles"] = []
+        engine.decide(night)
+        self.assertNotIn(10010, engine.state.state.plans)
+
+        dawn = json.loads(json.dumps(night))
+        dawn["roundNo"] = 131
+        dawn["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": 2}, "neutralType": "vendor"},
+        ]
+        reappeared = unit(10010, "worker", 2, 1)
+        reappeared["backpack"] = ["copper"]
+        dawn["teamOur"]["roles"] = [reappeared]
+        response = engine.decide(dawn)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "sell", "name": "copper", "num": 1,
+        })
+
+    def test_idle_night_gunner_plan_does_not_suppress_dawn_economy(self):
+        # Break caught: a worker that reached an idle tower keeps its gunner
+        # plan forever because no attack action exists to retire that plan.
+        payload = base_payload(
+            round_no=70, team_id="s2-idle-gunner-dawn-release",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": 2}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 4),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+        engine = DecisionEngine()
+
+        dusk_response = engine.decide(payload)
+        self.assertEqual(
+            dusk_response["roleCommandMap"]["10010"]["action"], "move",
+        )
+        night = json.loads(json.dumps(payload))
+        night["roundNo"] = 71
+        night["lastRoundRoleActionResults"] = {"10010": True}
+        night["teamOur"]["roles"][0]["pos"] = json.loads(json.dumps(
+            dusk_response["roleCommandMap"]["10010"]["targetPos"][0]
+        ))
+        self.assertEqual(engine.decide(night)["roleCommandMap"], {})
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith("gunner:"),
+        )
+
+        dawn = json.loads(json.dumps(night))
+        dawn["roundNo"] = 131
+        dawn["teamOur"]["roles"][0]["pos"] = {"x": 2, "y": 1}
+        response = engine.decide(dawn)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "collect", "targetPos": [{"x": 2, "y": 2}],
+        })
+
+    def test_two_day_cycle_releases_night_posts_and_restores_them_at_dusk(self):
+        # Break caught: a no-deadline night gunner plan survives dawn and keeps
+        # suppressing daytime economy across every later day.
+        payload = base_payload(
+            round_no=70, team_id="s2-two-day-gunner-cycle",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": 2}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 6, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+        engine = DecisionEngine()
+
+        engine.decide(payload)
+        night = json.loads(json.dumps(payload))
+        night["roundNo"] = 71
+        night["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 6, "y": 9},
+            "roleType": "smallRobot",
+            "health": 40,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+        night_response = engine.decide(night)
+        self.assertEqual(
+            night_response["roleCommandMap"]["10020"]["action"], "attack",
+        )
+
+        dawn = json.loads(json.dumps(night))
+        dawn["roundNo"] = 131
+        dawn["robot"]["roles"] = []
+        dawn["teamOur"]["roles"][0]["pos"] = {"x": 2, "y": 1}
+        dawn_response = engine.decide(dawn)
+        self.assertEqual(dawn_response["roleCommandMap"]["10010"], {
+            "action": "collect", "targetPos": [{"x": 2, "y": 2}],
+        })
+
+        second_dusk = json.loads(json.dumps(dawn))
+        second_dusk["roundNo"] = 200
+        second_dusk["teamOur"]["roles"][0]["pos"] = {"x": 5, "y": 4}
+        dusk_response = engine.decide(second_dusk)
+        self.assertEqual(
+            dusk_response["roleCommandMap"]["10010"]["action"], "move",
+        )
+        self.assertEqual(
+            dusk_response["roleCommandMap"]["10010"]["targetPos"][0],
+            {"x": 5, "y": 5},
+        )
+        second_night = json.loads(json.dumps(second_dusk))
+        second_night["roundNo"] = 201
+        second_night["lastRoundRoleActionResults"] = {"10010": True}
+        second_night["teamOur"]["roles"][0]["pos"] = json.loads(json.dumps(
+            dusk_response["roleCommandMap"]["10010"]["targetPos"][0]
+        ))
+        second_night["robot"]["roles"] = json.loads(json.dumps(
+            night["robot"]["roles"]
+        ))
+        second_night_response = engine.decide(second_night)
+        self.assertEqual(
+            second_night_response["roleCommandMap"]["10020"]["action"],
+            "attack",
+        )
+
+        second_dawn = json.loads(json.dumps(second_night))
+        second_dawn["roundNo"] = 261
+        second_dawn["robot"]["roles"] = []
+        second_dawn["teamOur"]["roles"][0]["pos"] = {"x": 2, "y": 1}
+        second_dawn_response = engine.decide(second_dawn)
+        self.assertEqual(
+            second_dawn_response["roleCommandMap"]["10010"]["action"],
+            "collect",
+        )
+        self.assertEqual(engine.state.state.session_index, 1)
+
+    def test_missing_wall_builder_is_reassigned_on_the_next_day(self):
+        # Break caught: a dead first-day builder leaves its fixed ID in state,
+        # permanently preventing another worker from continuing the wall line.
+        payload = base_payload(
+            round_no=5, team_id="s2-next-day-builder-reassignment",
+        )
+        first_builder = unit(10010, "worker", 11, 8)
+        first_builder["backpack"] = ["stone"]
+        replacement = unit(10011, "worker", 11, 9)
+        replacement["backpack"] = ["stone", "stone"]
+        payload["teamOur"]["roles"] = [
+            first_builder,
+            replacement,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+
+        engine.decide(payload)
+        self.assertEqual(engine.state.state.fortification_builder_id, 10010)
+
+        night = json.loads(json.dumps(payload))
+        night["roundNo"] = 71
+        night["lastRoundRoleActionResults"] = {}
+        night["teamOur"]["roles"] = [
+            role for role in night["teamOur"]["roles"]
+            if role["id"] != 10010
+        ]
+        engine.decide(night)
+
+        next_day = json.loads(json.dumps(night))
+        next_day["roundNo"] = 131
+        response = engine.decide(next_day)
+
+        self.assertEqual(engine.state.state.fortification_builder_id, 10011)
+        self.assertEqual(
+            response["roleCommandMap"]["10011"].get("name"), "wall",
+        )
+
     def test_completed_tower_line_actively_collects_stone_for_fortification(self):
         # Break caught: ordinary high-value mining can starve the approved wall line.
         payload = base_payload(round_no=5, team_id="brain-r8-active-stone")
