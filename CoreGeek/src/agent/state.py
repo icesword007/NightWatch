@@ -4,11 +4,12 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import Pos, Turn, distance
+from .protocol import ROUNDS_PER_DAY, Pos, Turn, distance
 
 MAX_ACTION_HISTORY = 64
 MAX_ENDED_TASKS = 16
 MAX_HISTORY_FACTS = 256
+MAX_NEWS_TEXT_CHARS = 2_048
 
 
 def request_fingerprint(payload: dict[str, Any]) -> str:
@@ -84,8 +85,20 @@ class TaskMemory:
 class HistoricalFact:
     category: str
     value: str
+    value_fingerprint: str
+    original_length: int
+    value_truncated: bool
     source_session: int
     source_round: int
+    source_day: int
+
+
+@dataclass(frozen=True, slots=True)
+class NewsObservation:
+    fact: HistoricalFact
+    is_new: bool
+    observed_round: int
+    observed_day: int
 
 
 @dataclass(slots=True)
@@ -104,6 +117,7 @@ class SessionState:
     active_task: TaskMemory | None = None
     ended_tasks: list[TaskMemory] = field(default_factory=list)
     history: list[HistoricalFact] = field(default_factory=list)
+    news_observations: tuple[NewsObservation, ...] = ()
     late_tool_results: int = 0
     task_environment_paths: list[str] = field(default_factory=list)
     fortification_initialized: bool = False
@@ -169,7 +183,7 @@ class StateStore:
         self._release_dead_roles(turn)
         self._release_invalid_plans(turn)
         self._update_task(turn, payload, accept_results=boundary is None)
-        self._record_news(turn.round_no, payload)
+        self._record_news(turn, payload)
         state.last_round_no = turn.round_no
         state.last_fingerprint = fingerprint
         state.last_response = None
@@ -586,23 +600,46 @@ class StateStore:
             return "left_point"
         return "unknown"
 
-    def _record_news(self, round_no: int, payload: dict[str, Any]) -> None:
+    def _record_news(self, turn: Turn, payload: dict[str, Any]) -> None:
         state = self._require_state()
+        state.news_observations = ()
         news = payload.get("worldNews")
         if not isinstance(news, dict):
             return
-        known = {(fact.category, fact.value) for fact in state.history}
+        known = {
+            (fact.category, fact.value_fingerprint): fact
+            for fact in state.history
+            if fact.source_session == state.session_index
+        }
+        observations = []
+        observed_day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
         for category in ("officialNews", "folkLegends"):
             value = news.get(category)
-            if not isinstance(value, str) or not value or (category, value) in known:
+            if not isinstance(value, str) or not value:
                 continue
-            state.history.append(HistoricalFact(
-                category=category,
-                value=value,
-                source_session=state.session_index,
-                source_round=round_no,
+            fingerprint = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            fact = known.get((category, fingerprint))
+            is_new = fact is None
+            if fact is None:
+                fact = HistoricalFact(
+                    category=category,
+                    value=value[:MAX_NEWS_TEXT_CHARS],
+                    value_fingerprint=fingerprint,
+                    original_length=len(value),
+                    value_truncated=len(value) > MAX_NEWS_TEXT_CHARS,
+                    source_session=state.session_index,
+                    source_round=turn.round_no,
+                    source_day=observed_day,
+                )
+                state.history.append(fact)
+                known[(category, fingerprint)] = fact
+            observations.append(NewsObservation(
+                fact=fact,
+                is_new=is_new,
+                observed_round=turn.round_no,
+                observed_day=observed_day,
             ))
-            known.add((category, value))
+        state.news_observations = tuple(observations)
         del state.history[:-MAX_HISTORY_FACTS]
 
     def _require_state(self) -> SessionState:

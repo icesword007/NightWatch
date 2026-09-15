@@ -15,7 +15,7 @@ from .defense import (
 from .economy import propose_economy, wall_build_positions
 from .fortification import fortification_diagnostic, prepare_fortification
 from .protocol import TOWER_TYPES, Pos, Turn, Unit, distance, move_command
-from .state import StateStore, request_fingerprint
+from .state import MAX_HISTORY_FACTS, StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
 
 _NEIGHBOUR_STEPS = (
@@ -293,6 +293,7 @@ class DecisionEngine:
                 state,
                 coordination_reason,
                 economy_planning,
+                observation.boundary,
             )
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for _, candidate in accepted:
@@ -421,6 +422,7 @@ class DecisionEngine:
         state: Any,
         coordination_reason: str,
         economy_planning: dict[str, Any] | None = None,
+        session_boundary: str | None = None,
     ) -> dict[str, Any]:
         task = state.active_task if state is not None else None
         remaining = None
@@ -495,6 +497,40 @@ class DecisionEngine:
             "cycleFingerprint": cycle_fingerprint,
             "coordinationReason": coordination_reason,
             "actions": actions,
+            "newsEvidence": {
+                "currentSession": state.session_index if state is not None else None,
+                "sessionBoundary": session_boundary,
+                "retainedFacts": len(state.history) if state is not None else 0,
+                "retainedLimit": MAX_HISTORY_FACTS,
+                "observations": [
+                    {
+                        "source": observation.fact.category,
+                        "status": (
+                            "new_current_session" if observation.is_new
+                            else "seen_current_session"
+                        ),
+                        "firstObserved": {
+                            "session": observation.fact.source_session,
+                            "round": observation.fact.source_round,
+                            "day": observation.fact.source_day,
+                        },
+                        "observed": {
+                            "round": observation.observed_round,
+                            "day": observation.observed_day,
+                        },
+                        "publicationTimeKnown": False,
+                        "text": {
+                            "value": observation.fact.value,
+                            "originalLength": observation.fact.original_length,
+                            "truncated": observation.fact.value_truncated,
+                            "fingerprint": observation.fact.value_fingerprint,
+                        },
+                    }
+                    for observation in (
+                        state.news_observations if state is not None else ()
+                    )
+                ],
+            },
         }
         if economy_planning is not None:
             trace["economyPlanning"] = copy.deepcopy(economy_planning)

@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import socket
 import subprocess
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from agent import server as server_module
-from agent.brain import decide
+from agent.brain import DecisionEngine, decide
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,115 @@ def free_port():
 
 
 class ServerTests(unittest.TestCase):
+    def test_real_decision_trace_logs_bounded_news_evidence(self):
+        # Break caught: retained news exists only in hidden state, not request logs.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 5
+        payload["teamOur"]["teamId"] = "s2-news-trace"
+        payload["worldNews"] = {
+            "officialNews": "official bulletin",
+            "folkLegends": "folk account",
+        }
+        engine = DecisionEngine()
+        traces = []
+
+        response = engine.decide(payload, trace_sink=traces.append)
+        without_news = json.loads(json.dumps(payload))
+        without_news["worldNews"] = {}
+        without_news_traces = []
+        response_without_news = DecisionEngine().decide(
+            without_news, trace_sink=without_news_traces.append,
+        )
+        first_trace = traces[0]
+        evidence = first_trace["newsEvidence"]
+
+        self.assertEqual(response, response_without_news)
+        self.assertEqual(set(response), {"roleCommandMap", "prompt", "executeCmd"})
+        self.assertEqual(
+            without_news_traces[0]["newsEvidence"]["observations"], [],
+        )
+        self.assertEqual(evidence["currentSession"], 1)
+        self.assertEqual(evidence["retainedLimit"], 256)
+        self.assertEqual(evidence["retainedFacts"], 2)
+        self.assertEqual(evidence["observations"], [
+            {
+                "source": "officialNews",
+                "status": "new_current_session",
+                "firstObserved": {"session": 1, "round": 5, "day": 1},
+                "observed": {"round": 5, "day": 1},
+                "publicationTimeKnown": False,
+                "text": {
+                    "value": "official bulletin",
+                    "originalLength": 17,
+                    "truncated": False,
+                    "fingerprint": hashlib.sha256(
+                        b"official bulletin"
+                    ).hexdigest(),
+                },
+            },
+            {
+                "source": "folkLegends",
+                "status": "new_current_session",
+                "firstObserved": {"session": 1, "round": 5, "day": 1},
+                "observed": {"round": 5, "day": 1},
+                "publicationTimeKnown": False,
+                "text": {
+                    "value": "folk account",
+                    "originalLength": 12,
+                    "truncated": False,
+                    "fingerprint": hashlib.sha256(b"folk account").hexdigest(),
+                },
+            },
+        ])
+
+        repeated = json.loads(json.dumps(payload))
+        repeated["roundNo"] = 135
+        repeated_traces = []
+        repeated_response = engine.decide(
+            repeated, trace_sink=repeated_traces.append,
+        )
+        repeated_evidence = repeated_traces[0]["newsEvidence"]
+        self.assertEqual(
+            [item["status"] for item in repeated_evidence["observations"]],
+            ["seen_current_session", "seen_current_session"],
+        )
+        self.assertEqual(
+            repeated_evidence["observations"][0]["firstObserved"],
+            {"session": 1, "round": 5, "day": 1},
+        )
+        self.assertEqual(
+            repeated_evidence["observations"][0]["observed"],
+            {"round": 135, "day": 2},
+        )
+
+        cached_traces = []
+        cached_response = engine.decide(repeated, trace_sink=cached_traces.append)
+        self.assertEqual(cached_response, repeated_response)
+        self.assertEqual(cached_traces[0], repeated_traces[0])
+        self.assertEqual(len(engine.state.state.history), 2)
+
+        record = server_module.turn_log_record(
+            repeated, repeated_response, {}, decision_trace=repeated_traces[0],
+        )
+        self.assertEqual(record["decision"]["newsEvidence"], repeated_evidence)
+
+        next_session = json.loads(json.dumps(payload))
+        next_session["roundNo"] = 1
+        next_session["teamOur"]["teamId"] = "s2-news-trace-next-session"
+        next_traces = []
+        engine.decide(next_session, trace_sink=next_traces.append)
+        next_evidence = next_traces[0]["newsEvidence"]
+        self.assertEqual(next_evidence["sessionBoundary"], "team_identity_changed")
+        self.assertEqual(next_evidence["currentSession"], 2)
+        self.assertEqual(
+            [item["status"] for item in next_evidence["observations"]],
+            ["new_current_session", "new_current_session"],
+        )
+        self.assertEqual(
+            next_evidence["observations"][0]["firstObserved"],
+            {"session": 2, "round": 1, "day": 1},
+        )
+
     def setUp(self):
         self.port = free_port()
         self.process = subprocess.Popen(
