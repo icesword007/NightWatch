@@ -63,6 +63,8 @@ class TaskMemory:
     last_submission_feedback_round: int | None = None
     solver_history: list[str] = field(default_factory=list)
     solver_history_truncated: bool = False
+    solver_evidence: list[str] = field(default_factory=list)
+    environment_paths: tuple[str, ...] = ()
     solver_stopped_reason: str | None = None
     last_tool_result_fingerprint: str | None = None
     last_accepted_cmd_result_round: int | None = None
@@ -70,6 +72,7 @@ class TaskMemory:
     last_command: str | None = None
     last_cycle_fingerprint: str | None = None
     repeated_cycle_count: int = 0
+    command_count: int = 0
     final_answer_requested: bool = False
     coordination_final_requested: bool = False
     coordination_deadline_round: int | None = None
@@ -102,11 +105,16 @@ class SessionState:
     ended_tasks: list[TaskMemory] = field(default_factory=list)
     history: list[HistoricalFact] = field(default_factory=list)
     late_tool_results: int = 0
+    task_environment_paths: list[str] = field(default_factory=list)
     fortification_initialized: bool = False
     fortification_builder_id: int | None = None
     fortification_targets: tuple[Pos, ...] = ()
+    fortification_batch_targets: tuple[Pos, ...] = ()
     fortification_completed: set[Pos] = field(default_factory=set)
     fortification_failed: set[Pos] = field(default_factory=set)
+    fortification_deferred: dict[Pos, tuple[str, str, int]] = field(
+        default_factory=dict
+    )
     fortification_phase: str = "idle"
     fortification_skip_reason: str | None = None
     last_trace: dict[str, Any] | None = None
@@ -485,6 +493,7 @@ class StateStore:
                 task_cells=task_cells,
                 accepted_round=accepted_round,
                 timeout_round=timeout_round,
+                environment_paths=tuple(state.task_environment_paths),
             )
 
         task = state.active_task

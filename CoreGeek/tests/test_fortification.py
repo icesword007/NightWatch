@@ -264,6 +264,312 @@ class FortificationTests(unittest.TestCase):
 
         self.assertIn(Pos(12, 8), engine.state.state.fortification_failed)
 
+    def test_movable_worker_on_fixed_target_is_rechecked_then_recovers(self):
+        # Break caught: one transient friendly occupancy permanently creates a gap.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 5
+        payload["mapInfo"].update({
+            "width": 20,
+            "height": 20,
+            "zones": [{"pos": {"x": 5, "y": 8}, "neutralType": "stone"}],
+        })
+        builder = unit(10010, "worker", 11, 10)
+        builder["backpack"] = ["stone"]
+        payload["teamOur"].update({
+            "teamId": "fortification-transient-worker",
+            "roles": [
+                builder,
+                unit(10011, "worker", 12, 8),
+                unit(10013, "station", 9, 9),
+                unit(10020, "gatling", 8, 8),
+                unit(10030, "railgun", 9, 7),
+                unit(10040, "rocket", 10, 7),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = [unit(20013, "station", 17, 9)]
+        payload["robot"]["roles"] = []
+        state = SessionState("fortification-transient-worker", "challenger")
+        state.fortification_initialized = True
+        state.fortification_builder_id = 10010
+        state.fortification_targets = (Pos(12, 8),)
+        blocked_turn = Turn.load(payload)
+
+        builder_id = prepare_fortification(
+            blocked_turn,
+            state,
+            wall_build_positions(blocked_turn),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=64,
+        )
+
+        self.assertIsNone(builder_id)
+        self.assertNotIn(Pos(12, 8), state.fortification_failed)
+        self.assertEqual(
+            state.fortification_skip_reason, "target_temporarily_blocked",
+        )
+
+        payload["roundNo"] = 6
+        payload["teamOur"]["roles"][1]["pos"] = {"x": 8, "y": 11}
+        clear_turn = Turn.load(payload)
+        builder_id = prepare_fortification(
+            clear_turn,
+            state,
+            wall_build_positions(clear_turn),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=64,
+        )
+
+        self.assertEqual(builder_id, 10010)
+        self.assertEqual(state.fortification_batch_targets, (Pos(12, 8),))
+        self.assertNotIn(Pos(12, 8), state.fortification_failed)
+
+    def test_same_movable_blocker_can_clear_after_more_than_three_rounds(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 5
+        payload["mapInfo"].update({"width": 20, "height": 20, "zones": []})
+        builder = unit(10010, "worker", 11, 10)
+        builder["backpack"] = ["stone"]
+        payload["teamOur"].update({
+            "teamId": "fortification-persistent-worker",
+            "roles": [
+                builder,
+                unit(10011, "worker", 12, 8),
+                unit(10013, "station", 9, 9),
+                unit(10020, "gatling", 8, 8),
+                unit(10030, "railgun", 9, 7),
+                unit(10040, "rocket", 10, 7),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = [unit(20013, "station", 17, 9)]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+        state = SessionState("fortification-persistent-worker", "challenger")
+        state.fortification_initialized = True
+        state.fortification_builder_id = 10010
+        state.fortification_targets = (Pos(12, 8),)
+
+        for round_no in range(5, 10):
+            payload["roundNo"] = round_no
+            turn = Turn.load(payload)
+            prepare_fortification(
+                turn,
+                state,
+                wall_build_positions(turn),
+                clock=lambda: 0.0,
+                deadline=1.0,
+                max_expansions=64,
+            )
+            self.assertNotIn(Pos(12, 8), state.fortification_failed)
+
+        payload["roundNo"] = 10
+        payload["teamOur"]["roles"][1]["pos"] = {"x": 8, "y": 11}
+        clear_turn = Turn.load(payload)
+        builder_id = prepare_fortification(
+            clear_turn,
+            state,
+            wall_build_positions(clear_turn),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=64,
+        )
+        self.assertEqual(builder_id, 10010)
+        self.assertNotIn(Pos(12, 8), state.fortification_failed)
+
+    def test_unrelated_unit_changes_do_not_consume_direct_blocker_rechecks(self):
+        # Break caught: global unit position/HP changes exhaust retries while the
+        # same role continues to occupy the wall target.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 5
+        payload["mapInfo"].update({"width": 20, "height": 20, "zones": []})
+        payload["teamOur"].update({
+            "teamId": "fortification-unrelated-unit-change",
+            "roles": [
+                unit(10010, "worker", 5, 9),
+                unit(10011, "pioneer", 12, 8),
+                unit(10013, "station", 9, 9),
+                unit(10020, "gatling", 8, 8),
+                unit(10030, "railgun", 9, 7),
+                unit(10040, "rocket", 10, 7),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = [unit(20013, "station", 17, 9)]
+        payload["robot"]["roles"] = []
+        target = Pos(12, 8)
+        state = SessionState(
+            "fortification-unrelated-unit-change", "challenger",
+        )
+        state.fortification_initialized = True
+        state.fortification_builder_id = 10010
+        state.fortification_targets = (target,)
+
+        for index, worker_x in enumerate((5, 6, 7, 8), start=5):
+            payload["roundNo"] = index
+            payload["teamOur"]["roles"][0]["pos"] = {
+                "x": worker_x, "y": 9,
+            }
+            payload["teamOur"]["roles"][0]["health"] = 100 - index
+            turn = Turn.load(payload)
+            accepted = fortification_module._current_safe_prefix(
+                turn,
+                state,
+                (target,),
+                wall_build_positions(turn),
+            )
+            self.assertEqual(accepted, ())
+            self.assertNotIn(target, state.fortification_failed)
+
+        payload["roundNo"] = 9
+        payload["teamOur"]["roles"][1]["pos"] = {"x": 8, "y": 11}
+        clear_turn = Turn.load(payload)
+        accepted = fortification_module._current_safe_prefix(
+            clear_turn,
+            state,
+            (target,),
+            wall_build_positions(clear_turn),
+        )
+
+        self.assertEqual(accepted, (target,))
+        self.assertNotIn(target, state.fortification_failed)
+
+    def test_unchanged_temporary_block_does_not_repeat_safety_search(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 5
+        payload["mapInfo"].update({"width": 20, "height": 20, "zones": []})
+        builder = unit(10010, "worker", 11, 10)
+        builder["backpack"] = ["stone"]
+        payload["teamOur"].update({
+            "teamId": "fortification-stable-robot-block",
+            "roles": [
+                builder,
+                unit(10013, "station", 9, 9),
+                unit(10020, "gatling", 8, 8),
+                unit(10030, "railgun", 9, 7),
+                unit(10040, "rocket", 10, 7),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = [unit(20013, "station", 17, 9)]
+        back_passage = (
+            (7, 6), (7, 7), (7, 8), (7, 9), (7, 10),
+            (7, 11), (8, 6), (8, 11), (9, 6), (9, 11),
+        )
+        payload["robot"]["roles"] = [
+            {
+                "id": 30000 + index,
+                "pos": {"x": x, "y": y},
+                "roleType": "smallRobot",
+                "health": 40,
+                "attackPower": 5,
+                "abnormalState": "",
+                "targetTeam": "challenger",
+            }
+            for index, (x, y) in enumerate(back_passage)
+        ]
+        state = SessionState("fortification-stable-robot-block", "challenger")
+        state.fortification_initialized = True
+        state.fortification_builder_id = 10010
+        state.fortification_targets = (Pos(12, 8),)
+        real_safe_wall_targets = fortification_module.safe_wall_targets
+        calls = 0
+
+        def counted_safe_wall_targets(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real_safe_wall_targets(*args, **kwargs)
+
+        with patch.object(
+            fortification_module,
+            "safe_wall_targets",
+            counted_safe_wall_targets,
+        ):
+            for round_no in range(5, 10):
+                payload["roundNo"] = round_no
+                turn = Turn.load(payload)
+                prepare_fortification(
+                    turn,
+                    state,
+                    wall_build_positions(turn),
+                    clock=lambda: 0.0,
+                    deadline=1.0,
+                    max_expansions=64,
+                )
+
+        self.assertEqual(calls, 2)
+        self.assertNotIn(Pos(12, 8), state.fortification_failed)
+
+    def test_short_window_selects_only_feasible_wall_prefix(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 61
+        payload["mapInfo"].update({
+            "width": 20,
+            "height": 20,
+            "zones": [{"pos": {"x": 5, "y": 8}, "neutralType": "stone"}],
+        })
+        payload["teamOur"].update({
+            "teamId": "fortification-short-prefix",
+            "roles": [
+                unit(10010, "worker", 5, 9),
+                unit(10013, "station", 9, 9),
+                unit(10020, "gatling", 8, 8),
+                unit(10030, "railgun", 9, 7),
+                unit(10040, "rocket", 10, 7),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = [unit(20013, "station", 17, 9)]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+        state = SessionState("fortification-short-prefix", "challenger")
+
+        builder_id = prepare_fortification(
+            turn,
+            state,
+            wall_build_positions(turn),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=256,
+        )
+
+        self.assertEqual(builder_id, 10010)
+        self.assertEqual(len(state.fortification_batch_targets), 1)
+
+    def test_batch_never_exceeds_current_backpack_capacity(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 5
+        payload["mapInfo"].update({
+            "width": 20,
+            "height": 20,
+            "zones": [{"pos": {"x": 5, "y": 8}, "neutralType": "stone"}],
+        })
+        builder = unit(10010, "worker", 5, 9)
+        builder["backPackCapability"] = 1
+        payload["teamOur"].update({
+            "teamId": "fortification-capacity-prefix",
+            "roles": [
+                builder,
+                unit(10013, "station", 9, 9),
+                unit(10020, "gatling", 8, 8),
+                unit(10030, "railgun", 9, 7),
+                unit(10040, "rocket", 10, 7),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = [unit(20013, "station", 17, 9)]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+        state = SessionState("fortification-capacity-prefix", "challenger")
+
+        builder_id = prepare_fortification(
+            turn,
+            state,
+            wall_build_positions(turn),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=256,
+        )
+
+        self.assertEqual(builder_id, 10010)
+        self.assertEqual(len(state.fortification_batch_targets), 1)
+
     def test_dusk_does_not_pass_stable_builder_as_economy_reservation(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
         payload["roundNo"] = 65

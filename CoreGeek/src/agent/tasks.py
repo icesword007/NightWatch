@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -27,6 +28,12 @@ MAX_TOOL_CONTEXT_CHARS = 8_192
 MAX_SOLVER_EVENT_CHARS = 4_096
 MAX_SOLVER_EVENTS = 8
 MAX_SOLVER_HISTORY_CHARS = 16_384
+MAX_SOLVER_EVIDENCE_EVENTS = 3
+MAX_SOLVER_EVIDENCE_CHARS = 12_288
+MAX_UNKNOWN_TASK_COMMANDS = 4
+MAX_ENVIRONMENT_PATHS = 8
+MAX_ENVIRONMENT_PATH_CHARS = 512
+_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.-])(/[^\s\"'<>|]{1,511})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +198,7 @@ def _continue_active_task(
                     return _leave_task(turn, task, owner)
                 _remember(task, "Platform command requested", envelope.content)
                 task.last_command = envelope.content
+                task.command_count += 1
                 return TaskTurnProposal(execute_cmd=envelope.content)
             if envelope.kind == "abandon":
                 _remember(task, "Solver abandoned task", envelope.content)
@@ -217,6 +225,9 @@ def _continue_active_task(
             else "The platform sandbox result was empty, failed, timed out, or truncated."
         )
         _remember(task, "Platform command result", result)
+        if command_result_complete(result):
+            _remember_evidence(task, "Verified sandbox result", result)
+            _remember_environment_paths(state, task, result)
         if remaining == 0:
             task.solver_stopped_reason = "command_result_at_deadline"
             return _leave_task(turn, task, owner)
@@ -232,6 +243,17 @@ def _continue_active_task(
             if remaining == 0:
                 task.solver_stopped_reason = "repeated_cycle_at_deadline"
                 return _leave_task(turn, task, owner)
+            task.final_answer_requested = True
+            return TaskTurnProposal(prompt=_solver_prompt(
+                turn,
+                task,
+                "No more command exploration. Return an evidence-based complete "
+                "or partial answer now, or abandon the task.",
+            ))
+        if (
+            _effective_deadline(task) is None
+            and task.command_count >= MAX_UNKNOWN_TASK_COMMANDS
+        ):
             task.final_answer_requested = True
             return TaskTurnProposal(prompt=_solver_prompt(
                 turn,
@@ -284,7 +306,20 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
     task_text = _bounded(turn.phase_task, MAX_TASK_PROMPT_CHARS)
     context_text = _bounded(context, MAX_TOOL_CONTEXT_CHARS)
     history_text = _solver_history_text(task)
+    evidence_text = _solver_evidence_text(task)
+    environment_text = _environment_path_text(task)
     remaining = _remaining_rounds(turn, task)
+    if remaining is not None and remaining <= 3:
+        if (
+            task.coordination_deadline_round == _effective_deadline(task)
+            and (
+                task.timeout_round is None
+                or task.coordination_deadline_round < task.timeout_round
+            )
+        ):
+            task.coordination_final_requested = True
+        else:
+            task.final_answer_requested = True
     effective_deadline = _effective_deadline(task)
     if remaining is None:
         budget_text = "Known remaining task rounds: unknown."
@@ -314,10 +349,18 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         "instead of fabricating an answer. "
         "If the task gives an explicit file path, inspect that exact path directly. "
         "If it gives only a filename, use a bounded filename search. "
+        "One command request consumes two game-round transitions before its result "
+        "can inform the next answer. When safe, combine bounded discovery and the "
+        "necessary read in one command rather than issuing blind cat, ls, and find "
+        "steps separately. "
         "If it names no file, use a single input only when exactly one task-relevant input "
         "is evident. Do not assume the entire sandbox contains only one file. "
+        "Handle line endings only when sandbox evidence specifically proves an "
+        "interpreter or file-format problem. "
         "Never claim success from an empty, failed, timed-out, or truncated result.\n"
-        f"{context_text}\nSolver history:\n{history_text}\nTask:\n{task_text}"
+        f"{context_text}\nPreviously verified environment paths:\n"
+        f"{environment_text}\nCritical verified evidence:\n{evidence_text}\n"
+        f"Solver history:\n{history_text}\nTask:\n{task_text}"
     )
 
 
@@ -381,6 +424,47 @@ def _remember(task: TaskMemory, label: str, content: str) -> None:
     if len(task.solver_history) > MAX_SOLVER_EVENTS:
         del task.solver_history[:-MAX_SOLVER_EVENTS]
         task.solver_history_truncated = True
+
+
+def _remember_evidence(task: TaskMemory, label: str, content: str) -> None:
+    event = _bounded(f"{label}:\n{content}", MAX_SOLVER_EVENT_CHARS)
+    if len(task.solver_evidence) < MAX_SOLVER_EVIDENCE_EVENTS:
+        task.solver_evidence.append(event)
+    else:
+        # Preserve the first two verified context anchors (typically bounded
+        # discovery and its read) while refreshing the current evidence slot.
+        task.solver_evidence[-1] = event
+
+
+def _solver_evidence_text(task: TaskMemory) -> str:
+    joined = "\n\n".join(task.solver_evidence)
+    return _bounded(joined, MAX_SOLVER_EVIDENCE_CHARS) if joined else "(none)"
+
+
+def _remember_environment_paths(
+    state: SessionState,
+    task: TaskMemory,
+    result: str,
+) -> None:
+    for match in _ABSOLUTE_PATH.finditer(result):
+        path = match.group(1).rstrip(".,:;)]}")[:MAX_ENVIRONMENT_PATH_CHARS]
+        if not path or path == "/" or path.startswith("//"):
+            continue
+        if path in state.task_environment_paths:
+            state.task_environment_paths.remove(path)
+        state.task_environment_paths.append(path)
+    del state.task_environment_paths[:-MAX_ENVIRONMENT_PATHS]
+    task.environment_paths = tuple(state.task_environment_paths)
+
+
+def _environment_path_text(task: TaskMemory) -> str:
+    if not task.environment_paths:
+        return "(none)"
+    return (
+        "These paths appeared in successful sandbox output from this match; "
+        "verify each path for the current task before relying on it:\n"
+        + "\n".join(task.environment_paths)
+    )
 
 
 def _solver_history_text(task: TaskMemory) -> str:

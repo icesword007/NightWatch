@@ -6,6 +6,8 @@ from unittest import mock
 
 from agent import server as server_module
 from agent.brain import DecisionEngine
+from agent.protocol import Pos, Turn
+from agent.state import PlanState, request_fingerprint
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
@@ -148,8 +150,8 @@ class TeamTurnTests(unittest.TestCase):
         self.assertEqual(second["name"], "wall")
         self.assertNotEqual(second["targetPos"][0], first_target)
 
-    def test_collected_stone_switches_from_mining_to_wall_construction(self):
-        # Break caught: the ordinary mine plan keeps collecting after stone arrives.
+    def test_fortification_collects_a_two_wall_batch_before_construction(self):
+        # Break caught: the builder walks back after every single stone.
         payload = base_payload(round_no=5, team_id="brain-r8-mine-build")
         payload["mapInfo"]["zones"] = [
             {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
@@ -173,9 +175,146 @@ class TeamTurnTests(unittest.TestCase):
         following["lastRoundRoleActionResults"] = {"10010": True}
         following["teamOur"]["roles"][0]["backpack"] = ["stone"]
         second = engine.decide(following)["roleCommandMap"]["10010"]
+        self.assertEqual(second, {
+            "action": "collect", "targetPos": [{"x": 5, "y": 8}],
+        })
 
-        self.assertIn(second["action"], ("move", "build"))
-        self.assertNotEqual(second["action"], "collect")
+        ready = json.loads(json.dumps(following))
+        ready["roundNo"] = 7
+        ready["lastRoundRoleActionResults"] = {"10010": True}
+        ready["teamOur"]["roles"][0]["backpack"] = ["stone", "stone"]
+        third = engine.decide(ready)["roleCommandMap"]["10010"]
+
+        self.assertIn(third["action"], ("move", "build"))
+        self.assertNotEqual(third["action"], "collect")
+
+    def test_fortification_shrinks_batch_when_stone_disappears(self):
+        payload = base_payload(round_no=5, team_id="brain-r9-stone-disappears")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10010"]["action"],
+            "collect",
+        )
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 6
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["mapInfo"]["zones"] = []
+        following["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        command = engine.decide(following)["roleCommandMap"]["10010"]
+
+        self.assertIn(command["action"], ("move", "build"))
+        self.assertEqual(len(engine.state.state.fortification_batch_targets), 1)
+
+    def test_two_workers_build_and_switch_old_mine_to_full_funding_chain(self):
+        # Break caught: the active builder and an old mine plan together starve
+        # the independent worker's now-affordable upgrade route.
+        payload = base_payload(round_no=15, team_id="brain-r9-build-and-fund")
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+            {"pos": {"x": 2, "y": 2}, "neutralType": "copper"},
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 100}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        builder = unit(10010, "worker", 5, 9)
+        economic_worker = unit(10011, "worker", 2, 1)
+        economic_worker["backpack"] = ["copper"]
+        payload["teamOur"]["roles"] = [
+            builder,
+            economic_worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 2, health=1000),
+            unit(10030, "railgun", 8, 8, health=1000),
+            unit(10040, "rocket", 11, 8, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.state.plans[10011] = PlanState(
+            10011,
+            Pos(2, 2),
+            "mine:copper",
+            None,
+            engine.state.state.session_index,
+        )
+        builder_actions = []
+        economic_actions = []
+
+        for _ in range(12):
+            response = engine.decide(payload)
+            commands = response["roleCommandMap"]
+            if "10010" in commands:
+                builder_actions.append(commands["10010"]["action"])
+            if "10011" in commands:
+                economic_actions.append(commands["10011"]["action"])
+            for raw_id, command in commands.items():
+                actor = next(
+                    role for role in payload["teamOur"]["roles"]
+                    if role["id"] == int(raw_id)
+                )
+                action = command["action"]
+                if action == "move":
+                    actor["pos"] = json.loads(json.dumps(command["targetPos"][0]))
+                elif action == "collect":
+                    actor["backpack"].append(
+                        "stone" if int(raw_id) == 10010 else "copper"
+                    )
+                elif action == "sell":
+                    actor["backpack"].remove(command["name"])
+                    payload["teamOur"]["goldNum"] += 100
+                elif action == "buy":
+                    payload["teamOur"]["goldNum"] -= 100
+                    actor["backpack"].append(command["name"])
+                elif action == "use":
+                    actor["backpack"].remove(command["name"])
+                    target = next(
+                        role for role in payload["teamOur"]["roles"]
+                        if role["pos"] == command["targetPos"][0]
+                    )
+                    target["level"] += 1
+                elif action == "build":
+                    actor["backpack"].remove("stone")
+                    target = command["targetPos"][0]
+                    payload["teamOur"]["roles"].append(unit(
+                        10100 + len(builder_actions),
+                        "wall",
+                        target["x"],
+                        target["y"],
+                        health=1000,
+                    ))
+            payload["lastRoundRoleActionResults"] = {
+                raw_id: True for raw_id in commands
+            }
+            payload["roundNo"] += 1
+            if "build" in builder_actions and "use" in economic_actions:
+                break
+
+        self.assertEqual(economic_actions[0], "move")
+        self.assertIn("collect", builder_actions)
+        self.assertIn("build", builder_actions)
+        self.assertIn("sell", economic_actions)
+        self.assertIn("buy", economic_actions)
+        self.assertIn("use", economic_actions)
 
     def test_failed_fortification_mine_moves_to_another_visible_stone(self):
         # Break caught: dedicated stone mining retries one failed mine forever.

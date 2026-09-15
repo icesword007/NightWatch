@@ -319,6 +319,21 @@ def _propose_economy(
                 clock, deadline, max_expansions,
             )
         current_plan = state.plans.get(worker.unit_id)
+        funding_rechecked = False
+        if (
+            candidate is None
+            and current_plan is not None
+            and current_plan.reason.startswith("mine:")
+        ):
+            funding_rechecked = True
+            candidate = _single_funding_action(
+                turn,
+                worker,
+                turn.gold - claimed_gold,
+                clock,
+                deadline,
+                max_expansions,
+            )
         managed_wall_plan = (
             current_plan is not None
             and current_plan.reason == "build:wall"
@@ -347,6 +362,7 @@ def _propose_economy(
             candidate = _trade_or_mine(
                 turn, worker, turn.gold - claimed_gold,
                 clock, deadline, max_expansions, failed_mines,
+                check_funding=not funding_rechecked,
             )
         if candidate is not None and worker.unit_id in joint_cancellations:
             diagnostic = dict(candidate.diagnostic or {})
@@ -604,7 +620,13 @@ def _wall_action(
 ) -> PlannedAction | None:
     if not turn.is_day:
         return None
-    if "stone" not in worker.backpack:
+    batch_targets = tuple(
+        target for target in state.fortification_batch_targets
+        if target not in state.fortification_completed
+        and target not in state.fortification_failed
+    )
+    stone_goal = max(len(batch_targets), 1)
+    if worker.backpack.count("stone") < stone_goal:
         stone = fortification_stone_target(turn, worker, failed_mines)
         if stone is None:
             return None
@@ -617,7 +639,8 @@ def _wall_action(
             },
         )
     target = next((
-        pos for pos in remaining_wall_targets(state) if pos not in excluded
+        pos for pos in (batch_targets or remaining_wall_targets(state))
+        if pos not in excluded
     ), None)
     if target is None:
         return None
@@ -1403,23 +1426,14 @@ def _trade_or_mine(
     deadline: float,
     max_expansions: int,
     failed_mines: set[Pos],
+    *,
+    check_funding: bool = True,
 ) -> PlannedAction | None:
     minerals = Counter(item for item in worker.backpack if item in MINERALS)
     vendors = turn.zones_of("vendor")
-    funded = _fundable_purchase(
-        turn, worker, available_gold, clock, deadline, max_expansions,
-    )
-    if funded is not None:
-        item, hard_deadline, route = funded
-        candidate = _funding_action(
-            turn,
-            worker,
-            item,
-            hard_deadline,
-            clock,
-            deadline,
-            max_expansions,
-            verified_route=route,
+    if check_funding:
+        candidate = _single_funding_action(
+            turn, worker, available_gold, clock, deadline, max_expansions,
         )
         if candidate is not None:
             return candidate
@@ -1469,6 +1483,32 @@ def _trade_or_mine(
         deadline,
         max_expansions,
         excluded_targets=failed_mines,
+    )
+
+
+def _single_funding_action(
+    turn: Turn,
+    worker: Unit,
+    available_gold: int,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    funded = _fundable_purchase(
+        turn, worker, available_gold, clock, deadline, max_expansions,
+    )
+    if funded is None:
+        return None
+    item, hard_deadline, route = funded
+    return _funding_action(
+        turn,
+        worker,
+        item,
+        hard_deadline,
+        clock,
+        deadline,
+        max_expansions,
+        verified_route=route,
     )
 
 

@@ -92,6 +92,42 @@ def with_completed_wall_line(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    def test_existing_mine_plan_yields_to_current_single_funding_route(self):
+        # Break caught: a valid old mine plan bypasses a newly executable sale chain.
+        payload = economy_payload(
+            round_no=15,
+            worker_pos=(2, 1),
+            items=("copper",),
+        )
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010,
+            Pos(2, 2),
+            "mine:copper",
+            None,
+            state.session_index,
+        )
+
+        candidates = economy.propose_economy(
+            Turn.load(payload),
+            state,
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=64,
+        )
+        worker = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+
+        self.assertEqual(worker.proposal.command, {
+            "action": "move", "targetPos": [{"x": 3, "y": 1}],
+        })
+        self.assertEqual(
+            worker.plan_reason,
+            "fund:WeaponUpgradeVoucher1:10020:10020",
+        )
+
     def test_new_joint_funding_does_not_claim_reserved_wall_builder(self):
         # Break caught: funding arbitration takes the builder selected before economy.
         payload = economy_payload(round_no=30, worker_pos=(3, 1))

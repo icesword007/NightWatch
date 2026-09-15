@@ -625,6 +625,156 @@ class TaskTests(unittest.TestCase):
         self.assertIn("python3 solve.py --stage one", prompt)
         self.assertIn("[exitCode:0]\nvalue=42", prompt)
 
+    def test_successful_tool_evidence_survives_recent_history_truncation(self):
+        # Break caught: later retries evict the only successful specification read.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="use the specification",
+        )
+        engine.decide(active)
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"read-spec"}'
+        engine.decide(command)
+
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = (
+            "[exitCode:0]\nVerified constraint: output must be decimal."
+        )
+        prompt = engine.decide(result)["prompt"]
+        for index in range(3):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 4 + index * 2
+            command["llmResp"] = (
+                '{"kind":"command","content":"followup-'
+                f'{index}'
+                '"}'
+            )
+            engine.decide(command)
+            later_result = copy.deepcopy(active)
+            later_result["roundNo"] = 5 + index * 2
+            later_result["lastCmdResult"] = (
+                f"[exitCode:0]\nlater evidence {index}"
+            )
+            prompt = engine.decide(later_result)["prompt"]
+        for round_no in range(10, 15):
+            invalid = copy.deepcopy(active)
+            invalid["roundNo"] = round_no
+            invalid["llmResp"] = f"invalid-response-{round_no}"
+            prompt = engine.decide(invalid)["prompt"]
+
+        self.assertIn("Verified constraint: output must be decimal.", prompt)
+        self.assertLessEqual(
+            len(engine.state.state.active_task.solver_evidence), 3,
+        )
+
+    def test_read_specification_survives_find_and_later_successes(self):
+        # Break caught: keeping only the first and latest success preserves the
+        # path discovery but evicts the specification read that defines output.
+        engine = DecisionEngine()
+        accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 30
+        engine.decide(accepted)
+        active = copy.deepcopy(accepted)
+        active["roundNo"] = 2
+        active["phaseTask"] = "discover, read, and solve"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        engine.decide(active)
+        exchanges = (
+            ("find-input", "[exitCode:0]\n/sandbox/input/specification.md"),
+            (
+                "read-specification",
+                "[exitCode:0]\nRequired format: one decimal number.",
+            ),
+            ("calculate-first", "[exitCode:0]\nintermediate=40"),
+            ("calculate-second", "[exitCode:0]\nintermediate=42"),
+            ("verify-first", "[exitCode:0]\nverified-part-a"),
+            ("verify-second", "[exitCode:0]\nverified-part-b"),
+        )
+        for index, (command_text, result_text) in enumerate(exchanges):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 3 + index * 2
+            command["llmResp"] = json.dumps({
+                "kind": "command", "content": command_text,
+            })
+            engine.decide(command)
+            result = copy.deepcopy(active)
+            result["roundNo"] = 4 + index * 2
+            result["lastCmdResult"] = result_text
+            engine.decide(result)
+
+        partial = copy.deepcopy(active)
+        partial["roundNo"] = 15
+        partial["llmResp"] = (
+            '{"kind":"answer","content":"42", "complete":false}'
+        )
+        engine.decide(partial)
+        rejected = copy.deepcopy(active)
+        rejected["roundNo"] = 16
+        rejected["lastRoundRoleActionResults"] = {"10011": False}
+        rejected["errors"] = [
+            {"errorCode": 2, "description": "format incomplete"},
+        ]
+        prompt = engine.decide(rejected)["prompt"]
+
+        self.assertIn("Required format: one decimal number.", prompt)
+        self.assertLessEqual(
+            len(engine.state.state.active_task.solver_evidence), 3,
+        )
+
+    def test_new_task_reuses_only_paths_from_successful_sandbox_evidence(self):
+        # Break caught: verified environment paths are forgotten between task instances.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="first task",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"discover"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = (
+            "[exitCode:0]\n/opt/task-input/specification.md\n"
+            "https://example.test/api\n"
+        )
+        engine.decide(result)
+
+        next_task = copy.deepcopy(active)
+        next_task["roundNo"] = 4
+        next_task["phaseTask"] = "second task"
+        prompt = engine.decide(next_task)["prompt"]
+
+        self.assertIn("/opt/task-input/specification.md", prompt)
+        self.assertIn("verify each path for the current task", prompt)
+        self.assertNotIn("//example.test/api", prompt)
+
+    def test_failed_sandbox_output_does_not_create_reusable_path_clue(self):
+        # Break caught: a failed command's guessed path becomes trusted next-task input.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="first task",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"discover"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:1]\n/guessed/not-real.txt"
+        engine.decide(result)
+
+        next_task = copy.deepcopy(active)
+        next_task["roundNo"] = 4
+        next_task["phaseTask"] = "second task"
+        prompt = engine.decide(next_task)["prompt"]
+
+        self.assertNotIn("/guessed/not-real.txt", prompt)
+
     def test_solver_prompt_gives_unambiguous_file_location_rules(self):
         # Break caught: the solver scans broadly despite an explicit input path.
         payload = task_payload(
@@ -641,6 +791,9 @@ class TaskTests(unittest.TestCase):
         self.assertIn("bounded filename search", prompt)
         self.assertIn("exactly one task-relevant input", prompt)
         self.assertIn("Do not assume the entire sandbox contains only one file", prompt)
+        self.assertIn("consumes two game-round transitions", prompt)
+        self.assertIn("combine bounded discovery and the necessary read", prompt)
+        self.assertIn("line endings only when sandbox evidence", prompt)
 
     def test_known_deadline_is_in_every_prompt_and_blocks_late_commands(self):
         # Break caught: normal command/result branches bypass the deadline policy.
@@ -667,28 +820,186 @@ class TaskTests(unittest.TestCase):
         result["lastCmdResult"] = "[exitCode:0]\nprogress"
         prompt = engine.decide(result)["prompt"]
         self.assertIn("Known remaining task rounds: 3", prompt)
-
-        command["roundNo"] = 5
-        command["llmResp"] = '{"kind":"command","content":"step-two"}'
-        self.assertEqual(engine.decide(command)["executeCmd"], "step-two")
-
-        result["roundNo"] = 6
-        result["lastCmdResult"] = "[exitCode:0]\nmore progress"
-        prompt = engine.decide(result)["prompt"]
-        self.assertIn("Known remaining task rounds: 1", prompt)
         self.assertIn("Command exploration is not allowed", prompt)
 
-        late_command = copy.deepcopy(active)
-        late_command["roundNo"] = 7
-        late_command["llmResp"] = (
-            '{"kind":"command","content":"too-late-command"}'
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 5
+        answer["llmResp"] = (
+            '{"kind":"answer","content":"supported partial",'
+            '"complete":false}'
         )
-        response = engine.decide(late_command)
+        response = engine.decide(answer)
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "supported partial",
+        })
+
+    def test_command_requested_with_four_rounds_left_is_not_dropped_in_flight(self):
+        # Break caught: the remaining-three cutoff rejects a command requested
+        # by the immediately preceding, still-valid remaining-four prompt.
+        engine = DecisionEngine()
+        accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 6
+        engine.decide(accepted)
+
+        active = copy.deepcopy(accepted)
+        active["roundNo"] = 2
+        active["phaseTask"] = "active task"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        engine.decide(active)
+
+        retry = copy.deepcopy(active)
+        retry["roundNo"] = 3
+        retry["llmResp"] = "invalid-response"
+        prompt = engine.decide(retry)["prompt"]
+        self.assertIn("Known remaining task rounds: 4", prompt)
+        self.assertIn("Command exploration is allowed", prompt)
+
+        in_flight = copy.deepcopy(active)
+        in_flight["roundNo"] = 4
+        in_flight["llmResp"] = (
+            '{"kind":"command","content":"final-evidence-read"}'
+        )
+        self.assertEqual(
+            engine.decide(in_flight)["executeCmd"], "final-evidence-read",
+        )
+
+    def test_unknown_deadline_stops_after_four_distinct_command_cycles(self):
+        # Break caught: changing output permits unbounded tool exploration.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        engine.decide(active)
+
+        prompt = ""
+        for index in range(4):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 2 + index * 2
+            command["llmResp"] = (
+                '{"kind":"command","content":"step-'
+                f'{index}'
+                '"}'
+            )
+            engine.decide(command)
+            result = copy.deepcopy(active)
+            result["roundNo"] = 3 + index * 2
+            result["lastCmdResult"] = f"[exitCode:0]\nresult-{index}"
+            prompt = engine.decide(result)["prompt"]
+
+        self.assertIn("No more command exploration", prompt)
+
+    def test_known_deadline_allows_a_fifth_cycle_when_budget_is_sufficient(self):
+        # Break caught: the unknown-deadline safety cap also truncates a known,
+        # still-feasible task whose evidence is continuing to change.
+        engine = DecisionEngine()
+        accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 20
+        engine.decide(accepted)
+
+        active = copy.deepcopy(accepted)
+        active["roundNo"] = 2
+        active["phaseTask"] = "known long task"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        engine.decide(active)
+
+        for index in range(4):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 3 + index * 2
+            command["llmResp"] = (
+                '{"kind":"command","content":"known-step-'
+                f'{index}'
+                '"}'
+            )
+            self.assertEqual(
+                engine.decide(command)["executeCmd"], f"known-step-{index}",
+            )
+            result = copy.deepcopy(active)
+            result["roundNo"] = 4 + index * 2
+            result["lastCmdResult"] = f"[exitCode:0]\nchanged-{index}"
+            prompt = engine.decide(result)["prompt"]
+
+        self.assertIn("Known remaining task rounds: 11", prompt)
+        self.assertIn("Command exploration is allowed", prompt)
+
+        fifth = copy.deepcopy(active)
+        fifth["roundNo"] = 11
+        fifth["llmResp"] = (
+            '{"kind":"command","content":"known-step-4"}'
+        )
+        self.assertEqual(engine.decide(fifth)["executeCmd"], "known-step-4")
+
+    def test_fourteen_round_chain_converges_and_preserves_partial_feedback(self):
+        # Break caught: a changing command loop consumes the whole task window,
+        # or an incomplete submission prevents a final evidence-based revision.
+        engine = DecisionEngine()
+        accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 12
+        engine.decide(accepted)
+
+        active = copy.deepcopy(accepted)
+        active["roundNo"] = 2
+        active["phaseTask"] = "synthetic bounded task"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        engine.decide(active)
+
+        for index in range(4):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 3 + index * 2
+            command["llmResp"] = (
+                '{"kind":"command","content":"bounded-step-'
+                f'{index}'
+                '"}'
+            )
+            self.assertEqual(
+                engine.decide(command)["executeCmd"], f"bounded-step-{index}",
+            )
+            result = copy.deepcopy(active)
+            result["roundNo"] = 4 + index * 2
+            result["lastCmdResult"] = f"[exitCode:0]\nevidence-{index}"
+            response = engine.decide(result)
+
+        self.assertEqual(result["roundNo"], 10)
+        self.assertIn("Known remaining task rounds: 3", response["prompt"])
+        self.assertIn("Command exploration is not allowed", response["prompt"])
+
+        partial = copy.deepcopy(active)
+        partial["roundNo"] = 11
+        partial["llmResp"] = (
+            '{"kind":"answer","content":"supported partial",'
+            '"complete":false}'
+        )
+        response = engine.decide(partial)
+        self.assertEqual(
+            response["roleCommandMap"]["10011"]["action"], "submitAnswer",
+        )
+
+        rejected = copy.deepcopy(active)
+        rejected["roundNo"] = 12
+        rejected["lastRoundRoleActionResults"] = {"10011": False}
+        rejected["errors"] = [
+            {"errorCode": 2, "description": "incomplete"},
+        ]
+        response = engine.decide(rejected)
+        self.assertIn("previous submission failed or was incomplete", response["prompt"])
+        self.assertIn("supported partial", response["prompt"])
+
+        revised = copy.deepcopy(active)
+        revised["roundNo"] = 13
+        revised["llmResp"] = (
+            '{"kind":"answer","content":"supported revision",'
+            '"complete":true}'
+        )
+        response = engine.decide(revised)
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "supported revision",
+        })
+
+        finished = copy.deepcopy(active)
+        finished["roundNo"] = 14
+        finished["phaseTask"] = ""
+        finished["lastRoundRoleActionResults"] = {"10011": True}
+        response = engine.decide(finished)
         self.assertEqual(response["executeCmd"], "")
-        self.assertFalse(any(
-            command.get("action") == "submitAnswer"
-            for command in response["roleCommandMap"].values()
-        ))
 
     def test_evidence_based_answer_can_submit_on_last_known_round(self):
         # Break caught: deadline handling stops a previously requested answer too early.

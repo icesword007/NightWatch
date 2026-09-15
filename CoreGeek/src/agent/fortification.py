@@ -1,3 +1,4 @@
+import hashlib
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -6,6 +7,8 @@ from .grid import next_step
 from .protocol import STATION, Pos, Turn, distance
 
 MAX_WALL_TARGETS = 6
+MAX_WALL_BATCH = 2
+MAX_TEMPORARY_RECHECKS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,18 +315,32 @@ def prepare_fortification(
             ),
         )
         state.fortification_builder_id = builder.unit_id
-    skipped_unsafe = False
-    while remaining_targets:
-        target = remaining_targets[0]
-        if target in candidates and safe_wall_targets(turn, (target,)) == (target,):
-            break
-        state.fortification_failed.add(target)
-        skipped_unsafe = True
-        remaining_targets = remaining_targets[1:]
-    if not remaining_targets:
-        state.fortification_phase = "complete"
+    batch_targets = tuple(
+        target for target in state.fortification_batch_targets
+        if target in remaining_targets
+    )
+    if not batch_targets:
+        state.fortification_batch_targets = ()
+        batch_targets = _current_safe_prefix(
+            turn, state, remaining_targets, candidates,
+        )
+    else:
+        batch_targets = _current_safe_prefix(
+            turn, state, batch_targets, candidates,
+        )
+    if not batch_targets:
+        temporarily_blocked = any(
+            target in state.fortification_deferred
+            for target in remaining_targets
+            if target not in state.fortification_failed
+        )
+        state.fortification_phase = (
+            "waiting" if temporarily_blocked else "complete"
+        )
         state.fortification_skip_reason = (
-            "target_unsafe" if skipped_unsafe else None
+            "target_temporarily_blocked"
+            if temporarily_blocked
+            else "target_unsafe"
         )
         return None
     failed_mines = frozenset(
@@ -341,25 +358,162 @@ def prepare_fortification(
         state.fortification_phase = "waiting"
         state.fortification_skip_reason = "stone_unavailable"
         return None
-    if not _can_build_and_return(
-        turn,
-        builder,
-        remaining_targets[0],
-        failed_mines,
-        clock,
-        deadline,
-        max_expansions,
-    ):
+    feasible_targets = ()
+    available_slots = (
+        MAX_WALL_BATCH
+        if builder.capacity is None
+        else max(builder.capacity - len(builder.backpack), 0)
+    )
+    max_batch = min(
+        len(batch_targets),
+        MAX_WALL_BATCH,
+        builder.backpack.count("stone") + available_slots,
+    )
+    for size in range(max_batch, 0, -1):
+        trial = batch_targets[:size]
+        if _can_build_and_return(
+            turn,
+            builder,
+            trial,
+            failed_mines,
+            clock,
+            deadline,
+            max_expansions,
+        ):
+            feasible_targets = trial
+            break
+    if not feasible_targets:
         state.fortification_phase = "waiting"
         state.fortification_skip_reason = "return_deadline"
         return None
+    state.fortification_batch_targets = feasible_targets
     state.fortification_phase = (
-        "building" if "stone" in builder.backpack else "mining"
+        "building"
+        if builder.backpack.count("stone") >= len(feasible_targets)
+        else "mining"
     )
-    state.fortification_skip_reason = (
-        "target_unsafe" if skipped_unsafe else None
-    )
+    state.fortification_skip_reason = None
     return builder.unit_id
+
+
+def _current_safe_prefix(
+    turn: Turn,
+    state: Any,
+    targets: tuple[Pos, ...],
+    candidates: tuple[Pos, ...],
+) -> tuple[Pos, ...]:
+    accepted = []
+    for target in targets:
+        trial = tuple((*accepted, target))
+        validation_signature = _wall_condition_signature(
+            turn, trial, target in candidates,
+        )
+        deferred = state.fortification_deferred.get(target)
+        if deferred is not None and deferred[0] == validation_signature:
+            continue
+        if target in candidates and safe_wall_targets(turn, trial) == trial:
+            state.fortification_deferred.pop(target, None)
+            accepted.append(target)
+            if len(accepted) >= MAX_WALL_BATCH:
+                break
+            continue
+        blocker_signature = _temporary_blocker_signature(
+            turn, target, candidates,
+        )
+        if blocker_signature is not None:
+            if deferred is None:
+                attempts = 1
+            elif deferred[1] == blocker_signature:
+                attempts = deferred[2]
+            else:
+                attempts = deferred[2] + 1
+            state.fortification_deferred[target] = (
+                validation_signature, blocker_signature, attempts,
+            )
+            if attempts <= MAX_TEMPORARY_RECHECKS:
+                continue
+        state.fortification_deferred.pop(target, None)
+        state.fortification_failed.add(target)
+    return tuple(accepted)
+
+
+def _wall_condition_signature(
+    turn: Turn,
+    trial: tuple[Pos, ...],
+    target_available: bool,
+) -> str:
+    parts = [
+        f"map:{turn.width}:{turn.height}",
+        f"available:{int(target_available)}",
+        "trial:" + ",".join(f"{pos.x}:{pos.y}" for pos in trial),
+    ]
+    parts.extend(
+        f"zone:{pos.x}:{pos.y}:{kind}"
+        for pos, kind in sorted(
+            turn.zones.items(), key=lambda entry: (entry[0].x, entry[0].y)
+        )
+    )
+    parts.extend(
+        f"unit:{side}:{unit.unit_id}:{unit.kind}:"
+        f"{unit.pos.x}:{unit.pos.y}:{unit.health}"
+        for side, units in (("our", turn.ours), ("enemy", turn.enemies))
+        for unit in sorted(units, key=lambda entry: entry.unit_id)
+    )
+    parts.extend(
+        f"robot:{robot.robot_id}:{robot.pos.x}:{robot.pos.y}:{robot.health}"
+        for robot in sorted(turn.robots, key=lambda entry: entry.robot_id)
+    )
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+
+
+def _temporary_blocker_signature(
+    turn: Turn,
+    target: Pos,
+    candidates: tuple[Pos, ...],
+) -> str | None:
+    if turn.zones.get(target, "land") != "land":
+        return None
+    movable_units = tuple(
+        unit for unit in (*turn.controllable(), *turn.enemies)
+        if unit.kind != STATION
+    )
+    movable = {unit.pos for unit in movable_units} | {
+        robot.pos for robot in turn.robots
+    }
+    if target not in candidates:
+        blockers = [
+            f"unit:{unit.unit_id}:{unit.kind}"
+            for unit in movable_units if unit.pos == target
+        ]
+        blockers.extend(
+            f"robot:{robot.robot_id}"
+            for robot in turn.robots if robot.pos == target
+        )
+        if not blockers:
+            return None
+        return hashlib.sha256(
+            "\0".join(sorted(blockers)).encode("utf-8")
+        ).hexdigest()
+    if not movable:
+        return None
+    relaxed = replace(
+        turn,
+        enemies=tuple(unit for unit in turn.enemies if unit.kind == STATION),
+        robots=(),
+    )
+    if safe_wall_targets(relaxed, (target,)) != (target,):
+        return None
+    blockers = [
+        f"unit:{unit.unit_id}:{unit.kind}:{unit.pos.x}:{unit.pos.y}"
+        for unit in movable_units
+    ]
+    blockers.extend(
+        f"robot:{robot.robot_id}:{robot.pos.x}:{robot.pos.y}"
+        for robot in turn.robots
+    )
+    return hashlib.sha256(
+        "\0".join(sorted(blockers)).encode("utf-8")
+    ).hexdigest()
 
 
 def _worker_protected(
@@ -403,6 +557,9 @@ def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
         "direction": {"x": direction.dx, "y": direction.dy},
         "directionSource": direction.source,
         "targets": [target.dump() for target in state.fortification_targets[:6]],
+        "batchTargets": [
+            target.dump() for target in state.fortification_batch_targets[:2]
+        ],
         "completed": len(state.fortification_completed),
         "failed": len(state.fortification_failed),
         "builderId": (
@@ -419,7 +576,7 @@ def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
 def _can_build_and_return(
     turn: Turn,
     builder: Any,
-    wall_target: Pos,
+    wall_targets: tuple[Pos, ...],
     failed_mines: frozenset[Pos],
     clock: Callable[[], float],
     deadline: float,
@@ -428,7 +585,9 @@ def _can_build_and_return(
     projected_turn = turn
     projected_builder = builder
     rounds = 0
-    if "stone" not in builder.backpack:
+    stone_count = builder.backpack.count("stone")
+    needed_stone = max(len(wall_targets) - stone_count, 0)
+    if needed_stone:
         mine = fortification_stone_target(turn, builder, failed_mines)
         if mine is None:
             return False
@@ -444,35 +603,38 @@ def _can_build_and_return(
         if mine_route is None:
             return False
         mine_stand, mine_cost = mine_route
-        rounds += mine_cost + 1
+        rounds += mine_cost + needed_stone
         projected_builder, projected_turn = _project_role(
             projected_turn,
             projected_builder,
             mine_stand,
-            (*projected_builder.backpack, "stone"),
+            (*projected_builder.backpack, *(("stone",) * needed_stone)),
         )
-    wall_route = _best_adjacent_route(
-        projected_turn,
-        projected_builder,
-        (wall_target,),
-        clock,
-        deadline,
-        max_expansions,
-        [8],
-    )
-    if wall_route is None:
-        return False
-    wall_stand, wall_cost = wall_route
-    rounds += wall_cost + 1
-    projected_builder, projected_turn = _project_role(
-        projected_turn,
-        projected_builder,
-        wall_stand,
-        projected_builder.backpack,
-    )
-    zones = dict(projected_turn.zones)
-    zones[wall_target] = "wall"
-    projected_turn = replace(projected_turn, zones=zones)
+    for wall_target in wall_targets:
+        wall_route = _best_adjacent_route(
+            projected_turn,
+            projected_builder,
+            (wall_target,),
+            clock,
+            deadline,
+            max_expansions,
+            [8],
+        )
+        if wall_route is None:
+            return False
+        wall_stand, wall_cost = wall_route
+        rounds += wall_cost + 1
+        backpack = list(projected_builder.backpack)
+        backpack.remove("stone")
+        projected_builder, projected_turn = _project_role(
+            projected_turn,
+            projected_builder,
+            wall_stand,
+            tuple(backpack),
+        )
+        zones = dict(projected_turn.zones)
+        zones[wall_target] = "wall"
+        projected_turn = replace(projected_turn, zones=zones)
     post_targets = tuple(
         Pos(weapon.pos.x + dx, weapon.pos.y + dy)
         for weapon in projected_turn.weapons()

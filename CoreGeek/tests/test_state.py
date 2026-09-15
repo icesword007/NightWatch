@@ -372,7 +372,12 @@ class StateTests(unittest.TestCase):
         store.state.fortification_initialized = True
         store.state.fortification_builder_id = 10010
         store.state.fortification_targets = (Pos(5, 5),)
+        store.state.fortification_batch_targets = (Pos(5, 5),)
         store.state.fortification_completed.add(Pos(5, 5))
+        store.state.fortification_deferred[Pos(6, 5)] = (
+            "validation", "blocker", 1,
+        )
+        store.state.task_environment_paths.append("/sandbox/verified.txt")
         store.record_response(turn, fingerprint, {
             "roleCommandMap": {"10010": {"action": "move"}},
             "prompt": "",
@@ -394,7 +399,10 @@ class StateTests(unittest.TestCase):
         self.assertFalse(store.state.fortification_initialized)
         self.assertIsNone(store.state.fortification_builder_id)
         self.assertEqual(store.state.fortification_targets, ())
+        self.assertEqual(store.state.fortification_batch_targets, ())
         self.assertEqual(store.state.fortification_completed, set())
+        self.assertEqual(store.state.fortification_deferred, {})
+        self.assertEqual(store.state.task_environment_paths, [])
         self.assertEqual(tuple(store.state.history), old_history)
         self.assertNotEqual(store.state.active_task.instance_id, old_task_id)
 
