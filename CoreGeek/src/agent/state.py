@@ -65,6 +65,7 @@ class TaskMemory:
     solver_history_truncated: bool = False
     solver_evidence: list[str] = field(default_factory=list)
     environment_paths: tuple[str, ...] = ()
+    current_environment_paths: list[str] = field(default_factory=list)
     solver_stopped_reason: str | None = None
     last_tool_result_fingerprint: str | None = None
     last_accepted_cmd_result_round: int | None = None

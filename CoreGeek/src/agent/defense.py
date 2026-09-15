@@ -1,15 +1,17 @@
 import time
+from dataclasses import replace
 from typing import Callable
 
 from .actions import ActionProposal, PlannedAction
 from .fortification import gunner_stand_sort_key
 from .grid import next_step
-from .protocol import Pos, Robot, Turn, Unit, distance, move_command
+from .protocol import PlayerTask, Pos, Robot, Turn, Unit, distance, move_command
 from .state import SessionState
 
 DUSK_POSITIONING_ROUNDS = 12
 EMERGENCY_MEDICINE_HEALTH = 40
 TASK_RECALL_THREAT_DISTANCE = 3
+MIN_TASK_INTERACTION_ROUNDS = 5
 
 
 def protected_gunners(turn: Turn) -> frozenset[int]:
@@ -109,8 +111,32 @@ def task_pioneer_day_return_action(
     reserved_role_ids: frozenset[int] = frozenset(),
     reserved_weapon_ids: frozenset[int] = frozenset(),
 ) -> tuple[PlannedAction, int] | None:
+    _, action, _ = _task_pioneer_day_return_assessment(
+        turn,
+        state,
+        pioneer,
+        clock=clock,
+        deadline=deadline,
+        max_expansions=max_expansions,
+        reserved_role_ids=reserved_role_ids,
+        reserved_weapon_ids=reserved_weapon_ids,
+    )
+    return action
+
+
+def _task_pioneer_day_return_assessment(
+    turn: Turn,
+    state: SessionState,
+    pioneer: Unit,
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    reserved_role_ids: frozenset[int] = frozenset(),
+    reserved_weapon_ids: frozenset[int] = frozenset(),
+) -> tuple[str, tuple[PlannedAction, int] | None, int]:
     if not turn.is_day or len(turn.weapons()) < 3:
-        return None
+        return "not_required", None, 0
     adjacent = _adjacent_assignments(
         turn,
         {pioneer.unit_id, *reserved_role_ids},
@@ -147,7 +173,7 @@ def task_pioneer_day_return_action(
     committed_roles.update(projected_roles)
     staffed_weapons.update(projected_weapons)
     if len(staffed_weapons) < 2:
-        return None
+        return "not_required", None, 0
 
     planned = state.plans.get(pioneer.unit_id)
     planned_weapon_id = None
@@ -157,14 +183,13 @@ def task_pioneer_day_return_action(
         except ValueError:
             planned_weapon_id = None
     options = []
+    unavailable = False
     for weapon in turn.weapons():
         if weapon.unit_id in staffed_weapons:
             continue
         route = _gunner_route(
             turn, pioneer, weapon, clock, deadline, max_expansions,
         )
-        if route is None or route[1] is None:
-            continue
         other_can_arrive = False
         for role in turn.controllable():
             if role.unit_id == pioneer.unit_id or role.unit_id in committed_roles:
@@ -180,9 +205,16 @@ def task_pioneer_day_return_action(
                 break
         if other_can_arrive:
             continue
+        if route is None:
+            unavailable = True
+            continue
         options.append((weapon, route))
     if not options:
-        return None
+        return (
+            "unavailable" if unavailable else "not_required",
+            None,
+            0,
+        )
     weapon, route = min(
         options,
         key=lambda item: (
@@ -192,7 +224,9 @@ def task_pioneer_day_return_action(
         ),
     )
     stand, step, route_cost = route
-    return PlannedAction(
+    if step is None:
+        return "required", None, route_cost
+    action = PlannedAction(
         ActionProposal(
             pioneer.unit_id,
             pioneer.unit_id,
@@ -204,6 +238,60 @@ def task_pioneer_day_return_action(
         turn.round_no + max(turn.rounds_until_night, route_cost, 1),
         route_cost,
     ), turn.rounds_until_night - route_cost
+    return "required", action, route_cost
+
+
+def task_start_skip_reason(
+    turn: Turn,
+    state: SessionState,
+    pioneer: Unit,
+    task: PlayerTask,
+    stand: Pos,
+    arrival_rounds: int,
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    reserved_role_ids: frozenset[int] = frozenset(),
+    reserved_weapon_ids: frozenset[int] = frozenset(),
+) -> str | None:
+    timeout_rounds = getattr(task, "timeout_rounds", None)
+    if (
+        timeout_rounds is not None
+        and timeout_rounds < MIN_TASK_INTERACTION_ROUNDS
+    ):
+        return "insufficient_solver_window"
+    if not turn.is_day:
+        return None
+    projected_pioneer = replace(pioneer, pos=stand)
+    projected_turn = replace(
+        turn,
+        ours=tuple(
+            projected_pioneer if role.unit_id == pioneer.unit_id else role
+            for role in turn.ours
+        ),
+    )
+    return_status, _, return_rounds = _task_pioneer_day_return_assessment(
+        projected_turn,
+        state,
+        projected_pioneer,
+        clock=clock,
+        deadline=deadline,
+        max_expansions=max_expansions,
+        reserved_role_ids=reserved_role_ids,
+        reserved_weapon_ids=reserved_weapon_ids,
+    )
+    if return_status == "unavailable":
+        return "return_route_unavailable"
+    if return_status == "not_required":
+        return None
+    available_rounds = max(turn.rounds_until_night - 1, 0)
+    required_rounds = (
+        arrival_rounds + MIN_TASK_INTERACTION_ROUNDS + return_rounds
+    )
+    if required_rounds > available_rounds:
+        return "insufficient_solver_return_window"
+    return None
 
 
 def _project_daytime_gunners(
@@ -647,9 +735,15 @@ def _gunner_route(
             continue
     if not found:
         return None
+    timely = [route for route in found if route[2] <= turn.rounds_until_night]
+    if timely:
+        def timely_key(route: tuple[Pos, Pos | None, int]) -> tuple[int, ...]:
+            protection = gunner_stand_sort_key(turn, weapon.pos, route[0])
+            return protection[:1] + (route[2],) + protection[1:]
+
+        return min(timely, key=timely_key)
     return min(found, key=lambda route: (
-        route[2],
-        gunner_stand_sort_key(turn, weapon.pos, route[0]),
+        route[2], gunner_stand_sort_key(turn, weapon.pos, route[0]),
     ))
 
 

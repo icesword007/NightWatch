@@ -9,7 +9,7 @@ import agent.economy as economy
 from agent.actions import ActionAllocator, ActionProposal
 from agent.brain import DecisionEngine
 from agent.protocol import Pos, Turn
-from agent.state import StateStore, request_fingerprint
+from agent.state import StateStore, TaskMemory, request_fingerprint
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
@@ -745,12 +745,135 @@ class TaskTests(unittest.TestCase):
 
         next_task = copy.deepcopy(active)
         next_task["roundNo"] = 4
-        next_task["phaseTask"] = "second task"
+        next_task["phaseTask"] = "second task using specification.md"
         prompt = engine.decide(next_task)["prompt"]
 
         self.assertIn("/opt/task-input/specification.md", prompt)
         self.assertIn("verify each path for the current task", prompt)
         self.assertNotIn("//example.test/api", prompt)
+
+    def test_success_output_prose_after_path_is_not_cached_as_a_path(self):
+        # Break caught: an inline sentence is injected as a verified path clue.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="first task",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"discover"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = (
+            "[exitCode:0]\n"
+            "/tmp/example/workspace/README.md：必须先读取规范，再提交答案"
+        )
+
+        engine.decide(result)
+
+        self.assertEqual(engine.state.state.task_environment_paths, [])
+        self.assertEqual(engine.state.state.active_task.environment_paths, ())
+
+    def test_standalone_non_ascii_path_remains_current_task_evidence(self):
+        # Break caught: conservative filtering rejects every non-ASCII path.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="读取输入文件",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"discover"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:0]\n/sandbox/输入/数据.csv"
+
+        prompt = engine.decide(result)["prompt"]
+
+        self.assertIn("/sandbox/输入/数据.csv", prompt)
+        self.assertEqual(
+            engine.state.state.task_environment_paths,
+            ["/sandbox/输入/数据.csv"],
+        )
+
+    def test_unrelated_new_task_does_not_receive_old_specific_path(self):
+        # Break caught: every prior engineering path is injected into an API task.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="inspect project files",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"discover"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:0]\n/workspace/project/README.md"
+        engine.decide(result)
+
+        next_task = copy.deepcopy(active)
+        next_task["roundNo"] = 4
+        next_task["phaseTask"] = "Call the documented API and report its status."
+        prompt = engine.decide(next_task)["prompt"]
+
+        self.assertNotIn("/workspace/project/README.md", prompt)
+
+    def test_explicit_path_wins_when_old_paths_share_a_filename(self):
+        # Break caught: ambiguous same-name history injects both old directories.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="inspect inputs",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"discover"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = (
+            "[exitCode:0]\n/a/input/specification.md\n/b/input/specification.md"
+        )
+        engine.decide(result)
+
+        next_task = copy.deepcopy(active)
+        next_task["roundNo"] = 4
+        next_task["phaseTask"] = "Read /b/input/specification.md and answer."
+        prompt = engine.decide(next_task)["prompt"]
+
+        self.assertIn("/b/input/specification.md", prompt)
+        self.assertNotIn("/a/input/specification.md", prompt)
+
+    def test_different_explicit_path_does_not_reuse_same_basename(self):
+        # Break caught: an explicit new path falls back to an old same-name path.
+        tasks = importlib.import_module("agent.tasks")
+        memory = TaskMemory(
+            "path-instance",
+            "prompt",
+            environment_paths=("/tmp/old/task.md",),
+        )
+
+        text = tasks._environment_path_text(
+            memory, "Read /tmp/new/task.md",
+        )
+
+        self.assertEqual(text, "(none)")
+
+    def test_explicit_path_matching_uses_whole_path_boundaries(self):
+        # Break caught: /foo is treated as explicitly named inside /foobar.
+        tasks = importlib.import_module("agent.tasks")
+        memory = TaskMemory(
+            "path-boundary",
+            "prompt",
+            environment_paths=("/foo",),
+        )
+
+        text = tasks._environment_path_text(memory, "Read /foobar")
+
+        self.assertEqual(text, "(none)")
 
     def test_failed_sandbox_output_does_not_create_reusable_path_clue(self):
         # Break caught: a failed command's guessed path becomes trusted next-task input.
@@ -794,6 +917,8 @@ class TaskTests(unittest.TestCase):
         self.assertIn("consumes two game-round transitions", prompt)
         self.assertIn("combine bounded discovery and the necessary read", prompt)
         self.assertIn("line endings only when sandbox evidence", prompt)
+        self.assertIn("Observed environment path clues", prompt)
+        self.assertNotIn("Previously verified environment paths", prompt)
 
     def test_known_deadline_is_in_every_prompt_and_blocks_late_commands(self):
         # Break caught: normal command/result branches bypass the deadline policy.
@@ -1248,6 +1373,187 @@ class TaskTests(unittest.TestCase):
 
         self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
 
+    def test_task_is_not_accepted_without_solver_and_return_window(self):
+        # Break caught: R58 accepts a task that cannot finish one cycle and return.
+        payload = task_payload(round_no=58, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "task-preaccept-window"
+        payload["teamOur"]["roles"].extend([
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+            unit(10040, "rocket", 16, 6, health=1000),
+        ])
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        pioneer_command = response["roleCommandMap"].get("10011")
+        self.assertTrue(
+            pioneer_command is None or pioneer_command["action"] != "acceptTask"
+        )
+        self.assertEqual(
+            traces[0]["taskStartSkipReason"], "insufficient_solver_return_window",
+        )
+
+    def test_timeout_four_task_is_rejected_before_first_final_only_prompt(self):
+        # Break caught: R1 accept with timeout 4 makes the first R2 prompt final-only.
+        payload = task_payload(round_no=1, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "task-preaccept-timeout-four"
+        payload["teamOur"]["playerTasks"][0]["timeoutRounds"] = 4
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        pioneer_command = response["roleCommandMap"].get("10011")
+        self.assertTrue(
+            pioneer_command is None or pioneer_command["action"] != "acceptTask"
+        )
+        self.assertEqual(
+            traces[0]["taskStartSkipReason"], "insufficient_solver_window",
+        )
+
+    def test_timeout_five_allows_one_command_result_and_answer_chain(self):
+        # Break caught: the corrected minimum blocks the first feasible boundary.
+        engine = DecisionEngine()
+        accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+        accepted["teamOur"]["teamId"] = "task-preaccept-timeout-five"
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 5
+
+        response = engine.decide(accepted)
+        self.assertEqual(
+            response["roleCommandMap"]["10011"]["action"], "acceptTask",
+        )
+
+        active = copy.deepcopy(accepted)
+        active["roundNo"] = 2
+        active["phaseTask"] = "active task"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        prompt = engine.decide(active)["prompt"]
+        self.assertIn("Known remaining task rounds: 4", prompt)
+        self.assertIn("Command exploration is allowed", prompt)
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 3
+        command["llmResp"] = '{"kind":"command","content":"inspect"}'
+        self.assertEqual(engine.decide(command)["executeCmd"], "inspect")
+
+        result = copy.deepcopy(active)
+        result["roundNo"] = 4
+        result["lastCmdResult"] = "[exitCode:0]\nevidence"
+        prompt = engine.decide(result)["prompt"]
+        self.assertIn("Command exploration is not allowed", prompt)
+
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 5
+        answer["llmResp"] = (
+            '{"kind":"answer","content":"supported",'
+            '"complete":true}'
+        )
+        response = engine.decide(answer)
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "supported",
+        })
+
+    def test_task_is_not_accepted_when_required_return_post_is_unreachable(self):
+        # Break caught: a missing return route is mistaken for no return need.
+        payload = task_payload(round_no=50, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "task-preaccept-unreachable-return"
+        payload["teamOur"]["roles"].extend([
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+            unit(10040, "rocket", 16, 6, health=1000),
+        ])
+        payload["mapInfo"]["zones"].extend(
+            {"pos": {"x": 11, "y": y}, "neutralType": "vendor"}
+            for y in range(20)
+        )
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        pioneer_command = response["roleCommandMap"].get("10011")
+        self.assertTrue(
+            pioneer_command is None or pioneer_command["action"] != "acceptTask"
+        )
+        self.assertEqual(
+            traces[0]["taskStartSkipReason"], "return_route_unavailable",
+        )
+
+    def test_late_task_is_allowed_when_other_roles_cover_every_weapon(self):
+        # Break caught: a fixed dusk cutoff blocks work that needs no pioneer return.
+        payload = task_payload(round_no=69, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "task-preaccept-covered"
+        payload["teamOur"]["roles"].extend([
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10014, "worker", 12, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+            unit(10040, "rocket", 12, 6, health=1000),
+        ])
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10011"]["action"], "acceptTask",
+        )
+
+    def test_task_is_accepted_with_one_cycle_and_return_window(self):
+        # Break caught: the new guard blocks every task before dusk positioning.
+        payload = task_payload(round_no=50, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "task-preaccept-window-valid"
+        payload["teamOur"]["roles"].extend([
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+            unit(10040, "rocket", 16, 6, health=1000),
+        ])
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10011"]["action"], "acceptTask",
+        )
+
+    def test_short_timeout_task_does_not_hide_feasible_second_point(self):
+        # Break caught: the first blocked task causes all other points to be skipped.
+        payload = task_payload(round_no=1, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "task-preaccept-two-points"
+        payload["teamOur"]["playerTasks"] = [{
+            "taskType": "自进化类1",
+            "taskPosition": {"x": 4, "y": 4},
+            "coldDownRounds": 0,
+            "scoreReward": 500,
+            "goldReward": 500,
+            "isValid": True,
+            "timeoutRounds": 3,
+        }, {
+            "taskType": "自进化类2",
+            "taskPosition": {"x": 7, "y": 7},
+            "coldDownRounds": 0,
+            "scoreReward": 50,
+            "goldReward": 30,
+            "isValid": True,
+            "timeoutRounds": 20,
+        }]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
+        self.assertEqual(
+            engine.state.state.plans[10011].target,
+            Pos(7, 7),
+        )
+
     def test_active_task_pioneer_is_reserved_unless_support_is_immediate(self):
         # Break caught: any third tower pulls the pioneer away from an active task.
         payload = task_payload(
@@ -1577,7 +1883,7 @@ class TaskTests(unittest.TestCase):
         # Break caught: an elapsed observed timeout is recorded as an unknown success.
         engine = DecisionEngine()
         accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
-        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 1
+        accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = 5
         engine.decide(accepted)
 
         active = copy.deepcopy(accepted)
@@ -1586,8 +1892,8 @@ class TaskTests(unittest.TestCase):
         active["lastRoundRoleActionResults"] = {"10011": True}
         engine.decide(active)
 
-        ended = task_payload(round_no=3, pioneer_pos=(3, 3))
-        ended["teamOur"]["playerTasks"][0]["timeoutRounds"] = 1
+        ended = task_payload(round_no=7, pioneer_pos=(3, 3))
+        ended["teamOur"]["playerTasks"][0]["timeoutRounds"] = 5
         engine.decide(ended)
 
         self.assertEqual(

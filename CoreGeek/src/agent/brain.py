@@ -9,6 +9,7 @@ from .defense import (
     DUSK_POSITIONING_ROUNDS,
     propose_defense,
     protected_gunners,
+    task_start_skip_reason,
     task_pioneer_day_return_action,
     task_pioneer_recall_action,
 )
@@ -187,6 +188,23 @@ class DecisionEngine:
                 clock=self.clock,
                 deadline=deadline,
                 max_expansions=self.max_search_expansions,
+                start_guard=(
+                    lambda task, stand, arrival: task_start_skip_reason(
+                        turn,
+                        state,
+                        turn.pioneers()[0],
+                        task,
+                        stand,
+                        arrival,
+                        clock=self.clock,
+                        deadline=deadline,
+                        max_expansions=self.max_search_expansions,
+                        reserved_role_ids=funding_roles,
+                        reserved_weapon_ids=funding_posts,
+                    )
+                    if state.active_task is None and turn.pioneers()
+                    else None
+                ),
             )
             if day_return is not None and day_return[1] <= 1:
                 submits_now = any(
@@ -261,6 +279,13 @@ class DecisionEngine:
                     elif domain == "economy":
                         rejected_economy.add(id(candidate))
 
+            if (
+                task_turn.start_skip_reason is not None
+                and turn.pioneers()
+                and turn.pioneers()[0].unit_id in protected
+            ):
+                blocked_new_task_by_gunner = True
+
             last_valid = allocator.complete_response(
                 prompt=task_turn.prompt,
                 execute_cmd=task_turn.execute_cmd,
@@ -293,6 +318,7 @@ class DecisionEngine:
                 state,
                 coordination_reason,
                 economy_planning,
+                task_turn.start_skip_reason,
             )
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for _, candidate in accepted:
@@ -421,6 +447,7 @@ class DecisionEngine:
         state: Any,
         coordination_reason: str,
         economy_planning: dict[str, Any] | None = None,
+        task_start_skip_reason: str | None = None,
     ) -> dict[str, Any]:
         task = state.active_task if state is not None else None
         remaining = None
@@ -494,6 +521,7 @@ class DecisionEngine:
             ),
             "cycleFingerprint": cycle_fingerprint,
             "coordinationReason": coordination_reason,
+            "taskStartSkipReason": task_start_skip_reason,
             "actions": actions,
         }
         if economy_planning is not None:

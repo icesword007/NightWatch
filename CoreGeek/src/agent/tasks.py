@@ -33,7 +33,10 @@ MAX_SOLVER_EVIDENCE_CHARS = 12_288
 MAX_UNKNOWN_TASK_COMMANDS = 4
 MAX_ENVIRONMENT_PATHS = 8
 MAX_ENVIRONMENT_PATH_CHARS = 512
-_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_.-])(/[^\s\"'<>|]{1,511})")
+_STANDALONE_PATH = re.compile(r"/[^\s\"'<>|：]{1,511}")
+_PATH_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(/[^\s\"'<>|：]{1,511})"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,7 @@ class TaskTurnProposal:
     actions: tuple[PlannedAction, ...] = ()
     prompt: str = ""
     execute_cmd: str = ""
+    start_skip_reason: str | None = None
 
 
 def parse_llm_envelope(raw: str) -> LlmEnvelope | None:
@@ -105,6 +109,7 @@ def propose_tasks(
     clock: Callable[[], float] = time.monotonic,
     deadline: float,
     max_expansions: int,
+    start_guard: Callable[[PlayerTask, Pos, int], str | None] | None = None,
 ) -> TaskTurnProposal:
     task = state.active_task
     if task is not None and turn.phase_task:
@@ -115,11 +120,11 @@ def propose_tasks(
     if not pioneers:
         return TaskTurnProposal()
     pioneer = pioneers[0]
-    selected = _select_task(
-        turn, pioneer, clock, deadline, max_expansions,
+    selected, skip_reason = _select_task(
+        turn, pioneer, clock, deadline, max_expansions, start_guard,
     )
     if selected is None:
-        return TaskTurnProposal()
+        return TaskTurnProposal(start_skip_reason=skip_reason)
     task_spec, _, step = selected
     reason = f"task:{task_spec.task_type}:{task_spec.pos.x}:{task_spec.pos.y}"
     if step is None:
@@ -307,7 +312,7 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
     context_text = _bounded(context, MAX_TOOL_CONTEXT_CHARS)
     history_text = _solver_history_text(task)
     evidence_text = _solver_evidence_text(task)
-    environment_text = _environment_path_text(task)
+    environment_text = _environment_path_text(task, task_text)
     remaining = _remaining_rounds(turn, task)
     if remaining is not None and remaining <= 3:
         if (
@@ -358,7 +363,8 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         "Handle line endings only when sandbox evidence specifically proves an "
         "interpreter or file-format problem. "
         "Never claim success from an empty, failed, timed-out, or truncated result.\n"
-        f"{context_text}\nPreviously verified environment paths:\n"
+        f"{context_text}\nObserved environment path clues from successful "
+        "sandbox output; re-check for this task:\n"
         f"{environment_text}\nCritical verified evidence:\n{evidence_text}\n"
         f"Solver history:\n{history_text}\nTask:\n{task_text}"
     )
@@ -446,25 +452,78 @@ def _remember_environment_paths(
     task: TaskMemory,
     result: str,
 ) -> None:
-    for match in _ABSOLUTE_PATH.finditer(result):
-        path = match.group(1).rstrip(".,:;)]}")[:MAX_ENVIRONMENT_PATH_CHARS]
-        if not path or path == "/" or path.startswith("//"):
+    lines = result.splitlines()[1:]
+    for line in lines:
+        path = line.strip()
+        if (
+            not _STANDALONE_PATH.fullmatch(path)
+            or len(path) > MAX_ENVIRONMENT_PATH_CHARS
+            or path == "/"
+            or path.startswith("//")
+            or path[-1] in ".,:;)]}，。：；）】"
+        ):
             continue
         if path in state.task_environment_paths:
             state.task_environment_paths.remove(path)
         state.task_environment_paths.append(path)
+        if path in task.current_environment_paths:
+            task.current_environment_paths.remove(path)
+        task.current_environment_paths.append(path)
     del state.task_environment_paths[:-MAX_ENVIRONMENT_PATHS]
     task.environment_paths = tuple(state.task_environment_paths)
+    task.current_environment_paths[:] = [
+        path for path in task.current_environment_paths
+        if path in state.task_environment_paths
+    ]
 
 
-def _environment_path_text(task: TaskMemory) -> str:
+def _environment_path_text(task: TaskMemory, task_text: str) -> str:
     if not task.environment_paths:
+        return "(none)"
+    current = set(task.current_environment_paths)
+    historical = [
+        path for path in task.environment_paths if path not in current
+    ]
+    explicit = _task_path_references(task_text)
+    related = [path for path in historical if path in explicit]
+    if not explicit:
+        by_name: dict[str, list[str]] = {}
+        for path in historical:
+            by_name.setdefault(path.rsplit("/", 1)[-1], []).append(path)
+        related = [
+            paths[0]
+            for name, paths in by_name.items()
+            if len(paths) == 1 and _mentions_filename(task_text, name)
+        ]
+    paths = [
+        path for path in task.environment_paths
+        if path in current or path in related
+    ]
+    if not paths:
         return "(none)"
     return (
         "These paths appeared in successful sandbox output from this match; "
         "verify each path for the current task before relying on it:\n"
-        + "\n".join(task.environment_paths)
+        + "\n".join(paths)
     )
+
+
+def _task_path_references(task_text: str) -> frozenset[str]:
+    paths = []
+    for match in _PATH_REFERENCE.finditer(task_text):
+        path = match.group(1).rstrip(".,:;)]}，。：；）】")
+        if path and path != "/" and not path.startswith("//"):
+            paths.append(path)
+    return frozenset(paths)
+
+
+def _mentions_filename(task_text: str, name: str) -> bool:
+    if not name:
+        return False
+    return re.search(
+        rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
+        task_text,
+    ) is not None
 
 
 def _solver_history_text(task: TaskMemory) -> str:
@@ -495,8 +554,10 @@ def _select_task(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
-) -> tuple[PlayerTask, Pos, Pos | None] | None:
+    start_guard: Callable[[PlayerTask, Pos, int], str | None] | None,
+) -> tuple[tuple[PlayerTask, Pos, Pos | None] | None, str | None]:
     options = []
+    skip_reason = None
     for task in turn.player_tasks:
         if not task.is_valid or task.cooldown_rounds != 0:
             continue
@@ -511,9 +572,20 @@ def _select_task(
                     max_expansions=max_expansions,
                 )
                 if path.status == "already_there":
-                    options.append((0, task, cell, None))
+                    reason = start_guard(task, stand, 0) if start_guard else None
+                    if reason is None:
+                        options.append((0, task, cell, None))
+                    elif skip_reason is None:
+                        skip_reason = reason
                 elif path.status == "found" and path.step is not None:
-                    options.append((path.cost or 0, task, cell, path.step))
+                    cost = path.cost or 0
+                    reason = (
+                        start_guard(task, stand, cost) if start_guard else None
+                    )
+                    if reason is None:
+                        options.append((cost, task, cell, path.step))
+                    elif skip_reason is None:
+                        skip_reason = reason
                 if clock() >= deadline:
                     break
             if clock() >= deadline:
@@ -521,7 +593,7 @@ def _select_task(
         if clock() >= deadline:
             break
     if not options:
-        return None
+        return None, skip_reason
     _, task, cell, step = min(options, key=lambda option: (
         option[0],
         -(option[1].score_reward + option[1].gold_reward),
@@ -529,7 +601,7 @@ def _select_task(
         option[1].pos.x,
         option[1].pos.y,
     ))
-    return task, cell, step
+    return (task, cell, step), None
 
 
 def _adjacent_stands(turn: Turn, pioneer: Unit, target: Pos) -> tuple[Pos, ...]:

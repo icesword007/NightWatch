@@ -115,6 +115,50 @@ class DefenseTests(unittest.TestCase):
         self.assertIsNotNone(route)
         self.assertEqual(route[0], Pos(11, 4))
 
+    def test_timely_back_stand_beats_shorter_exposed_stand(self):
+        # Break caught: route length outranks a reachable rear daytime position.
+        defense = importlib.import_module("agent.defense")
+        payload = defense_payload(round_no=65)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 8, 5),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 10, 5, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 1, 9, health=1500),
+        ]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+
+        route = defense._gunner_route(
+            turn, turn.unit(10010), turn.unit(10020), lambda: 0.0, 1.0, 64,
+        )
+
+        self.assertEqual(route[0], Pos(11, 5))
+        self.assertEqual(route[2], 3)
+
+    def test_late_back_stand_does_not_beat_timely_exposed_stand(self):
+        # Break caught: rear preference sends a gunner to a post after night starts.
+        defense = importlib.import_module("agent.defense")
+        payload = defense_payload(round_no=69)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 8, 5),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 10, 5, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 1, 9, health=1500),
+        ]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+
+        route = defense._gunner_route(
+            turn, turn.unit(10010), turn.unit(10020), lambda: 0.0, 1.0, 64,
+        )
+
+        self.assertEqual(route[0], Pos(10, 4))
+        self.assertEqual(route[2], 2)
+
     def _limited_route_payload(self):
         payload = defense_payload(round_no=65)
         payload["mapInfo"].update({
