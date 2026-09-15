@@ -14,7 +14,16 @@ from .defense import (
 )
 from .economy import propose_economy, wall_build_positions
 from .fortification import fortification_diagnostic, prepare_fortification
-from .protocol import TOWER_TYPES, Pos, Turn, Unit, distance, move_command
+from .intelligence import MAX_NEWS_CALLS_PER_DAY, MAX_NEWS_CANDIDATES
+from .protocol import (
+    ROUNDS_PER_DAY,
+    TOWER_TYPES,
+    Pos,
+    Turn,
+    Unit,
+    distance,
+    move_command,
+)
 from .state import MAX_HISTORY_FACTS, StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
 
@@ -273,6 +282,24 @@ class DecisionEngine:
             ):
                 last_valid = fallback
 
+            has_task_accept = any(
+                isinstance(command, dict)
+                and command.get("action") == "acceptTask"
+                for command in last_valid["roleCommandMap"].values()
+            )
+            if turn.phase_task:
+                state.news_skip_reason = "task_active"
+            elif last_valid["prompt"] or last_valid["executeCmd"]:
+                state.news_skip_reason = "task_tool_priority"
+            elif has_task_accept:
+                state.news_skip_reason = "task_accept_priority"
+            else:
+                news_request = self.state.prepare_news_request(turn)
+                if news_request is not None:
+                    last_valid = copy.deepcopy(last_valid)
+                    last_valid["prompt"] = news_request.prompt
+                    self.state.record_news_request(news_request)
+
             coordination_reason = self._coordination_reason(
                 accepted,
                 urgent_recall,
@@ -530,6 +557,38 @@ class DecisionEngine:
                         state.news_observations if state is not None else ()
                     )
                 ],
+            },
+            "newsInterpretation": {
+                "dailyPolicyLimit": MAX_NEWS_CALLS_PER_DAY,
+                "callsToday": (
+                    state.news_calls_by_day.get(
+                        (turn.round_no - 1) // ROUNDS_PER_DAY + 1, 0,
+                    ) if state is not None else 0
+                ),
+                "remainingToday": max(
+                    0,
+                    MAX_NEWS_CALLS_PER_DAY - (
+                        state.news_calls_by_day.get(
+                            (turn.round_no - 1) // ROUNDS_PER_DAY + 1, 0,
+                        ) if state is not None else 0
+                    ),
+                ),
+                "pendingRequestId": (
+                    state.pending_news_request.request_id
+                    if state is not None
+                    and state.pending_news_request is not None
+                    else None
+                ),
+                "skipReason": (
+                    state.news_skip_reason if state is not None else "no_state"
+                ),
+                "candidateCount": (
+                    len(state.news_candidates) if state is not None else 0
+                ),
+                "candidateLimit": MAX_NEWS_CANDIDATES,
+                "events": (
+                    copy.deepcopy(state.news_events) if state is not None else []
+                ),
             },
         }
         if economy_planning is not None:

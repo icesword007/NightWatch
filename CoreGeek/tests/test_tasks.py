@@ -89,6 +89,7 @@ class TaskTests(unittest.TestCase):
     def test_dead_task_owner_does_not_revive_old_instance_next_day(self):
         payload = task_payload(round_no=69, pioneer_pos=(3, 3))
         payload["teamOur"]["teamId"] = "s2-dead-task-owner-next-day"
+        payload["worldNews"] = {}
         engine = DecisionEngine()
 
         accepted = engine.decide(payload)
@@ -107,6 +108,7 @@ class TaskTests(unittest.TestCase):
         night["phaseTask"] = ""
         night["llmResp"] = '{"kind":"answer","content":"late"}'
         night["teamOur"]["roles"] = []
+        night["worldNews"] = {}
         response = engine.decide(night)
         self.assertEqual(response["prompt"], "")
         self.assertIsNone(engine.state.state.active_task)

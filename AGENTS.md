@@ -125,3 +125,10 @@
 - 在既有S2工作树codex/s2-day-recovery、e874497之后继续，范围扩展为新闻/传闻的来源、当前session去重、跨日与跨局有效性及有界诊断；依据外层design/【codex】s2-news-evidence-plan.md。本段覆盖此前“仅跨日恢复”的范围限制。
 - 原Sol+medium独占S2源码，main送测树不得修改；不增加新闻LLM调用、价格预测交易、宝藏采购/献祭/改道，不改变S1任务/防守仲裁。不新建目录，不引入依赖；使用既有模块和测试目录。
 - 开发任务不提交、推送、合并、切分支或删除；交付由主会话验收。日志只在内网保留有界新闻证据，不记录整包请求、凭据或无关正文；issue只反馈脱敏摘要。
+
+
+## S2新闻LLM候选解读（R113，用户授权继续开发）
+
+- 在S2树codex/s2-day-recovery、a1eae92之后执行design/【codex】s2-news-interpretation-plan.md；覆盖R110禁止新闻LLM的阶段限制，仅允许有界普通额度新闻解读与带证据的候选记忆。
+- 可新增CoreGeek/src/agent/intelligence.py和CoreGeek/tests/test_intelligence.py，沿现有目录修改state/brain及必要日志/测试；不新增目录，不改SDK或依赖。普通新闻分析每天至多2次，任务求解优先，禁止混用工具结果。
+- 仍禁止宝藏采购/献祭/改道、囤矿、投资或防守调参；LLM解释不是平台事实，不执行其命令。主main保持r9；开发任务不提交推送/合并/切分支/删除，主会话独立验收。

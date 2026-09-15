@@ -11,8 +11,9 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s1-r9"
+BUILD_ID = "nightwatch-s2-r3"
 MAX_TASK_DETAIL_CHARS = 131_072
+MAX_NEWS_DETAIL_CHARS = 4_096
 MAX_LOG_ITEMS = 16
 MAX_LOG_TARGETS = 3
 LOG_INVENTORY_ITEMS = (
@@ -54,11 +55,24 @@ def task_detail_log_record(
         })
     trace = decision_trace if isinstance(decision_trace, dict) else {}
     task_instance_id = trace.get("taskInstanceId")
+    news = trace.get("newsInterpretation")
+    news = news if isinstance(news, dict) else {}
+    news_events = news.get("events")
+    news_events = news_events if isinstance(news_events, list) else []
+    has_news_response = any(
+        isinstance(event, dict)
+        and event.get("kind") in ("response_accepted", "response_rejected")
+        for event in news_events
+    )
+    has_news_prompt = any(
+        isinstance(event, dict) and event.get("kind") == "request_issued"
+        for event in news_events
+    )
     raw_text = {
         "phaseTask": payload.get("phaseTask"),
-        "llmResp": payload.get("llmResp"),
+        "llmResp": None if has_news_response else payload.get("llmResp"),
         "lastCmdResult": payload.get("lastCmdResult"),
-        "prompt": response.get("prompt"),
+        "prompt": None if has_news_prompt else response.get("prompt"),
         "executeCmd": response.get("executeCmd"),
     }
     relevant = (
@@ -66,7 +80,8 @@ def task_detail_log_record(
         or bool(submitted)
         or task_instance_id is not None
         or (
-            isinstance(payload.get("errors"), list)
+            not news_events
+            and isinstance(payload.get("errors"), list)
             and bool(payload.get("errors"))
         )
     )
@@ -144,6 +159,78 @@ def task_detail_log_record(
             "score": team.get("totalScore"),
         },
     }
+
+
+def news_detail_log_record(
+    payload: dict[str, Any],
+    *,
+    decision_trace: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    trace = decision_trace if isinstance(decision_trace, dict) else {}
+    news = trace.get("newsInterpretation")
+    news = news if isinstance(news, dict) else {}
+    raw_events = news.get("events")
+    raw_events = raw_events if isinstance(raw_events, list) else []
+    events = [
+        _news_event_detail(event)
+        for event in raw_events[:MAX_LOG_ITEMS]
+        if isinstance(event, dict)
+    ]
+    if not events:
+        return None
+    team = payload.get("teamOur")
+    team = team if isinstance(team, dict) else {}
+    return {
+        "event": "news_detail",
+        "buildId": BUILD_ID,
+        "timestampUtc": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        ),
+        "roundNo": payload.get("roundNo"),
+        "team": {"type": team.get("type"), "id": team.get("teamId")},
+        "requestFingerprint": _payload_fingerprint(payload),
+        "events": events,
+    }
+
+
+def _news_event_detail(raw: dict[str, Any]) -> dict[str, Any]:
+    detail = {
+        name: raw.get(name)
+        for name in (
+            "kind",
+            "requestId",
+            "session",
+            "issuedRound",
+            "issuedDay",
+            "requestDay",
+            "reason",
+            "candidateCount",
+        )
+        if name in raw
+    }
+    for name in ("sourceIds", "newSourceIds", "contextSourceIds"):
+        source_ids = raw.get(name)
+        if isinstance(source_ids, list):
+            detail[name] = [
+                value for value in source_ids[:8] if isinstance(value, str)
+            ]
+    for name in ("prompt", "response"):
+        text = raw.get(name)
+        if not isinstance(text, dict):
+            continue
+        value = text.get("value")
+        value = value if isinstance(value, str) else ""
+        detail[name] = {
+            "value": value[:MAX_NEWS_DETAIL_CHARS],
+            "originalLength": text.get("originalLength"),
+            "truncated": bool(text.get("truncated"))
+            or len(value) > MAX_NEWS_DETAIL_CHARS,
+            "fingerprint": text.get("fingerprint"),
+        }
+    candidates = raw.get("candidates")
+    if isinstance(candidates, list):
+        detail["candidates"] = candidates[:8]
+    return detail
 
 
 def _detail_text(raw: Any) -> dict[str, Any]:
@@ -270,10 +357,36 @@ def turn_log_record(
             "points": _task_points(team),
             "tool": _task_tool_shape(payload, response),
         },
-        "decision": decision_trace,
+        "decision": _summary_decision_trace(decision_trace),
         "timingMs": timing_ms,
         "timingScope": "server-side only; not judger end-to-end",
     }
+
+
+def _summary_decision_trace(
+    decision_trace: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(decision_trace, dict):
+        return None
+    summary = dict(decision_trace)
+    raw_news = decision_trace.get("newsInterpretation")
+    if not isinstance(raw_news, dict):
+        return summary
+    news = dict(raw_news)
+    raw_events = raw_news.get("events")
+    if isinstance(raw_events, list):
+        events = []
+        for raw_event in raw_events[:MAX_LOG_ITEMS]:
+            if not isinstance(raw_event, dict):
+                continue
+            event = _news_event_detail(raw_event)
+            event.pop("prompt", None)
+            event.pop("response", None)
+            event.pop("candidates", None)
+            events.append(event)
+        news["events"] = events
+    summary["newsInterpretation"] = news
+    return summary
 
 
 def _controlled_role_states(team: dict[str, Any]) -> dict[str, Any]:
@@ -528,6 +641,16 @@ class Handler(BaseHTTPRequestHandler):
                     "%s",
                     json.dumps(
                         detail, ensure_ascii=False, separators=(",", ":"),
+                    ),
+                )
+            news_detail = news_detail_log_record(
+                payload, decision_trace=decision_trace,
+            )
+            if news_detail is not None:
+                LOGGER.info(
+                    "%s",
+                    json.dumps(
+                        news_detail, ensure_ascii=False, separators=(",", ":"),
                     ),
                 )
         except Exception:
