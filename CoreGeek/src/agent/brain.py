@@ -15,8 +15,17 @@ from .defense import (
 )
 from .economy import propose_economy, wall_build_positions
 from .fortification import fortification_diagnostic, prepare_fortification
-from .protocol import TOWER_TYPES, Pos, Turn, Unit, distance, move_command
-from .state import StateStore, request_fingerprint
+from .intelligence import MAX_NEWS_CALLS_PER_DAY, MAX_NEWS_CANDIDATES
+from .protocol import (
+    ROUNDS_PER_DAY,
+    TOWER_TYPES,
+    Pos,
+    Turn,
+    Unit,
+    distance,
+    move_command,
+)
+from .state import MAX_HISTORY_FACTS, StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
 
 _NEIGHBOUR_STEPS = (
@@ -298,6 +307,24 @@ class DecisionEngine:
             ):
                 last_valid = fallback
 
+            has_task_accept = any(
+                isinstance(command, dict)
+                and command.get("action") == "acceptTask"
+                for command in last_valid["roleCommandMap"].values()
+            )
+            if turn.phase_task:
+                state.news_skip_reason = "task_active"
+            elif last_valid["prompt"] or last_valid["executeCmd"]:
+                state.news_skip_reason = "task_tool_priority"
+            elif has_task_accept:
+                state.news_skip_reason = "task_accept_priority"
+            else:
+                news_request = self.state.prepare_news_request(turn)
+                if news_request is not None:
+                    last_valid = copy.deepcopy(last_valid)
+                    last_valid["prompt"] = news_request.prompt
+                    self.state.record_news_request(news_request)
+
             coordination_reason = self._coordination_reason(
                 accepted,
                 urgent_recall,
@@ -318,7 +345,8 @@ class DecisionEngine:
                 state,
                 coordination_reason,
                 economy_planning,
-                task_turn.start_skip_reason,
+                task_start_skip_reason=task_turn.start_skip_reason,
+                session_boundary=observation.boundary,
             )
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for _, candidate in accepted:
@@ -448,6 +476,7 @@ class DecisionEngine:
         coordination_reason: str,
         economy_planning: dict[str, Any] | None = None,
         task_start_skip_reason: str | None = None,
+        session_boundary: str | None = None,
     ) -> dict[str, Any]:
         task = state.active_task if state is not None else None
         remaining = None
@@ -523,6 +552,72 @@ class DecisionEngine:
             "coordinationReason": coordination_reason,
             "taskStartSkipReason": task_start_skip_reason,
             "actions": actions,
+            "newsEvidence": {
+                "currentSession": state.session_index if state is not None else None,
+                "sessionBoundary": session_boundary,
+                "retainedFacts": len(state.history) if state is not None else 0,
+                "retainedLimit": MAX_HISTORY_FACTS,
+                "observations": [
+                    {
+                        "source": observation.fact.category,
+                        "status": (
+                            "new_current_session" if observation.is_new
+                            else "seen_current_session"
+                        ),
+                        "firstObserved": {
+                            "session": observation.fact.source_session,
+                            "round": observation.fact.source_round,
+                            "day": observation.fact.source_day,
+                        },
+                        "observed": {
+                            "round": observation.observed_round,
+                            "day": observation.observed_day,
+                        },
+                        "publicationTimeKnown": False,
+                        "text": {
+                            "value": observation.fact.value,
+                            "originalLength": observation.fact.original_length,
+                            "truncated": observation.fact.value_truncated,
+                            "fingerprint": observation.fact.value_fingerprint,
+                        },
+                    }
+                    for observation in (
+                        state.news_observations if state is not None else ()
+                    )
+                ],
+            },
+            "newsInterpretation": {
+                "dailyPolicyLimit": MAX_NEWS_CALLS_PER_DAY,
+                "callsToday": (
+                    state.news_calls_by_day.get(
+                        (turn.round_no - 1) // ROUNDS_PER_DAY + 1, 0,
+                    ) if state is not None else 0
+                ),
+                "remainingToday": max(
+                    0,
+                    MAX_NEWS_CALLS_PER_DAY - (
+                        state.news_calls_by_day.get(
+                            (turn.round_no - 1) // ROUNDS_PER_DAY + 1, 0,
+                        ) if state is not None else 0
+                    ),
+                ),
+                "pendingRequestId": (
+                    state.pending_news_request.request_id
+                    if state is not None
+                    and state.pending_news_request is not None
+                    else None
+                ),
+                "skipReason": (
+                    state.news_skip_reason if state is not None else "no_state"
+                ),
+                "candidateCount": (
+                    len(state.news_candidates) if state is not None else 0
+                ),
+                "candidateLimit": MAX_NEWS_CANDIDATES,
+                "events": (
+                    copy.deepcopy(state.news_events) if state is not None else []
+                ),
+            },
         }
         if economy_planning is not None:
             trace["economyPlanning"] = copy.deepcopy(economy_planning)

@@ -116,3 +116,40 @@
 - 原Sol+medium本批唯一源码工作区切回`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch`，main基准5c22d6155cb61500232b6412abada04536f9d3bc。不得沿用S2目录；S2分支f369b58保持不动。
 - 实施外层design/【codex】s1-r10-and-s2-integration-plan.md：修复任务路径线索污染、接取前回防窗口，针对及时可达的后方炮位被短路径压过进行反例定位后最小修订。经济持券/修墙问题等待内网实证，不盲调参数。
 - 主会话独立验收并提交S1修复后，用户已明确授权将codex/s2-day-recovery合入main。本地合并、必要冲突修复与完整验证均在授权范围；不推送，不删除工作树/分支，不回滚。开发任务仍不自行commit/merge/push，集成由主会话统一安排。
+
+
+## S2跨日恢复专用工作树（R107，用户授权，覆盖旧阶段范围限制）
+
+- 唯一开发目录：`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-recovery`；唯一开发分支：`codex/s2-day-recovery`；基准`5c22d6155cb61500232b6412abada04536f9d3bc`。每次执行命令显式指定该目录或其CoreGeek，先核对pwd/branch/HEAD。
+- 任务虽仍绑定外层CCN-Comp，请勿沿用旧源码路径`code/NightWatch`。该主工作区仅为r9验收/修复保留，本S2任务禁止修改它。
+- 仅实施外层`design/【codex】s2-day-recovery-plan.md`：先盘点已有能力，再用真实连续回合反例修复跨日释放/恢复、角色复活和次日施工缺口。不得扩展宝藏/投资/直接对抗或宣称S1通过。
+- 共享todo/review保留在外层design，可按原规范追加；不得复制平行清单。主会话已跑新工作树基线238项通过。
+- 不commit/push/merge/rebase/cherry-pick/reset，不切main，不删除分支/目录。完成后留变更给主会话独立验收；紧急S1修复由主会话另行明确调度，不自动回旧目录。
+
+
+## S2新闻证据基础（R110，用户授权继续选批开发）
+
+- 在既有S2工作树codex/s2-day-recovery、e874497之后继续，范围扩展为新闻/传闻的来源、当前session去重、跨日与跨局有效性及有界诊断；依据外层design/【codex】s2-news-evidence-plan.md。本段覆盖此前“仅跨日恢复”的范围限制。
+- 原Sol+medium独占S2源码，main送测树不得修改；不增加新闻LLM调用、价格预测交易、宝藏采购/献祭/改道，不改变S1任务/防守仲裁。不新建目录，不引入依赖；使用既有模块和测试目录。
+- 开发任务不提交、推送、合并、切分支或删除；交付由主会话验收。日志只在内网保留有界新闻证据，不记录整包请求、凭据或无关正文；issue只反馈脱敏摘要。
+
+
+## S2新闻LLM候选解读（R113，用户授权继续开发）
+
+- 在S2树codex/s2-day-recovery、a1eae92之后执行design/【codex】s2-news-interpretation-plan.md；覆盖R110禁止新闻LLM的阶段限制，仅允许有界普通额度新闻解读与带证据的候选记忆。
+- 可新增CoreGeek/src/agent/intelligence.py和CoreGeek/tests/test_intelligence.py，沿现有目录修改state/brain及必要日志/测试；不新增目录，不改SDK或依赖。普通新闻分析每天至多2次，任务求解优先，禁止混用工具结果。
+- 仍禁止宝藏采购/献祭/改道、囤矿、投资或防守调参；LLM解释不是平台事实，不执行其命令。主main保持r9；开发任务不提交推送/合并/切分支/删除，主会话独立验收。
+
+
+## S1-r10与S2三批集成开发（R122，用户授权，覆盖旧工作树指向）
+
+- 当前main集成唯一工作区为`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch`；正在将S1-r10提交`59918afbaf9e4825b1e21b58425b2c95e1016a2b`与S2分支`codex/s2-day-recovery`/`f369b58bf234afd962044c14e79dfd3f6ed6eca0`语义合并。
+- 旧`code/NightWatch-s2-recovery`工作树只读保留，不再是当前命令或编码入口，不修改、删除或清理。
+- 冲突须同时保留S1任务路径/接取窗口/炮位修订与S2跨日恢复/新闻证据/有界LLM候选解读，不允许整文件选单边。新闻候选仍不驱动角色动作，不扩展宝藏、投资或防守参数。
+- 开发会话可`git add`明确解决的冲突/集成文件，但不commit/push/rebase/cherry-pick/reset/abort/切分支/删除；主会话最终独立验收并提交merge。
+
+
+## R123 当前集成版本约定
+
+- 主会话已独立验证S1-r10与S2三批合并结果，288项完整测试通过，构建nightwatch-r10-s2；本次创建本地merge提交，不推送。当前后续工作入口为本main树，旧S2工作树与分支只读保留。
+- R122中的冲突解决操作仅适用于当次集成，不授权后续开发会话自行合并或提交；新源码任务须主会话另行下发。S1/S2实战验收尚未通过，保持issue开放。

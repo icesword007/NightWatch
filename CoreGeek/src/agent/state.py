@@ -4,11 +4,24 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import Pos, Turn, distance
+from .intelligence import (
+    MAX_NEWS_CALLS_PER_DAY,
+    MAX_NEWS_CANDIDATES,
+    NewsCandidate,
+    NewsRequest,
+    build_news_request,
+    parse_news_response,
+    source_id,
+)
+from .protocol import ROUNDS_PER_DAY, Pos, Turn, distance
 
 MAX_ACTION_HISTORY = 64
 MAX_ENDED_TASKS = 16
 MAX_HISTORY_FACTS = 256
+MAX_NEWS_TEXT_CHARS = 2_048
+MAX_NEWS_ATTEMPTS = 256
+MAX_NEWS_DAY_RECORDS = 2
+MAX_NEWS_EVENT_TEXT_CHARS = 4_096
 
 
 def request_fingerprint(payload: dict[str, Any]) -> str:
@@ -85,8 +98,20 @@ class TaskMemory:
 class HistoricalFact:
     category: str
     value: str
+    value_fingerprint: str
+    original_length: int
+    value_truncated: bool
     source_session: int
     source_round: int
+    source_day: int
+
+
+@dataclass(frozen=True, slots=True)
+class NewsObservation:
+    fact: HistoricalFact
+    is_new: bool
+    observed_round: int
+    observed_day: int
 
 
 @dataclass(slots=True)
@@ -105,6 +130,14 @@ class SessionState:
     active_task: TaskMemory | None = None
     ended_tasks: list[TaskMemory] = field(default_factory=list)
     history: list[HistoricalFact] = field(default_factory=list)
+    news_observations: tuple[NewsObservation, ...] = ()
+    pending_news_request: NewsRequest | None = None
+    news_calls_by_day: dict[int, int] = field(default_factory=dict)
+    news_blocked_days: set[int] = field(default_factory=set)
+    news_attempted_source_ids: list[str] = field(default_factory=list)
+    news_candidates: list[NewsCandidate] = field(default_factory=list)
+    news_events: list[dict[str, Any]] = field(default_factory=list)
+    news_skip_reason: str | None = None
     late_tool_results: int = 0
     task_environment_paths: list[str] = field(default_factory=list)
     fortification_initialized: bool = False
@@ -166,11 +199,21 @@ class StateStore:
             )
 
         state.observation_count += 1
+        state.news_events = []
+        state.news_skip_reason = None
+        news_response_claimed = self._consume_news_response(
+            turn, payload, accept_result=boundary is None,
+        )
         self._apply_feedback(turn, payload)
         self._release_dead_roles(turn)
         self._release_invalid_plans(turn)
-        self._update_task(turn, payload, accept_results=boundary is None)
-        self._record_news(turn.round_no, payload)
+        self._update_task(
+            turn,
+            payload,
+            accept_results=boundary is None,
+            ignore_llm_result=news_response_claimed,
+        )
+        self._record_news(turn, payload)
         state.last_round_no = turn.round_no
         state.last_fingerprint = fingerprint
         state.last_response = None
@@ -270,6 +313,87 @@ class StateStore:
 
     def clear_plan(self, role_id: int) -> None:
         self._require_state().plans.pop(role_id, None)
+
+    def prepare_news_request(self, turn: Turn) -> NewsRequest | None:
+        state = self._require_state()
+        day = self._day(turn.round_no)
+        self._trim_news_days(day)
+        if state.pending_news_request is not None:
+            state.news_skip_reason = "request_pending"
+            return None
+        if day in state.news_blocked_days:
+            state.news_skip_reason = "quota_error_for_day"
+            return None
+        if state.news_calls_by_day.get(day, 0) >= MAX_NEWS_CALLS_PER_DAY:
+            state.news_skip_reason = "daily_policy_limit"
+            return None
+        attempted = set(state.news_attempted_source_ids)
+        current_session = [
+            fact for fact in state.history
+            if fact.source_session == state.session_index
+        ]
+        eligible = sorted(
+            (
+                fact for fact in current_session
+                if source_id(
+                    state.session_index,
+                    fact.category,
+                    fact.value_fingerprint,
+                ) not in attempted
+            ),
+            key=lambda fact: (-fact.source_round, fact.category),
+        )
+        context = sorted(
+            (
+                fact for fact in current_session
+                if source_id(
+                    state.session_index,
+                    fact.category,
+                    fact.value_fingerprint,
+                ) in attempted
+            ),
+            key=lambda fact: (-fact.source_round, fact.category),
+        )
+        request = build_news_request(
+            eligible,
+            context_sources=context,
+            session=state.session_index,
+            round_no=turn.round_no,
+            day=day,
+        )
+        state.news_skip_reason = None if request is not None else "no_new_evidence"
+        return request
+
+    def record_news_request(self, request: NewsRequest) -> None:
+        state = self._require_state()
+        if state.pending_news_request is not None:
+            raise RuntimeError("news request already pending")
+        state.pending_news_request = request
+        state.news_calls_by_day[request.issued_day] = (
+            state.news_calls_by_day.get(request.issued_day, 0) + 1
+        )
+        state.news_attempted_source_ids.extend(
+            source.source_id for source in request.sources
+            if source.evidence_role == "new_evidence"
+        )
+        del state.news_attempted_source_ids[:-MAX_NEWS_ATTEMPTS]
+        state.news_events.append({
+            "kind": "request_issued",
+            "requestId": request.request_id,
+            "session": request.source_session,
+            "issuedRound": request.issued_round,
+            "issuedDay": request.issued_day,
+            "sourceIds": [source.source_id for source in request.sources],
+            "newSourceIds": [
+                source.source_id for source in request.sources
+                if source.evidence_role == "new_evidence"
+            ],
+            "contextSourceIds": [
+                source.source_id for source in request.sources
+                if source.evidence_role == "context"
+            ],
+            "prompt": self._news_text_detail(request.prompt),
+        })
 
     def _start_session(self, identity: tuple[str, str]) -> None:
         previous = self._require_state()
@@ -445,12 +569,13 @@ class StateStore:
         payload: dict[str, Any],
         *,
         accept_results: bool,
+        ignore_llm_result: bool = False,
     ) -> None:
         state = self._require_state()
         round_no = turn.round_no
         phase_task = payload.get("phaseTask")
         phase_task = phase_task if isinstance(phase_task, str) else ""
-        llm_result = payload.get("llmResp")
+        llm_result = "" if ignore_llm_result else payload.get("llmResp")
         llm_result = llm_result if isinstance(llm_result, str) else ""
         cmd_result = payload.get("lastCmdResult")
         cmd_result = cmd_result if isinstance(cmd_result, str) else ""
@@ -514,6 +639,107 @@ class StateStore:
             round_no=round_no,
             accept_result=accept_results,
         )
+
+    def _consume_news_response(
+        self,
+        turn: Turn,
+        payload: dict[str, Any],
+        *,
+        accept_result: bool,
+    ) -> bool:
+        state = self._require_state()
+        pending = state.pending_news_request
+        if pending is None or not accept_result:
+            return False
+        if turn.round_no <= pending.issued_round:
+            return False
+        raw = payload.get("llmResp")
+        raw = raw if isinstance(raw, str) else ""
+        if turn.round_no != pending.issued_round + 1:
+            state.pending_news_request = None
+            state.news_events.append({
+                "kind": "response_rejected",
+                "requestId": pending.request_id,
+                "reason": "late_response",
+                "response": self._news_text_detail(raw),
+            })
+            return bool(raw)
+        if any(error.code == 5 for error in turn.errors):
+            state.news_blocked_days.add(pending.issued_day)
+            state.pending_news_request = None
+            state.news_events.append({
+                "kind": "response_rejected",
+                "requestId": pending.request_id,
+                "reason": "platform_quota_error",
+                "requestDay": pending.issued_day,
+                "response": self._news_text_detail(raw),
+            })
+            return bool(raw)
+        parsed = parse_news_response(pending, raw)
+        state.pending_news_request = None
+        if parsed.rejection_reason is None:
+            state.news_candidates.extend(parsed.candidates)
+            del state.news_candidates[:-MAX_NEWS_CANDIDATES]
+            state.news_events.append({
+                "kind": "response_accepted",
+                "requestId": pending.request_id,
+                "candidateCount": len(parsed.candidates),
+                "candidates": [self._candidate_detail(candidate)
+                               for candidate in parsed.candidates],
+                "response": self._news_text_detail(raw),
+            })
+        else:
+            state.news_events.append({
+                "kind": "response_rejected",
+                "requestId": pending.request_id,
+                "reason": parsed.rejection_reason,
+                "response": self._news_text_detail(raw),
+            })
+        return bool(raw)
+
+    def _trim_news_days(self, current_day: int) -> None:
+        state = self._require_state()
+        previous = sorted(
+            (
+                day
+                for day in set(state.news_calls_by_day) | state.news_blocked_days
+                if day != current_day
+            ),
+            reverse=True,
+        )
+        keep_set = {current_day, *previous[:MAX_NEWS_DAY_RECORDS - 1]}
+        state.news_calls_by_day = {
+            day: count for day, count in state.news_calls_by_day.items()
+            if day in keep_set
+        }
+        state.news_blocked_days.intersection_update(keep_set)
+
+    @staticmethod
+    def _day(round_no: int) -> int:
+        return (round_no - 1) // ROUNDS_PER_DAY + 1
+
+    @staticmethod
+    def _news_text_detail(value: str) -> dict[str, Any]:
+        return {
+            "value": value[:MAX_NEWS_EVENT_TEXT_CHARS],
+            "originalLength": len(value),
+            "truncated": len(value) > MAX_NEWS_EVENT_TEXT_CHARS,
+            "fingerprint": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        }
+
+    @staticmethod
+    def _candidate_detail(candidate: NewsCandidate) -> dict[str, Any]:
+        return {
+            "type": candidate.kind,
+            "interpretation": candidate.interpretation,
+            "citations": [{
+                "sourceId": citation.source_id,
+                "excerpt": citation.excerpt,
+            } for citation in candidate.citations],
+            "missingConditions": list(candidate.missing_conditions),
+            "conflicts": list(candidate.conflicts),
+            "status": candidate.status,
+        }
 
     def _apply_tool_result(
         self,
@@ -587,23 +813,46 @@ class StateStore:
             return "left_point"
         return "unknown"
 
-    def _record_news(self, round_no: int, payload: dict[str, Any]) -> None:
+    def _record_news(self, turn: Turn, payload: dict[str, Any]) -> None:
         state = self._require_state()
+        state.news_observations = ()
         news = payload.get("worldNews")
         if not isinstance(news, dict):
             return
-        known = {(fact.category, fact.value) for fact in state.history}
+        known = {
+            (fact.category, fact.value_fingerprint): fact
+            for fact in state.history
+            if fact.source_session == state.session_index
+        }
+        observations = []
+        observed_day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
         for category in ("officialNews", "folkLegends"):
             value = news.get(category)
-            if not isinstance(value, str) or not value or (category, value) in known:
+            if not isinstance(value, str) or not value:
                 continue
-            state.history.append(HistoricalFact(
-                category=category,
-                value=value,
-                source_session=state.session_index,
-                source_round=round_no,
+            fingerprint = hashlib.sha256(value.encode("utf-8")).hexdigest()
+            fact = known.get((category, fingerprint))
+            is_new = fact is None
+            if fact is None:
+                fact = HistoricalFact(
+                    category=category,
+                    value=value[:MAX_NEWS_TEXT_CHARS],
+                    value_fingerprint=fingerprint,
+                    original_length=len(value),
+                    value_truncated=len(value) > MAX_NEWS_TEXT_CHARS,
+                    source_session=state.session_index,
+                    source_round=turn.round_no,
+                    source_day=observed_day,
+                )
+                state.history.append(fact)
+                known[(category, fingerprint)] = fact
+            observations.append(NewsObservation(
+                fact=fact,
+                is_new=is_new,
+                observed_round=turn.round_no,
+                observed_day=observed_day,
             ))
-            known.add((category, value))
+        state.news_observations = tuple(observations)
         del state.history[:-MAX_HISTORY_FACTS]
 
     def _require_state(self) -> SessionState:

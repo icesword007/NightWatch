@@ -289,9 +289,12 @@ def prepare_fortification(
         state.fortification_builder_id is not None
     ) else None
     if builder is None and state.fortification_builder_id is not None:
-        state.fortification_phase = "failed"
-        state.fortification_skip_reason = "builder_unavailable"
-        return None
+        state.fortification_builder_id = None
+        state.fortification_batch_targets = ()
+        if turn.round_in_day != 1:
+            state.fortification_phase = "waiting"
+            state.fortification_skip_reason = "builder_unavailable"
+            return None
     if builder is not None and _worker_protected(
         builder, state, reserved_role_ids,
     ):

@@ -20,19 +20,14 @@ class ProtocolTests(unittest.TestCase):
         # Break caught: the HTTP coordinator still emits only the S0 probe.
         response = decide(load_fixture())
 
-        self.assertEqual(
-            response,
-            {
-                "roleCommandMap": {
-                    "10010": {
-                        "action": "collect",
-                        "targetPos": [{"x": 1, "y": 1}],
-                    }
-                },
-                "prompt": "",
-                "executeCmd": "",
+        self.assertEqual(response["roleCommandMap"], {
+            "10010": {
+                "action": "collect",
+                "targetPos": [{"x": 1, "y": 1}],
             },
-        )
+        })
+        self.assertIn("UNTRUSTED_NEWS_DATA_BEGIN", response["prompt"])
+        self.assertEqual(response["executeCmd"], "")
 
     def test_response_is_a_complete_json_object(self):
         # Break caught: HTTP code receives only the inner command map.

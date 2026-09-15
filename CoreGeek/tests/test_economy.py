@@ -482,6 +482,7 @@ class EconomyTests(unittest.TestCase):
             {"name": "StationUpgradeVoucher1", "price": 100},
             {"name": "WeaponUpgradeVoucher1", "price": 100},
         ]
+        payload["worldNews"] = {}
         real_next_step = economy.next_step
         search_count = 0
 
@@ -518,6 +519,7 @@ class EconomyTests(unittest.TestCase):
 
     def test_economy_uses_only_its_reserved_share_of_request_budget(self):
         payload = economy_payload(round_no=30)
+        payload["worldNews"] = {}
         observed = {}
 
         def capture_economy(*args, **kwargs):

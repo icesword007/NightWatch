@@ -86,6 +86,48 @@ def state_for(payload):
 
 
 class TaskTests(unittest.TestCase):
+    def test_dead_task_owner_does_not_revive_old_instance_next_day(self):
+        payload = task_payload(round_no=69, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "s2-dead-task-owner-next-day"
+        payload["worldNews"] = {}
+        engine = DecisionEngine()
+
+        accepted = engine.decide(payload)
+        self.assertEqual(
+            accepted["roleCommandMap"]["10011"]["action"], "acceptTask",
+        )
+        active = copy.deepcopy(payload)
+        active["roundNo"] = 70
+        active["phaseTask"] = "first-day task"
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        self.assertTrue(engine.decide(active)["prompt"])
+        old_instance = engine.state.state.active_task.instance_id
+
+        night = copy.deepcopy(active)
+        night["roundNo"] = 71
+        night["phaseTask"] = ""
+        night["llmResp"] = '{"kind":"answer","content":"late"}'
+        night["teamOur"]["roles"] = []
+        night["worldNews"] = {}
+        response = engine.decide(night)
+        self.assertEqual(response["prompt"], "")
+        self.assertIsNone(engine.state.state.active_task)
+        self.assertEqual(
+            engine.state.state.ended_tasks[-1].instance_id, old_instance,
+        )
+        self.assertEqual(engine.state.state.ended_tasks[-1].end_reason, "death")
+
+        dawn = copy.deepcopy(payload)
+        dawn["roundNo"] = 131
+        dawn["llmResp"] = ""
+        dawn["lastRoundRoleActionResults"] = {}
+        next_task = engine.decide(dawn)
+
+        self.assertEqual(
+            next_task["roleCommandMap"]["10011"]["action"], "acceptTask",
+        )
+        self.assertIsNone(engine.state.state.active_task)
+
     def _idle_third_gunner_payload(self, round_no=65, *, rocket_cooldown=0):
         payload = task_payload(round_no=round_no, pioneer_pos=(12, 5))
         payload["teamOur"]["teamId"] = "task-idle-third-gunner"
@@ -247,6 +289,37 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(
             traces[0]["economyPlanning"]["heldInvestment"], "pending",
+        )
+
+    def test_remote_held_voucher_resumes_upgrade_route_at_next_dawn(self):
+        payload = self._idle_third_gunner_payload(round_no=71)
+        payload["teamOur"]["teamId"] = "s2-held-voucher-next-dawn"
+        worker = next(
+            role for role in payload["teamOur"]["roles"]
+            if role["id"] == 10010
+        )
+        worker["pos"] = {"x": 1, "y": 1}
+        worker["backpack"] = ["WeaponUpgradeVoucher1"]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+
+        night_response = engine.decide(payload)
+        self.assertNotEqual(
+            night_response["roleCommandMap"].get("10010", {}).get("name"),
+            "WeaponUpgradeVoucher1",
+        )
+
+        dawn = copy.deepcopy(payload)
+        dawn["roundNo"] = 131
+        dawn_response = engine.decide(dawn)
+
+        self.assertEqual(
+            dawn_response["roleCommandMap"]["10010"]["action"], "move",
+        )
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith("use:"),
         )
 
     def test_held_voucher_arbitration_rejection_is_diagnosed(self):
@@ -1455,6 +1528,77 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(response["roleCommandMap"]["10011"], {
             "action": "submitAnswer", "taskAnswer": "supported",
         })
+
+    def test_rejected_task_window_still_allows_news_and_defense_move(self):
+        # Integration break caught: a rejected S1 task suppresses S2 news or defense.
+        payload = task_payload(round_no=58, pioneer_pos=(3, 3))
+        payload["teamOur"]["teamId"] = "integration-task-news-defense"
+        payload["teamOur"]["roles"].extend([
+            unit(10010, "worker", 6, 5),
+            unit(10012, "worker", 9, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 9, 6, health=1000),
+            unit(10040, "rocket", 16, 6, health=1000),
+        ])
+        payload["worldNews"] = {"officialNews": "integration bulletin"}
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        self.assertEqual(
+            traces[0]["taskStartSkipReason"],
+            "insufficient_solver_return_window",
+        )
+        self.assertIn("UNTRUSTED_NEWS_DATA_BEGIN", response["prompt"])
+        self.assertTrue(any(
+            command["action"] == "move"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertFalse(any(
+            command["action"] == "acceptTask"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_news_response_is_consumed_before_new_task_prompt(self):
+        # Integration break caught: an S2 news result enters the S1 task parser.
+        engine = DecisionEngine()
+        first = task_payload(round_no=1, pioneer_pos=(3, 3))
+        first["teamOur"]["teamId"] = "integration-news-new-task"
+        first["teamOur"]["playerTasks"] = []
+        first["worldNews"] = {"officialNews": "stable source text"}
+
+        news_response = engine.decide(first)
+        self.assertIn("UNTRUSTED_NEWS_DATA_BEGIN", news_response["prompt"])
+        pending = engine.state.state.pending_news_request
+        self.assertIsNotNone(pending)
+        source = pending.sources[0]
+
+        active = task_payload(
+            round_no=2, pioneer_pos=(3, 3), phase_task="new active task",
+        )
+        active["teamOur"]["teamId"] = "integration-news-new-task"
+        active["worldNews"] = {}
+        active["llmResp"] = json.dumps({
+            "requestId": pending.request_id,
+            "candidates": [{
+                "type": "news",
+                "interpretation": "candidate only",
+                "citations": [{
+                    "sourceId": source.source_id,
+                    "excerpt": "stable source text",
+                }],
+                "missingConditions": [],
+                "conflicts": [],
+            }],
+        })
+
+        response = engine.decide(active)
+
+        self.assertIn("Solve the following competition task", response["prompt"])
+        self.assertNotIn("UNTRUSTED_NEWS_DATA_BEGIN", response["prompt"])
+        self.assertEqual(engine.state.state.active_task.tool_results, [])
+        self.assertEqual(len(engine.state.state.news_candidates), 1)
 
     def test_task_is_not_accepted_when_required_return_post_is_unreachable(self):
         # Break caught: a missing return route is mistaken for no return need.

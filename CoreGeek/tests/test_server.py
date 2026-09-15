@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import socket
 import subprocess
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from agent import server as server_module
-from agent.brain import decide
+from agent.brain import DecisionEngine, decide
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,120 @@ def free_port():
 
 
 class ServerTests(unittest.TestCase):
+    def test_real_decision_trace_logs_bounded_news_evidence(self):
+        # Break caught: retained news exists only in hidden state, not request logs.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 5
+        payload["teamOur"]["teamId"] = "s2-news-trace"
+        payload["worldNews"] = {
+            "officialNews": "official bulletin",
+            "folkLegends": "folk account",
+        }
+        engine = DecisionEngine()
+        traces = []
+
+        response = engine.decide(payload, trace_sink=traces.append)
+        without_news = json.loads(json.dumps(payload))
+        without_news["worldNews"] = {}
+        without_news_traces = []
+        response_without_news = DecisionEngine().decide(
+            without_news, trace_sink=without_news_traces.append,
+        )
+        first_trace = traces[0]
+        evidence = first_trace["newsEvidence"]
+
+        self.assertEqual(
+            response["roleCommandMap"], response_without_news["roleCommandMap"],
+        )
+        self.assertEqual(response["executeCmd"], response_without_news["executeCmd"])
+        self.assertTrue(response["prompt"])
+        self.assertEqual(response_without_news["prompt"], "")
+        self.assertEqual(set(response), {"roleCommandMap", "prompt", "executeCmd"})
+        self.assertEqual(
+            without_news_traces[0]["newsEvidence"]["observations"], [],
+        )
+        self.assertEqual(evidence["currentSession"], 1)
+        self.assertEqual(evidence["retainedLimit"], 256)
+        self.assertEqual(evidence["retainedFacts"], 2)
+        self.assertEqual(evidence["observations"], [
+            {
+                "source": "officialNews",
+                "status": "new_current_session",
+                "firstObserved": {"session": 1, "round": 5, "day": 1},
+                "observed": {"round": 5, "day": 1},
+                "publicationTimeKnown": False,
+                "text": {
+                    "value": "official bulletin",
+                    "originalLength": 17,
+                    "truncated": False,
+                    "fingerprint": hashlib.sha256(
+                        b"official bulletin"
+                    ).hexdigest(),
+                },
+            },
+            {
+                "source": "folkLegends",
+                "status": "new_current_session",
+                "firstObserved": {"session": 1, "round": 5, "day": 1},
+                "observed": {"round": 5, "day": 1},
+                "publicationTimeKnown": False,
+                "text": {
+                    "value": "folk account",
+                    "originalLength": 12,
+                    "truncated": False,
+                    "fingerprint": hashlib.sha256(b"folk account").hexdigest(),
+                },
+            },
+        ])
+
+        repeated = json.loads(json.dumps(payload))
+        repeated["roundNo"] = 135
+        repeated_traces = []
+        repeated_response = engine.decide(
+            repeated, trace_sink=repeated_traces.append,
+        )
+        repeated_evidence = repeated_traces[0]["newsEvidence"]
+        self.assertEqual(
+            [item["status"] for item in repeated_evidence["observations"]],
+            ["seen_current_session", "seen_current_session"],
+        )
+        self.assertEqual(
+            repeated_evidence["observations"][0]["firstObserved"],
+            {"session": 1, "round": 5, "day": 1},
+        )
+        self.assertEqual(
+            repeated_evidence["observations"][0]["observed"],
+            {"round": 135, "day": 2},
+        )
+
+        cached_traces = []
+        cached_response = engine.decide(repeated, trace_sink=cached_traces.append)
+        self.assertEqual(cached_response, repeated_response)
+        self.assertEqual(cached_traces[0], repeated_traces[0])
+        self.assertEqual(len(engine.state.state.history), 2)
+
+        record = server_module.turn_log_record(
+            repeated, repeated_response, {}, decision_trace=repeated_traces[0],
+        )
+        self.assertEqual(record["decision"]["newsEvidence"], repeated_evidence)
+
+        next_session = json.loads(json.dumps(payload))
+        next_session["roundNo"] = 1
+        next_session["teamOur"]["teamId"] = "s2-news-trace-next-session"
+        next_traces = []
+        engine.decide(next_session, trace_sink=next_traces.append)
+        next_evidence = next_traces[0]["newsEvidence"]
+        self.assertEqual(next_evidence["sessionBoundary"], "team_identity_changed")
+        self.assertEqual(next_evidence["currentSession"], 2)
+        self.assertEqual(
+            [item["status"] for item in next_evidence["observations"]],
+            ["new_current_session", "new_current_session"],
+        )
+        self.assertEqual(
+            next_evidence["observations"][0]["firstObserved"],
+            {"session": 2, "round": 1, "day": 1},
+        )
+
     def setUp(self):
         self.port = free_port()
         self.process = subprocess.Popen(
@@ -82,7 +197,7 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(
                     response.headers.get_content_charset(), "utf-8"
                 )
-                self.assertEqual(payload["prompt"], "")
+                self.assertIn("UNTRUSTED_NEWS_DATA_BEGIN", payload["prompt"])
                 self.assertEqual(payload["executeCmd"], "")
                 self.assertEqual(
                     payload["roleCommandMap"]["10010"]["targetPos"],
@@ -124,7 +239,7 @@ class ServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(record["buildId"], "nightwatch-s1-r10")
+        self.assertEqual(record["buildId"], "nightwatch-r10-s2")
         self.assertEqual(
             record["team"], {"type": "challenger", "id": "s0-our"}
         )
@@ -364,6 +479,93 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(phase["originalLength"], server_module.MAX_TASK_DETAIL_CHARS + 7)
         self.assertTrue(phase["truncated"])
         self.assertTrue(record["text"]["lastCmdResult"]["platformTruncated"])
+
+    def test_news_detail_is_separate_from_task_detail(self):
+        # Break caught: news prompts and replies leak into the task-specific log.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["llmResp"] = "news model response"
+        response = {
+            "roleCommandMap": {},
+            "prompt": "news model prompt",
+            "executeCmd": "",
+        }
+        trace = {
+            "taskInstanceId": None,
+            "newsInterpretation": {
+                "events": [{
+                    "kind": "response_accepted",
+                    "requestId": "news-s1-r1-test",
+                    "response": {
+                        "value": "news model response",
+                        "originalLength": 19,
+                        "truncated": False,
+                        "fingerprint": "response-hash",
+                    },
+                }, {
+                    "kind": "request_issued",
+                    "requestId": "news-s1-r2-test",
+                    "prompt": {
+                        "value": "news model prompt",
+                        "originalLength": 17,
+                        "truncated": False,
+                        "fingerprint": "prompt-hash",
+                    },
+                }],
+            },
+        }
+
+        self.assertIsNone(server_module.task_detail_log_record(
+            payload, response, decision_trace=trace,
+        ))
+        news_record = server_module.news_detail_log_record(
+            payload, decision_trace=trace,
+        )
+        self.assertEqual(news_record["event"], "news_detail")
+        self.assertEqual(len(news_record["events"]), 2)
+        self.assertEqual(
+            news_record["events"][0]["response"]["value"],
+            "news model response",
+        )
+        turn_record = server_module.turn_log_record(
+            payload, response, {}, decision_trace=trace,
+        )
+        encoded_turn = json.dumps(turn_record, ensure_ascii=False)
+        self.assertNotIn("news model response", encoded_turn)
+        self.assertNotIn("news model prompt", encoded_turn)
+        self.assertEqual(
+            turn_record["decision"]["newsInterpretation"]["events"][0],
+            {
+                "kind": "response_accepted",
+                "requestId": "news-s1-r1-test",
+            },
+        )
+
+    def test_task_detail_keeps_task_text_when_news_is_also_issued(self):
+        # Break caught: filtering news accidentally removes a current task record.
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["phaseTask"] = "current task body"
+        response = {
+            "roleCommandMap": {},
+            "prompt": "news model prompt",
+            "executeCmd": "",
+        }
+        trace = {
+            "taskInstanceId": "task-9",
+            "newsInterpretation": {
+                "events": [{
+                    "kind": "request_issued",
+                    "requestId": "news-s1-r3-test",
+                    "prompt": {"value": "news model prompt"},
+                }],
+            },
+        }
+
+        record = server_module.task_detail_log_record(
+            payload, response, decision_trace=trace,
+        )
+
+        self.assertEqual(record["text"]["phaseTask"]["value"], "current task body")
+        self.assertIsNone(record["text"]["prompt"]["value"])
 
     def test_turn_log_records_bounded_decision_trace_without_private_text(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
@@ -609,7 +811,12 @@ class ServerTests(unittest.TestCase):
             "send",
             "log_start",
             "log_end",
+            "log_start",
+            "log_end",
         ])
+        self.assertEqual(
+            [record["event"] for record in records], ["turn", "news_detail"],
+        )
         self.assertGreaterEqual(
             records[0]["timingMs"]["serverWriteComplete"],
             records[0]["timingMs"]["processing"],
