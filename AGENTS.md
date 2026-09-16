@@ -245,3 +245,8 @@ main f721702、投资分支776e8ac（墙升级）及其他旧树只读；本批�
 ## R159 S2统一集成送测（当前执行规则）
 
 用户已明确授权将投资目标/多人协同、围墙升级776e8ac与任务成功率5810d6d合入main，主会话处理集成冲突、完整验证、提交并推送。本条覆盖上述历史批次不合并/不推送限制。当前构建nightwatch-s2-integrated-r1，内网以【codex】s2-integrated-r1-intranet-prompt.md和通用手册当前轮次要求执行。停止旧版补证；旧版本资料仅历史参考。旧树/缓存/日志保留，不擅改策略，不以本地通过或推送作为实战验收，不自动关闭issue。
+
+
+## R165 S2宝藏结构化条件与只读评估（用户授权继续开发）
+
+新增code/NightWatch-s2-treasure/为同仓库linked worktree，仅源码/测试/手册，沿命名约定、不放临时材料，清理须授权。分支codex/s2-treasure-conditions，基准e7ff4c563b51a44e047721eda6ae30700477dd77；main送测和应急db579b2保持只读，互不混入。新Sol+medium（01a0ab24-5617-70f1-9d03-2899e3ea7a95）唯一开发，按design/【codex】s2-treasure-conditions-plan.md实施。覆盖R113禁止候选内地点/配方/时间字段，仅允许带引用的结构化假设与本地约束检查；模型结论仍pending_validation，不自动买物品、移动、献祭、囤矿，不增新闻调用额度，不改任务/经济/战斗策略。允许现有agent/tests新增treasure.py/test_treasure.py与必要intelligence/state/brain/server修改。开发不commit/merge/push/reset/切分支/删除/派生任务；交付R166、主会话R167验收后可隔离提交，不自动合main或推送。

@@ -29,6 +29,7 @@ from .protocol import (
 )
 from .state import MAX_HISTORY_FACTS, StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
+from .treasure import MAX_TREASURE_CANDIDATES, evaluate_treasure_candidates
 
 _NEIGHBOUR_STEPS = (
     (-1, -1),
@@ -639,7 +640,32 @@ class DecisionEngine:
         }
         if economy_planning is not None:
             trace["economyPlanning"] = copy.deepcopy(economy_planning)
+        treasure_candidates = (
+            evaluate_treasure_candidates(
+                turn,
+                tuple(state.news_candidates),
+                session_index=state.session_index,
+            )
+            if state is not None else ()
+        )
+        if treasure_candidates:
+            trace["treasureConditions"] = {
+                "candidateCount": len(treasure_candidates),
+                "candidateLimit": MAX_TREASURE_CANDIDATES,
+                "candidates": [
+                    DecisionEngine._treasure_trace_summary(candidate)
+                    for candidate in treasure_candidates
+                ],
+            }
         return trace
+
+    @staticmethod
+    def _treasure_trace_summary(candidate: dict[str, Any]) -> dict[str, Any]:
+        summary = copy.deepcopy(candidate)
+        missing = summary.pop("missingItems", {})
+        summary["missingItemCount"] = sum(missing.values())
+        summary["missingItemKinds"] = len(missing)
+        return summary
 
     @staticmethod
     def _short_fingerprint(value: Any) -> str | None:

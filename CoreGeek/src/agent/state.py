@@ -796,7 +796,7 @@ class StateStore:
 
     @staticmethod
     def _candidate_detail(candidate: NewsCandidate) -> dict[str, Any]:
-        return {
+        detail = {
             "type": candidate.kind,
             "interpretation": candidate.interpretation,
             "citations": [{
@@ -806,6 +806,39 @@ class StateStore:
             "missingConditions": list(candidate.missing_conditions),
             "conflicts": list(candidate.conflicts),
             "status": candidate.status,
+            "citationSourceSessions": list(
+                candidate.citation_source_sessions,
+            ),
+            "citationSourceTruncated": candidate.citation_source_truncated,
+        }
+        if candidate.treasure_conditions is not None:
+            conditions = candidate.treasure_conditions
+            detail["treasureConditions"] = {
+                "location": StateStore._treasure_field_detail(
+                    conditions.location,
+                ),
+                "window": StateStore._treasure_field_detail(conditions.window),
+                "items": StateStore._treasure_field_detail(conditions.items),
+            }
+        return detail
+
+    @staticmethod
+    def _treasure_field_detail(field: Any) -> dict[str, Any] | None:
+        if field is None:
+            return None
+        value = field.value
+        if isinstance(value, tuple):
+            value = list(value)
+        elif isinstance(value, dict):
+            value = dict(value)
+        return {
+            "value": value,
+            "citations": [{
+                "sourceId": citation.source_id,
+                "excerpt": citation.excerpt,
+            } for citation in field.citations],
+            "sourceSessions": list(field.source_sessions),
+            "sourceTruncated": field.source_truncated,
         }
 
     def _apply_tool_result(
