@@ -30,6 +30,17 @@ MAX_SOLVER_EVENTS = 8
 MAX_SOLVER_HISTORY_CHARS = 16_384
 MAX_SOLVER_EVIDENCE_EVENTS = 3
 MAX_SOLVER_EVIDENCE_CHARS = 12_288
+MAX_FAILED_OBSERVATIONS = 2
+MAX_FAILED_OBSERVATION_CHARS = 2_048
+MAX_FAILED_COMMAND_CHARS = 512
+_FAILED_COMMAND_LABEL = "Command:\n"
+_FAILED_RESULT_LABEL = "\nResult (failed or incomplete):\n"
+MAX_FAILED_RESULT_CHARS = (
+    MAX_FAILED_OBSERVATION_CHARS
+    - MAX_FAILED_COMMAND_CHARS
+    - len(_FAILED_COMMAND_LABEL)
+    - len(_FAILED_RESULT_LABEL)
+)
 MAX_UNKNOWN_TASK_COMMANDS = 4
 MAX_ENVIRONMENT_PATHS = 8
 MAX_ENVIRONMENT_PATH_CHARS = 512
@@ -59,7 +70,7 @@ def parse_llm_envelope(raw: str) -> LlmEnvelope | None:
         return None
     try:
         value = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         return None
     if not isinstance(value, dict):
         return None
@@ -233,6 +244,8 @@ def _continue_active_task(
         if command_result_complete(result):
             _remember_evidence(task, "Verified sandbox result", result)
             _remember_environment_paths(state, task, result)
+        else:
+            _remember_failed_observation(task, task.last_command or "", result)
         if remaining == 0:
             task.solver_stopped_reason = "command_result_at_deadline"
             return _leave_task(turn, task, owner)
@@ -312,6 +325,7 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
     context_text = _bounded(context, MAX_TOOL_CONTEXT_CHARS)
     history_text = _solver_history_text(task)
     evidence_text = _solver_evidence_text(task)
+    failed_observations_text = _failed_observations_text(task)
     environment_text = _environment_path_text(task, task_text)
     remaining = _remaining_rounds(turn, task)
     if remaining is not None and remaining <= 3:
@@ -342,10 +356,12 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         if command_allowed
         else "Command exploration is not allowed; answer from existing evidence or abandon."
     )
+    tool_cycles = _remaining_tool_cycles(task, remaining)
     return (
         "Solve the following competition task using only the stated task and "
         "platform sandbox evidence. Return exactly one JSON object and no markdown. "
-        f"{budget_text} {command_text} "
+        f"{budget_text} {command_text} Maximum remaining tool cycles: "
+        f"{tool_cycles}. This is an upper bound, not a target to exhaust. "
         'Use {"kind":"command","content":"<sandbox command>"} only when another '
         "platform sandbox step is allowed and necessary. Use "
         '{"kind":"answer","content":"<submit-ready answer>","complete":true} '
@@ -358,6 +374,10 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         "can inform the next answer. When safe, combine bounded discovery and the "
         "necessary read in one command rather than issuing blind cat, ls, and find "
         "steps separately. "
+        "After a failed observation, change the scope or method using the new evidence; "
+        "do not repeat an unchanged attempt. For APIs, compare every request field "
+        "against the current documentation and actual error response; exit code 0 "
+        "does not prove API success. Do not invent credentials or authentication schemes. "
         "If it names no file, use a single input only when exactly one task-relevant input "
         "is evident. Do not assume the entire sandbox contains only one file. "
         "Handle line endings only when sandbox evidence specifically proves an "
@@ -366,8 +386,18 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         f"{context_text}\nObserved environment path clues from successful "
         "sandbox output; re-check for this task:\n"
         f"{environment_text}\nCritical verified evidence:\n{evidence_text}\n"
+        "Recent failed or incomplete command observations (not verified facts):\n"
+        f"{failed_observations_text}\n"
         f"Solver history:\n{history_text}\nTask:\n{task_text}"
     )
+
+
+def _remaining_tool_cycles(task: TaskMemory, remaining: int | None) -> int:
+    if _final_answer_required(task):
+        return 0
+    if remaining is None:
+        return max(0, MAX_UNKNOWN_TASK_COMMANDS - task.command_count)
+    return max(0, (remaining - 2) // 2)
 
 
 def _remaining_rounds(turn: Turn, task: TaskMemory) -> int | None:
@@ -440,6 +470,30 @@ def _remember_evidence(task: TaskMemory, label: str, content: str) -> None:
         # Preserve the first two verified context anchors (typically bounded
         # discovery and its read) while refreshing the current evidence slot.
         task.solver_evidence[-1] = event
+
+
+def _remember_failed_observation(
+    task: TaskMemory,
+    command: str,
+    result: str,
+) -> None:
+    observation = (
+        _bounded(command or "(unknown command)", MAX_FAILED_COMMAND_CHARS),
+        _bounded(result or "(empty result)", MAX_FAILED_RESULT_CHARS),
+    )
+    if observation in task.failed_tool_observations:
+        task.failed_tool_observations.remove(observation)
+    task.failed_tool_observations.append(observation)
+    del task.failed_tool_observations[:-MAX_FAILED_OBSERVATIONS]
+
+
+def _failed_observations_text(task: TaskMemory) -> str:
+    if not task.failed_tool_observations:
+        return "(none)"
+    return "\n\n".join(
+        f"{_FAILED_COMMAND_LABEL}{command}{_FAILED_RESULT_LABEL}{result}"
+        for command, result in task.failed_tool_observations
+    )
 
 
 def _solver_evidence_text(task: TaskMemory) -> str:

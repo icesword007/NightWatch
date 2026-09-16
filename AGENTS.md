@@ -173,3 +173,13 @@
 - 用户授权将已验收S2首批68e24f7快进合入main并推送，本轮只送测，不启动下一批开发。覆盖R128的当轮禁止合并/推送及唯一开发树限制；原S2工作树与分支保留。
 - 内网使用实际克隆目录，以本仓库【codex】s2-defense-r1-intranet-prompt.md为本轮优先级，配合【codex】intranet-validation.md。不执行外网绝对目录指令，不照搬旧r10提示重跑完整S1验收。
 - S1已在7debfef完成功能验收（双阵营首夜、工程完整成功、失败恢复、726回合全量日志无已发现异常）；本版只作关键回归。裁判端到端时延不可得、本版部分提交未覆盖的边界保留。S2整体十天验收尚未完成。
+
+
+## R132 当前S2任务效率开发授权
+
+本工作树唯一开发入口code/NightWatch-s2-tasks，分支codex/s2-task-efficiency，基准0bce507。覆盖R131暂停与历史目录指向。按外层design/【codex】s2-task-efficiency-plan.md由原Sol+medium开发工具周期预算、本任务有界失败证据、求解指引和JSON边界。main与旧S2树只读；不变更截止/路径安全/SDK/经济/防守/新闻，不新增目录或依赖。开发任务不commit/merge/push/reset/切分支/删除；主会话验收后本地提交。本轮不推送，内网仍测试nightwatch-s2-defense-r1。
+
+
+## R134 本批本地验收
+
+任务效率首批已由主会话独立314项回归与4/5/6/20剩余回合连续工具/提交实验验证；本次允许主会话在codex/s2-task-efficiency创建本地提交。main/origin送测版0bce507保持，不合并、不推送。实际任务成功率收益待内网，S2整体未验收。

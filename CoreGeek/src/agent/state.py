@@ -78,6 +78,9 @@ class TaskMemory:
     solver_history: list[str] = field(default_factory=list)
     solver_history_truncated: bool = False
     solver_evidence: list[str] = field(default_factory=list)
+    failed_tool_observations: list[tuple[str, str]] = field(
+        default_factory=list
+    )
     environment_paths: tuple[str, ...] = ()
     current_environment_paths: list[str] = field(default_factory=list)
     solver_stopped_reason: str | None = None

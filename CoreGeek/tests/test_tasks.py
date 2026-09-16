@@ -601,6 +601,42 @@ class TaskTests(unittest.TestCase):
         ):
             self.assertIsNone(tasks.parse_llm_envelope(invalid))
 
+    def test_oversized_json_integer_is_rejected_without_poisoning_next_response(self):
+        # Break caught: Python's integer digit limit raises ValueError outside
+        # the JSONDecodeError branch and crashes the shared task solver entry.
+        tasks = importlib.import_module("agent.tasks")
+        oversized = (
+            '{"kind":"command","content":"inspect","extra":'
+            + "9" * 5_000
+            + "}"
+        )
+
+        self.assertIsNone(tasks.parse_llm_envelope(oversized))
+        self.assertEqual(
+            tasks.parse_llm_envelope(
+                '{"kind":"answer","content":"42","complete":true}'
+            ),
+            tasks.LlmEnvelope("answer", "42", True),
+        )
+
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        engine.decide(active)
+        invalid = copy.deepcopy(active)
+        invalid["roundNo"] = 2
+        invalid["llmResp"] = oversized
+        self.assertIn("violated the JSON envelope", engine.decide(invalid)["prompt"])
+        valid = copy.deepcopy(active)
+        valid["roundNo"] = 3
+        valid["llmResp"] = (
+            '{"kind":"answer","content":"42","complete":true}'
+        )
+        self.assertEqual(engine.decide(valid)["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "42",
+        })
+
     def test_real_engine_runs_accept_prompt_command_result_answer_chain(self):
         # Break caught: task state exists but no real brain path drives the tools.
         engine = DecisionEngine()
@@ -990,8 +1026,197 @@ class TaskTests(unittest.TestCase):
         self.assertIn("consumes two game-round transitions", prompt)
         self.assertIn("combine bounded discovery and the necessary read", prompt)
         self.assertIn("line endings only when sandbox evidence", prompt)
+        self.assertIn("change the scope or method using the new evidence", prompt)
+        self.assertIn("compare every request field", prompt)
+        self.assertIn("exit code 0 does not prove API success", prompt)
+        self.assertIn("Do not invent credentials", prompt)
         self.assertIn("Observed environment path clues", prompt)
         self.assertNotIn("Previously verified environment paths", prompt)
+
+    def test_known_deadline_prompts_report_state_machine_tool_cycle_ceiling(self):
+        # Break caught: the prompt reports raw rounds as if each were a usable
+        # command cycle, ignoring command/result transitions and final submission.
+        for timeout, expected_remaining, expected_cycles in (
+            (5, 4, 1),
+            (6, 5, 1),
+            (7, 6, 2),
+        ):
+            with self.subTest(timeout=timeout):
+                engine = DecisionEngine()
+                accepted = task_payload(round_no=1, pioneer_pos=(3, 3))
+                accepted["teamOur"]["teamId"] = f"cycle-budget-{timeout}"
+                accepted["teamOur"]["playerTasks"][0]["timeoutRounds"] = timeout
+                engine.decide(accepted)
+                active = copy.deepcopy(accepted)
+                active["roundNo"] = 2
+                active["phaseTask"] = "bounded task"
+                active["lastRoundRoleActionResults"] = {"10011": True}
+
+                prompt = engine.decide(active)["prompt"]
+
+                self.assertIn(
+                    f"Known remaining task rounds: {expected_remaining}", prompt,
+                )
+                self.assertIn(
+                    f"Maximum remaining tool cycles: {expected_cycles}", prompt,
+                )
+
+    def test_coordination_deadline_and_final_only_reduce_tool_cycle_ceiling(self):
+        # Break caught: cycle advice ignores an earlier return deadline or a
+        # final-answer state even though execution already honors both.
+        engine = DecisionEngine()
+        active = self._third_post_payload(50)
+        prompt = engine.decide(active)["prompt"]
+        self.assertIn("Known remaining task rounds: 12", prompt)
+        self.assertIn("Maximum remaining tool cycles: 5", prompt)
+
+        engine.state.state.active_task.final_answer_requested = True
+        retry = self._third_post_payload(51)
+        retry["llmResp"] = "invalid-one"
+        prompt = engine.decide(retry)["prompt"]
+        self.assertIn("Maximum remaining tool cycles: 0", prompt)
+
+    def test_unknown_deadline_tool_cycle_ceiling_tracks_existing_four_cycle_cap(self):
+        # Break caught: unknown-deadline guidance advertises a fixed four cycles
+        # after some of that existing safety allowance has already been consumed.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="active task",
+        )
+        self.assertIn("Maximum remaining tool cycles: 4", engine.decide(active)["prompt"])
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"inspect"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:0]\nevidence"
+
+        prompt = engine.decide(result)["prompt"]
+
+        self.assertIn("Maximum remaining tool cycles: 3", prompt)
+
+    def test_failed_observations_survive_history_eviction_but_remain_task_local(self):
+        # Break caught: failed command/result pairs disappear after eight recent
+        # events, or leak into a replacement task as trusted cross-task context.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="first task",
+        )
+        task = engine.decide(active)
+        self.assertTrue(task["prompt"])
+        for index in range(3):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 2 + index * 2
+            command["llmResp"] = json.dumps({
+                "kind": "command", "content": f"failed-command-{index}",
+            })
+            engine.decide(command)
+            result = copy.deepcopy(active)
+            result["roundNo"] = 3 + index * 2
+            result["lastCmdResult"] = f"[exitCode:1]\nfailed-result-{index}"
+            prompt = engine.decide(result)["prompt"]
+
+        for index in range(9):
+            invalid = copy.deepcopy(active)
+            invalid["roundNo"] = 8 + index
+            invalid["llmResp"] = f"invalid-response-{index}"
+            prompt = engine.decide(invalid)["prompt"]
+
+        self.assertIn("Recent failed or incomplete command observations", prompt)
+        self.assertNotIn("failed-command-0", prompt)
+        self.assertNotIn("failed-result-0", prompt)
+        self.assertIn("failed-command-1", prompt)
+        self.assertIn("failed-result-1", prompt)
+        self.assertIn("failed-command-2", prompt)
+        self.assertIn("failed-result-2", prompt)
+        self.assertEqual(engine.state.state.active_task.solver_evidence, [])
+        self.assertEqual(engine.state.state.active_task.environment_paths, ())
+
+        replacement = copy.deepcopy(active)
+        replacement["roundNo"] = 17
+        replacement["phaseTask"] = "replacement task"
+        replacement["llmResp"] = ""
+        prompt = engine.decide(replacement)["prompt"]
+        self.assertNotIn("failed-command-1", prompt)
+        self.assertNotIn("failed-result-2", prompt)
+
+    def test_failed_observations_are_deduplicated_and_separately_bounded(self):
+        # Break caught: a long command consumes the whole pair budget, duplicate
+        # pairs multiply, or a successful result enters the failure-only memory.
+        tasks = importlib.import_module("agent.tasks")
+        memory = TaskMemory("failure-bounds", "prompt")
+        long_command = "c" * 4_096
+        long_result = "[exitCode:1]\n" + "r" * 20_000
+
+        tasks._remember_failed_observation(memory, long_command, long_result)
+        tasks._remember_failed_observation(memory, long_command, long_result)
+
+        self.assertEqual(len(memory.failed_tool_observations), 1)
+        command, result = memory.failed_tool_observations[0]
+        self.assertTrue(command.endswith("[TRUNCATED]"))
+        self.assertTrue(result.endswith("[TRUNCATED]"))
+        rendered = tasks._failed_observations_text(memory)
+        self.assertLessEqual(len(rendered), tasks.MAX_FAILED_OBSERVATION_CHARS)
+        self.assertIn("c" * 100, rendered)
+        self.assertIn("r" * 100, rendered)
+
+        tasks._remember_failed_observation(
+            memory, "timed-out", "[TIMEOUT]\npartial",
+        )
+        self.assertIn("[TIMEOUT]", tasks._failed_observations_text(memory))
+        tasks._remember_failed_observation(
+            memory, "empty-output", "",
+        )
+        tasks._remember_failed_observation(
+            memory, "truncated-output", "[exitCode:0]\npartial\n[TRUNCATED]",
+        )
+        self.assertEqual(len(memory.failed_tool_observations), 2)
+        self.assertNotIn(long_command[:100], tasks._failed_observations_text(memory))
+        self.assertIn("empty-output", tasks._failed_observations_text(memory))
+        self.assertIn("truncated-output", tasks._failed_observations_text(memory))
+
+    def test_failed_observations_do_not_cross_session_and_exit_zero_is_not_reclassified(self):
+        # Break caught: failure-only memory survives a team/session boundary, or
+        # brittle text matching reclassifies an exit-zero HTTP response as failure.
+        tasks = importlib.import_module("agent.tasks")
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="API task",
+        )
+        engine.decide(active)
+        tasks._remember_failed_observation(
+            engine.state.state.active_task,
+            "curl documented-endpoint",
+            "[exitCode:1]\nconnection failed",
+        )
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = (
+            '{"kind":"command","content":"curl documented-endpoint"}'
+        )
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:0]\nHTTP/1.1 401 Unauthorized"
+        prompt = engine.decide(result)["prompt"]
+        self.assertIn("HTTP/1.1 401 Unauthorized", prompt)
+        self.assertEqual(
+            len(engine.state.state.active_task.failed_tool_observations), 1,
+        )
+
+        restarted = copy.deepcopy(active)
+        restarted["roundNo"] = 1
+        restarted["teamOur"]["teamId"] = "task-tests-new-session"
+        restarted["llmResp"] = ""
+        prompt = engine.decide(restarted)["prompt"]
+        self.assertEqual(engine.state.state.session_index, 2)
+        self.assertEqual(
+            engine.state.state.active_task.failed_tool_observations, [],
+        )
+        self.assertNotIn("connection failed", prompt)
 
     def test_known_deadline_is_in_every_prompt_and_blocks_late_commands(self):
         # Break caught: normal command/result branches bypass the deadline policy.
