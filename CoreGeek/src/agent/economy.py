@@ -1,7 +1,7 @@
 import time
 from collections import Counter
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from .actions import ActionProposal, PlannedAction
@@ -103,6 +103,8 @@ class RouteSearchContext:
     truncated_reason: str | None = None
     joint_status: str | None = None
     joint_blocker: str | None = None
+    investment_targets: set[int] = field(default_factory=set)
+    investment_owners: dict[int, int] = field(default_factory=dict)
 
 
 _ROUTE_SEARCH_CONTEXT: ContextVar[RouteSearchContext | None] = ContextVar(
@@ -198,6 +200,41 @@ def _propose_economy(
     fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
 ) -> tuple[PlannedAction, ...]:
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    if context is not None:
+        contenders: dict[int, list[tuple[bool, int]]] = {}
+        live = {role.unit_id: role for role in turn.controllable()}
+        for role_id, plan in state.plans.items():
+            if (
+                plan.source_session != state.session_index
+                or role_id in reserved_role_ids
+                or plan.deadline_round is not None
+                and turn.round_no > plan.deadline_round
+            ):
+                continue
+            target_id = _plan_use_target_id(plan)
+            parts = plan.reason.split(":")
+            joint = _joint_plan(plan.reason)
+            owner_id = joint[3] if joint is not None else role_id
+            if joint is not None and role_id != owner_id:
+                continue
+            role = live.get(owner_id)
+            if target_id is None or role is None or len(parts) < 2:
+                continue
+            item = parts[1]
+            if plan.reason.startswith("use:") and item not in role.backpack:
+                continue
+            target = turn.unit(target_id)
+            if target is None or not _item_matches_target(item, target):
+                continue
+            contenders.setdefault(target_id, []).append(
+                (item not in role.backpack, owner_id)
+            )
+        context.investment_owners = {
+            target_id: min(options)[1]
+            for target_id, options in contenders.items()
+        }
+        context.investment_targets.update(context.investment_owners)
     ensure_defense_layout(turn, state)
     candidates: list[PlannedAction] = []
     maintained_roles: set[int] = set()
@@ -246,7 +283,7 @@ def _propose_economy(
             (worker.unit_id for worker in turn.workers()), None,
         )
 
-    for role in turn.controllable():
+    for role in sorted(turn.controllable(), key=lambda entry: entry.unit_id):
         if clock() >= deadline:
             break
         plan = state.plans.get(role.unit_id)
@@ -278,6 +315,7 @@ def _propose_economy(
             candidate = None
         if candidate is not None:
             candidates.append(candidate)
+            _reserve_investment_target(candidate, _ROUTE_SEARCH_CONTEXT.get())
             maintained_roles.add(role.unit_id)
 
     joint_candidates, joint_roles, joint_cancellations = _joint_funding_actions(
@@ -297,8 +335,10 @@ def _propose_economy(
         max_expansions=max_expansions,
     )
     candidates.extend(joint_candidates)
+    for candidate in joint_candidates:
+        _reserve_investment_target(candidate, context)
     maintained_roles.update(joint_roles)
-    for worker in turn.workers():
+    for worker in sorted(turn.workers(), key=lambda entry: entry.unit_id):
         if (
             worker.unit_id in maintained_roles
             or worker.unit_id not in joint_cancellations
@@ -315,7 +355,7 @@ def _propose_economy(
             continue
         diagnostic = dict(held.diagnostic or {})
         diagnostic["jointCancelReason"] = joint_cancellations[worker.unit_id]
-        candidates.append(replace(
+        fallback = replace(
             held,
             estimated_rounds=(
                 1
@@ -323,14 +363,16 @@ def _propose_economy(
                 else held.estimated_rounds
             ),
             diagnostic=diagnostic,
-        ))
+        )
+        candidates.append(fallback)
+        _reserve_investment_target(fallback, context)
         maintained_roles.add(worker.unit_id)
         joint_cancellations.pop(worker.unit_id)
     for role_id, plan in tuple(state.plans.items()):
         if _joint_plan(plan.reason) is not None and role_id not in joint_roles:
             state.plans.pop(role_id)
 
-    for worker in turn.workers():
+    for worker in sorted(turn.workers(), key=lambda entry: entry.unit_id):
         if clock() >= deadline:
             break
         if worker.unit_id in maintained_roles:
@@ -406,6 +448,7 @@ def _propose_economy(
             candidate = replace(candidate, diagnostic=diagnostic)
         if candidate is not None:
             candidates.append(candidate)
+            _reserve_investment_target(candidate, _ROUTE_SEARCH_CONTEXT.get())
             if (
                 candidate.plan_reason
                 and (
@@ -479,6 +522,14 @@ def _maintenance_action(
 
     for item in worker.backpack:
         targets = _item_targets(turn, item)
+        context = _ROUTE_SEARCH_CONTEXT.get()
+        if context is not None:
+            targets = tuple(
+                target for target in targets
+                if context.investment_owners.get(
+                    target.unit_id, worker.unit_id,
+                ) == worker.unit_id
+            )
         preferred = ()
         if preferred_use_target_id is not None:
             preferred = tuple(
@@ -615,6 +666,22 @@ def _plan_use_target_id(plan) -> int | None:
     return None
 
 
+def _reserve_investment_target(
+    candidate: PlannedAction,
+    context: RouteSearchContext | None,
+) -> None:
+    if context is None:
+        return
+    target_id = _plan_use_target_id(candidate)
+    if target_id is not None:
+        joint = _joint_plan(candidate.plan_reason or "")
+        owner_id = joint[3] if joint is not None else candidate.proposal.actor_id
+        context.investment_targets.add(target_id)
+        context.investment_owners.setdefault(
+            target_id, owner_id,
+        )
+
+
 def _continue_plan(
     turn: Turn,
     state: SessionState,
@@ -648,6 +715,14 @@ def _continue_plan(
         if target is None or target.pos != plan.target:
             return None
         if not _item_matches_target(parts[1], target):
+            return None
+        context = _ROUTE_SEARCH_CONTEXT.get()
+        if (
+            context is not None
+            and context.investment_owners.get(
+                target.unit_id, worker.unit_id,
+            ) != worker.unit_id
+        ):
             return None
         route = _held_item_route(
             turn, worker, parts[1], clock, deadline, max_expansions,
@@ -2386,6 +2461,18 @@ def _held_item_route(
     preferred_use_target_id: int | None = None,
 ) -> FundingRoute | None:
     targets = _item_targets(turn, item)
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    if context is not None:
+        targets = tuple(
+            target for target in targets
+            if context.investment_owners.get(
+                target.unit_id, worker.unit_id,
+            ) == worker.unit_id
+            and (
+                target.unit_id not in context.investment_targets
+                or context.investment_owners.get(target.unit_id) == worker.unit_id
+            )
+        )
     if preferred_use_target_id is not None:
         targets = tuple(
             target for target in targets

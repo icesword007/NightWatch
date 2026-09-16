@@ -208,3 +208,13 @@
 ## R143 本批本地验收
 
 主会话独立360项回归及未绑定/封死/临夜超期额外反例通过，允许主会话在codex/s2-investment-targets本地提交。本轮不合main或推送；main e084aed仍在内网验证。实际投资收益与S2整体待实战，旧工作树和缓存保留。
+
+
+## R145 S2多工人投资协同（用户授权继续开发）
+
+继续使用`code/NightWatch-s2-investment/`与`codex/s2-investment-targets`，基准d1e0183ee88daed501cfe6e3818584333acfacdc，不新增工作树。原Sol+medium独占源码，按design/【codex】s2-investment-targets-plan.md的R145续批实施同目标投资冲突协调；覆盖R141不做跨工人目标排他的本批限制。main e084aed及其余旧树只读。仅同目标重复采购/使用与在途分工释放，不改投资品种/额度/储备阈值、布局/任务/新闻/攻击/SDK，不新增依赖目录。开发不commit/merge/push/reset/切分支/删除，主会话验收后可本地提交，本轮不合main/推送。交付R146、验收R147。
+
+
+## R147 投资协同本地验收
+
+主会话独立367项回归、6回合双目标购券使用链和owner释放矩阵通过，允许主会话在本隔离分支本地提交。本轮不合main/推送；main e084aed继续作为内网版本。

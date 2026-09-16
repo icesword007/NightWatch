@@ -96,6 +96,146 @@ def with_completed_wall_line(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    def test_two_workers_reserve_distinct_upgrade_targets(self):
+        payload = economy_payload(worker_pos=(5, 1), gold=200)
+        payload["teamOur"]["roles"].insert(1, role(10012, "worker", 5, 3))
+        engine = DecisionEngine()
+
+        response = engine.decide(payload)
+
+        self.assertEqual(sum(
+            command.get("action") == "buy"
+            for command in response["roleCommandMap"].values()
+        ), 2)
+        targets = {
+            economy._plan_use_target_id(engine.state.state.plans[role_id])
+            for role_id in (10010, 10012)
+        }
+        self.assertEqual(len(targets), 2)
+
+    def test_two_held_vouchers_do_not_use_same_building(self):
+        payload = economy_payload(
+            worker_pos=(7, 1), items=("WeaponUpgradeVoucher1",),
+        )
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 3,
+                    items=("WeaponUpgradeVoucher1",)),
+        )
+
+        response = DecisionEngine().decide(payload)
+
+        uses = [
+            command["targetPos"][0]
+            for command in response["roleCommandMap"].values()
+            if command.get("action") == "use"
+        ]
+        self.assertEqual(len(uses), len({(p["x"], p["y"]) for p in uses}))
+
+    def test_duplicate_existing_plans_choose_stable_owner(self):
+        payload = economy_payload(
+            worker_pos=(7, 1), items=("WeaponUpgradeVoucher1",),
+        )
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 3,
+                    items=("WeaponUpgradeVoucher1",)),
+        )
+        state = state_for(payload)
+        for role_id in (10010, 10012):
+            state.plans[role_id] = PlanState(
+                role_id, Pos(8, 2),
+                "use:WeaponUpgradeVoucher1:10020", 70,
+                state.session_index,
+            )
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64,
+        )
+        targets = {
+            action.proposal.actor_id: economy._plan_use_target_id(action)
+            for action in actions if action.proposal.actor_id in (10010, 10012)
+        }
+        self.assertEqual(targets[10010], 10020)
+        self.assertNotEqual(targets[10012], 10020)
+
+    def test_night_two_held_vouchers_use_target_once(self):
+        payload = economy_payload(
+            round_no=71, worker_pos=(7, 1),
+            items=("WeaponUpgradeVoucher1",),
+        )
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 3,
+                    items=("WeaponUpgradeVoucher1",)),
+        )
+        response = DecisionEngine().decide(payload)
+        targets = [
+            tuple(command["targetPos"][0].values())
+            for command in response["roleCommandMap"].values()
+            if command.get("action") == "use"
+        ]
+        self.assertEqual(len(targets), len(set(targets)))
+
+    def test_existing_joint_buyer_remains_owner(self):
+        payload = economy_payload(
+            round_no=30, worker_pos=(3, 1), items=("copper",) * 6,
+        )
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 3, 3, items=("copper",) * 6),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(4, 2),
+            "fund:WeaponUpgradeVoucher1:10030:10020:joint:10012",
+            70, state.session_index,
+        )
+        state.plans[10012] = PlanState(
+            10012, Pos(4, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020:joint:10012",
+            70, state.session_index,
+        )
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64,
+        )
+
+        self.assertTrue(all(
+            ":joint:10012" in (action.plan_reason or "")
+            for action in actions if action.proposal.actor_id in (10010, 10012)
+        ))
+
+    def test_only_one_target_starts_only_one_purchase(self):
+        payload = economy_payload(worker_pos=(5, 1), gold=200)
+        payload["teamOur"]["roles"].insert(1, role(10012, "worker", 5, 3))
+        for entry in payload["teamOur"]["roles"]:
+            if entry["id"] in (10030, 10040):
+                entry["level"] = 2
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(sum(
+            command.get("action") == "buy"
+            for command in response["roleCommandMap"].values()
+        ), 1)
+
+    def test_two_wall_fixers_do_not_repair_same_wall(self):
+        payload = economy_payload(worker_pos=(7, 8), items=("WallFixer",))
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 7, items=("WallFixer",)),
+        )
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 7, 9, health=100),
+        )
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(sum(
+            command.get("action") == "use"
+            and command.get("name") == "WallFixer"
+            for command in response["roleCommandMap"].values()
+        ), 1)
+
     @staticmethod
     def _block_weapon(payload, weapon_id):
         weapon = next(
