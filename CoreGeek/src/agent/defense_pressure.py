@@ -23,8 +23,10 @@ class WaveNight:
     target_team: str
     robot_types_by_id: dict[int, str] = field(default_factory=dict)
     complete: bool = False
+    finalized: bool = False
     first_observed_round: int = 0
     last_observed_round: int = 0
+    observed_rounds: set[int] = field(default_factory=set)
     truncated: bool = False
     start_defense: DefenseSnapshot | None = None
     end_defense: DefenseSnapshot | None = None
@@ -47,14 +49,18 @@ class WaveForecast:
     counts: dict[str, int]
     growth: dict[str, int]
     uncertain_types: tuple[str, ...] = ()
+    basis_completeness: str = "lower_bound"
+    finalized: bool = False
     actual_counts: dict[str, int] | None = None
     absolute_error: dict[str, int] | None = None
+    actual_completeness: str | None = None
+    actual_finalized: bool = False
 
 
 def observe_pressure(turn: Turn, state: Any) -> None:
     day = _day(turn.round_no)
+    _finalize_previous_night(turn, state, day)
     if turn.is_day:
-        _finalize_previous_night(turn, state, day)
         return
 
     night = next((item for item in state.wave_history if item.day == day), None)
@@ -62,7 +68,6 @@ def observe_pressure(turn: Turn, state: Any) -> None:
         night = WaveNight(
             day=day,
             target_team=turn.team_type,
-            complete=turn.round_in_day == 71,
             first_observed_round=turn.round_no,
             last_observed_round=turn.round_no,
             start_defense=_snapshot(turn),
@@ -73,6 +78,7 @@ def observe_pressure(turn: Turn, state: Any) -> None:
             state.wave_history_truncated = True
     else:
         night.last_observed_round = max(night.last_observed_round, turn.round_no)
+    night.observed_rounds.add(turn.round_no)
     night.end_defense = _snapshot(turn)
     for robot in turn.robots:
         if robot.target_team != turn.team_type:
@@ -83,8 +89,6 @@ def observe_pressure(turn: Turn, state: Any) -> None:
             night.truncated = True
             continue
         night.robot_types_by_id[robot.robot_id] = robot.kind
-    if night.truncated:
-        night.complete = False
     _score_forecast(state, night)
     _store_next_forecast(state, day)
 
@@ -146,30 +150,49 @@ def _snapshot(turn: Turn) -> DefenseSnapshot:
 
 def _finalize_previous_night(turn: Turn, state: Any, day: int) -> None:
     previous = next(
-        (item for item in reversed(state.wave_history) if item.day == day - 1),
+        (
+            item for item in reversed(state.wave_history)
+            if item.day < day and not item.finalized
+        ),
         None,
     )
     if (
         previous is not None
         and previous.end_defense is not None
-        and not previous.loss_finalized
+        and not previous.finalized
     ):
-        if turn.round_in_day == 1:
+        expected_rounds = set(range((previous.day - 1) * ROUNDS_PER_DAY + 71,
+                                    previous.day * ROUNDS_PER_DAY + 1))
+        exact_dawn = previous.day == day - 1 and turn.round_in_day == 1
+        previous.complete = (
+            exact_dawn
+            and not previous.truncated
+            and previous.observed_rounds == expected_rounds
+        )
+        previous.finalized = True
+        if exact_dawn:
             previous.end_defense = _snapshot(turn)
             if previous.complete:
                 previous.loss_completeness = "complete"
         previous.loss_finalized = True
+        _score_forecast(state, previous)
+        _store_next_forecast(state, previous.day)
 
 
 def _score_forecast(state: Any, night: WaveNight) -> None:
-    if not night.complete:
-        return
     for forecast in state.wave_forecasts:
-        if forecast.target_day != night.day or forecast.actual_counts is not None:
+        if forecast.target_day != night.day or forecast.actual_finalized:
             continue
         actual = night.counts()
         forecast.actual_counts = actual
-        kinds = set(forecast.counts) | set(actual)
+        forecast.actual_completeness = (
+            "complete" if night.complete else "lower_bound"
+        )
+        forecast.actual_finalized = night.finalized
+        kinds = (
+            set(forecast.counts) | set(actual)
+            if night.complete else set(actual)
+        )
         forecast.absolute_error = {
             kind: abs(forecast.counts.get(kind, 0) - actual.get(kind, 0))
             for kind in sorted(kinds)
@@ -177,17 +200,21 @@ def _score_forecast(state: Any, night: WaveNight) -> None:
 
 
 def _store_next_forecast(state: Any, day: int) -> None:
-    complete = [item for item in state.wave_history if item.complete]
-    latest = complete[-1] if complete else None
+    latest = next(
+        (item for item in reversed(state.wave_history) if item.day == day), None,
+    )
     target_day = day + 1
     if latest is None:
         proposed = WaveForecast(target_day, (), 0, "growth_unknown", {}, {})
-    elif (
-        latest.day == day
-        and len(complete) >= 2
-        and complete[-2].day + 1 == latest.day
-    ):
-        earlier = complete[-2]
+    else:
+        earlier = next(
+            (
+                item for item in reversed(state.wave_history)
+                if item.day == latest.day - 1 and item.complete
+            ),
+            None,
+        )
+    if latest is not None and earlier is not None:
         previous_counts = earlier.counts()
         latest_counts = latest.counts()
         kinds = set(previous_counts) | set(latest_counts)
@@ -220,8 +247,10 @@ def _store_next_forecast(state: Any, day: int) -> None:
             counts,
             growth,
             uncertain_types,
+            "complete" if latest.complete else "lower_bound",
+            latest.finalized,
         )
-    else:
+    elif latest is not None:
         proposed = WaveForecast(
             target_day,
             (latest.day,),
@@ -229,6 +258,9 @@ def _store_next_forecast(state: Any, day: int) -> None:
             "growth_unknown",
             latest.counts(),
             {},
+            (),
+            "complete" if latest.complete else "lower_bound",
+            latest.finalized,
         )
     existing = next(
         (item for item in state.wave_forecasts if item.target_day == target_day),
@@ -237,6 +269,15 @@ def _store_next_forecast(state: Any, day: int) -> None:
     if existing is None:
         state.wave_forecasts.append(proposed)
         del state.wave_forecasts[:-MAX_WAVE_FORECASTS]
+    elif not existing.finalized:
+        existing.basis_days = proposed.basis_days
+        existing.sample_count = proposed.sample_count
+        existing.method = proposed.method
+        existing.counts = proposed.counts
+        existing.growth = proposed.growth
+        existing.uncertain_types = proposed.uncertain_types
+        existing.basis_completeness = proposed.basis_completeness
+        existing.finalized = proposed.finalized
 
 
 def _night_dump(night: WaveNight | None) -> dict[str, Any] | None:
@@ -247,6 +288,7 @@ def _night_dump(night: WaveNight | None) -> dict[str, Any] | None:
         "targetTeam": night.target_team,
         "counts": night.counts(),
         "completeness": "complete" if night.complete else "lower_bound",
+        "finalized": night.finalized,
         "firstObservedRound": night.first_observed_round,
         "lastObservedRound": night.last_observed_round,
         "robotIdsRetained": len(night.robot_types_by_id),
@@ -266,6 +308,8 @@ def _forecast_dump(forecast: WaveForecast | None) -> dict[str, Any] | None:
         "counts": dict(forecast.counts),
         "growth": dict(forecast.growth),
         "uncertainTypes": list(forecast.uncertain_types),
+        "basisCompleteness": forecast.basis_completeness,
+        "finalized": forecast.finalized,
         "actualCounts": (
             dict(forecast.actual_counts)
             if forecast.actual_counts is not None else None
@@ -274,6 +318,8 @@ def _forecast_dump(forecast: WaveForecast | None) -> dict[str, Any] | None:
             dict(forecast.absolute_error)
             if forecast.absolute_error is not None else None
         ),
+        "actualCompleteness": forecast.actual_completeness,
+        "actualFinalized": forecast.actual_finalized,
     }
 
 
@@ -328,6 +374,8 @@ def _assessment_reasons(
         forecast is None
         or forecast.method == "growth_unknown"
         or bool(forecast.uncertain_types)
+        or not forecast.finalized
+        or forecast.basis_completeness != "complete"
     ):
         reasons.append("unknown")
     if not reasons or reasons == ["unknown"]:

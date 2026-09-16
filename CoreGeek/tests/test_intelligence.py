@@ -30,6 +30,33 @@ def valid_response(pending, *, candidates=None):
     })
 
 
+def treasure_candidate(pending, *, conditions=None):
+    source = pending.sources[0]
+    candidate = {
+        "type": "treasure",
+        "interpretation": "A treasure hypothesis needs local validation.",
+        "citations": [{
+            "sourceId": source.source_id,
+            "excerpt": "western market may close",
+        }],
+        "missingConditions": [],
+        "conflicts": [],
+    }
+    if conditions is not None:
+        candidate["treasureConditions"] = conditions
+    return candidate
+
+
+def cited(source, value, excerpt="western market may close"):
+    return {
+        "value": value,
+        "citations": [{
+            "sourceId": source.source_id,
+            "excerpt": excerpt,
+        }],
+    }
+
+
 def task_payload(round_no=1, *, phase=""):
     value = payload(round_no, team_id="intelligence-task-priority")
     value["mapInfo"].update({
@@ -66,6 +93,199 @@ def task_payload(round_no=1, *, phase=""):
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_treasure_conditions_are_strictly_parsed_with_field_evidence(self):
+        # Break caught: treasure details are accepted as prose without field citations.
+        store = StateStore()
+        first = payload(team_id="intelligence-treasure-structure")
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        response = valid_response(request, candidates=[treasure_candidate(
+            request,
+            conditions={
+                "location": cited(source, {"x": 4, "y": 5}),
+                "window": cited(source, {"startRound": 10, "endRound": 20}),
+                "items": cited(source, ["StarSand", "StarSand"]),
+            },
+        )])
+
+        parsed = intelligence.parse_news_response(request, response)
+
+        self.assertIsNone(parsed.rejection_reason)
+        conditions = parsed.candidates[0].treasure_conditions
+        self.assertEqual(conditions.location.value, {"x": 4, "y": 5})
+        self.assertEqual(
+            conditions.window.value,
+            {"startRound": 10, "endRound": 20},
+        )
+        self.assertEqual(conditions.items.value, ("StarSand", "StarSand"))
+        self.assertEqual(conditions.location.source_sessions, (1,))
+        self.assertFalse(conditions.location.source_truncated)
+        self.assertEqual(parsed.candidates[0].status, "pending_validation")
+
+    def test_legacy_candidates_and_null_or_empty_treasure_fields_remain_valid(self):
+        # Break caught: extending treasure parsing rejects old six-field responses.
+        store = StateStore()
+        first = payload(team_id="intelligence-treasure-compatible")
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        legacy = treasure_candidate(request)
+        unknown = treasure_candidate(request, conditions={
+            "location": None,
+            "window": None,
+            "items": cited(source, []),
+        })
+
+        parsed = intelligence.parse_news_response(
+            request, valid_response(request, candidates=[legacy, unknown]),
+        )
+
+        self.assertIsNone(parsed.rejection_reason)
+        self.assertIsNone(parsed.candidates[0].treasure_conditions)
+        self.assertIsNone(parsed.candidates[1].treasure_conditions.location)
+        self.assertIsNone(parsed.candidates[1].treasure_conditions.window)
+        self.assertEqual(parsed.candidates[1].treasure_conditions.items.value, ())
+
+    def test_treasure_conditions_reject_malformed_values_and_field_citations(self):
+        # Break caught: bools, invented fields, fake quotes, or unsafe recipes survive.
+        store = StateStore()
+        first = payload(team_id="intelligence-treasure-invalid")
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        base = {
+            "location": cited(source, {"x": 4, "y": 5}),
+            "window": cited(source, {"startRound": 10, "endRound": 20}),
+            "items": cited(source, ["StarSand"]),
+        }
+        malformed = []
+        cases = [
+            ("unknown condition key", {**base, "route": None}),
+            ("bool coordinate", {**base, "location": cited(source, {"x": True, "y": 5})}),
+            ("float coordinate", {**base, "location": cited(source, {"x": 4.0, "y": 5})}),
+            ("reversed window", {**base, "window": cited(source, {"startRound": 20, "endRound": 10})}),
+            ("window below one", {**base, "window": cited(source, {"startRound": 0, "endRound": 10})}),
+            ("window above match", {**base, "window": cited(source, {"startRound": 10, "endRound": 1301})}),
+            ("too many items", {**base, "items": cited(source, ["StarSand"] * 9)}),
+            ("empty item name", {**base, "items": cited(source, [""])}),
+            ("long item name", {**base, "items": cited(source, ["x" * 129])}),
+            ("fake field quote", {**base, "items": cited(source, ["StarSand"], "not present")}),
+            ("empty field citations", {**base, "items": {"value": ["StarSand"], "citations": []}}),
+            ("too many field citations", {**base, "items": {
+                "value": ["StarSand"],
+                "citations": cited(source, ["StarSand"])["citations"] * 9,
+            }}),
+            ("unknown field key", {**base, "items": {
+                **cited(source, ["StarSand"]), "confidence": 1,
+            }}),
+            ("non-string item", {**base, "items": cited(source, [1])}),
+        ]
+        for name, conditions in cases:
+            with self.subTest(name=name):
+                result = intelligence.parse_news_response(
+                    request,
+                    valid_response(request, candidates=[treasure_candidate(
+                        request, conditions=conditions,
+                    )]),
+                )
+                malformed.append(result.rejection_reason)
+        news_with_conditions = treasure_candidate(request, conditions=base)
+        news_with_conditions["type"] = "news"
+        malformed.append(intelligence.parse_news_response(
+            request,
+            valid_response(request, candidates=[news_with_conditions]),
+        ).rejection_reason)
+
+        self.assertEqual(malformed, ["invalid_candidate"] * len(malformed))
+
+    def test_treasure_detail_retains_response_bound_field_evidence(self):
+        # Break caught: accepted field evidence loses its request/session snapshot.
+        engine = DecisionEngine()
+        first = payload(team_id="intelligence-treasure-detail")
+        first["worldNews"]["officialNews"] = (
+            "western market may close" + "x" * 2_000
+        )
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        source = pending.sources[0]
+        returned = copy.deepcopy(first)
+        returned["roundNo"] = 2
+        returned["llmResp"] = valid_response(
+            pending,
+            candidates=[treasure_candidate(pending, conditions={
+                "location": cited(source, {"x": 4, "y": 4}),
+                "window": cited(source, {"startRound": 2, "endRound": 20}),
+                "items": cited(source, ["StarSand"]),
+            })],
+        )
+
+        engine.decide(returned)
+
+        detail = engine.state.state.news_events[-1]["candidates"][0]
+        location = detail["treasureConditions"]["location"]
+        self.assertEqual(location["value"], {"x": 4, "y": 4})
+        self.assertEqual(location["sourceSessions"], [1])
+        self.assertTrue(location["sourceTruncated"])
+        self.assertEqual(location["citations"], [{
+            "sourceId": source.source_id,
+            "excerpt": "western market may close",
+        }])
+        self.assertEqual(detail["status"], "pending_validation")
+
+    def test_top_level_truncated_citation_blocks_complete_field_hypothesis(self):
+        # Break caught: only field citations are checked for truncation/session origin.
+        engine = DecisionEngine()
+        first = payload(team_id="intelligence-treasure-top-citation")
+        first["worldNews"] = {
+            "officialNews": "TOP EVIDENCE " + "x" * 2_000,
+            "folkLegends": "FIELD EVIDENCE",
+        }
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        top_source = next(source for source in pending.sources if source.truncated)
+        field_source = next(source for source in pending.sources if not source.truncated)
+
+        def field(value):
+            return {
+                "value": value,
+                "citations": [{
+                    "sourceId": field_source.source_id,
+                    "excerpt": "FIELD EVIDENCE",
+                }],
+            }
+
+        returned = copy.deepcopy(first)
+        returned["roundNo"] = 2
+        returned["llmResp"] = valid_response(pending, candidates=[{
+            "type": "treasure",
+            "interpretation": "Top-level evidence is truncated.",
+            "citations": [{
+                "sourceId": top_source.source_id,
+                "excerpt": "TOP EVIDENCE",
+            }],
+            "missingConditions": [],
+            "conflicts": [],
+            "treasureConditions": {
+                "location": field({"x": 4, "y": 4}),
+                "window": field({"startRound": 2, "endRound": 20}),
+                "items": field([]),
+            },
+        }])
+        traces = []
+
+        engine.decide(returned, trace_sink=traces.append)
+
+        stored = engine.state.state.news_candidates[0]
+        diagnostic = traces[-1]["treasureConditions"]["candidates"][0]
+        self.assertTrue(stored.citation_source_truncated)
+        self.assertEqual(stored.citation_source_sessions, (1,))
+        self.assertIn("source_truncated", diagnostic["reasons"])
+        self.assertFalse(diagnostic["localChecksPassed"])
+
     def test_news_result_is_consumed_before_a_new_task_starts(self):
         # Break caught: a news reply becomes a task answer when phaseTask appears.
         engine = DecisionEngine()

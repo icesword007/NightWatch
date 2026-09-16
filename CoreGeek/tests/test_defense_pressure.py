@@ -58,6 +58,15 @@ def decide(engine, value):
     return traces[0]["defensePressure"]
 
 
+def observe_full_night(engine, day, robots):
+    start = 71 + (day - 1) * 130
+    for round_no in range(start, start + 60):
+        value = payload(round_no=round_no)
+        value["robot"]["roles"] = robots
+        decide(engine, value)
+    return decide(engine, payload(round_no=day * 130 + 1))
+
+
 class DefensePressureTests(unittest.TestCase):
     def test_first_night_snapshot_filters_target_and_deduplicates_robot_ids(self):
         # Break caught: enemy-targeted robots or duplicate IDs inflate our wave.
@@ -75,9 +84,127 @@ class DefensePressureTests(unittest.TestCase):
         self.assertEqual(diagnostic["currentNight"]["counts"], {
             "smallRobot": 1, "middleRobot": 1,
         })
-        self.assertEqual(diagnostic["currentNight"]["completeness"], "complete")
+        self.assertEqual(
+            diagnostic["currentNight"]["completeness"], "lower_bound",
+        )
         self.assertEqual(diagnostic["historyCount"], 1)
         self.assertIn("unknown", diagnostic["assessment"]["reasons"])
+
+    def test_current_night_accumulates_new_ids_and_refreshes_next_forecast(self):
+        # Real-engine regression: R71 small1, then R72 first observes large1.
+        engine = DecisionEngine()
+        first = payload(round_no=71)
+        first["robot"]["roles"] = [robot(30001, "smallRobot")]
+        first_diagnostic = decide(engine, first)
+        second = payload(round_no=72)
+        second["robot"]["roles"] = [
+            robot(30001, "smallRobot"), robot(30002, "largeRobot"),
+        ]
+
+        second_diagnostic = decide(engine, second)
+
+        self.assertEqual(
+            first_diagnostic["forecast"]["counts"], {"smallRobot": 1},
+        )
+        self.assertEqual(second_diagnostic["currentNight"]["counts"], {
+            "smallRobot": 1, "largeRobot": 1,
+        })
+        self.assertEqual(second_diagnostic["forecast"]["counts"], {
+            "smallRobot": 1, "largeRobot": 1,
+        })
+        self.assertFalse(second_diagnostic["forecast"]["finalized"])
+        self.assertEqual(
+            second_diagnostic["forecast"]["basisCompleteness"], "lower_bound",
+        )
+        self.assertEqual(len(engine.state.state.wave_forecasts), 1)
+
+    def test_actual_score_updates_without_rewriting_original_prediction(self):
+        engine = DecisionEngine()
+        for round_no in range(71, 131):
+            first = payload(round_no=round_no)
+            first["robot"]["roles"] = [robot(30001, "smallRobot")]
+            decide(engine, first)
+        dawn = decide(engine, payload(round_no=131))
+        original = dawn["forecast"]
+        self.assertEqual(original["counts"], {"smallRobot": 1})
+        self.assertTrue(original["finalized"])
+
+        second = payload(round_no=201)
+        second["robot"]["roles"] = [robot(40001, "smallRobot")]
+        decide(engine, second)
+        later = payload(round_no=202)
+        later["robot"]["roles"] = [
+            robot(40001, "smallRobot"), robot(40002, "largeRobot"),
+        ]
+
+        diagnostic = decide(engine, later)
+        scored = diagnostic["forecastHistory"][-1]
+
+        self.assertEqual(scored["counts"], original["counts"])
+        self.assertEqual(scored["actualCounts"], {
+            "smallRobot": 1, "largeRobot": 1,
+        })
+        self.assertEqual(scored["actualCompleteness"], "lower_bound")
+        self.assertEqual(scored["absoluteError"], {
+            "largeRobot": 1, "smallRobot": 0,
+        })
+
+    def test_lower_bound_actual_does_not_score_an_unseen_type_as_zero(self):
+        engine = DecisionEngine()
+        observe_full_night(engine, 1, [robot(30001, "smallRobot")])
+        second = payload(round_no=201)
+        second["robot"]["roles"] = [robot(40001, "largeRobot")]
+
+        diagnostic = decide(engine, second)
+        scored = diagnostic["forecastHistory"][-1]
+
+        self.assertEqual(scored["actualCounts"], {"largeRobot": 1})
+        self.assertEqual(scored["actualCompleteness"], "lower_bound")
+        self.assertEqual(scored["absoluteError"], {"largeRobot": 1})
+
+    def test_dawn_finalizes_only_continuously_observed_untruncated_night(self):
+        complete_engine = DecisionEngine()
+        for round_no in range(71, 131):
+            value = payload(round_no=round_no)
+            value["robot"]["roles"] = [robot(30001, "smallRobot")]
+            decide(complete_engine, value)
+        complete = decide(complete_engine, payload(round_no=131))
+        self.assertEqual(
+            complete["previousNightLoss"]["completeness"], "complete",
+        )
+        self.assertTrue(complete["forecast"]["finalized"])
+        self.assertEqual(complete["forecast"]["basisCompleteness"], "complete")
+
+        skipped_engine = DecisionEngine()
+        for round_no in (71, 72, 74, 130):
+            value = payload(round_no=round_no)
+            value["robot"]["roles"] = [robot(30001, "smallRobot")]
+            decide(skipped_engine, value)
+        partial = decide(skipped_engine, payload(round_no=131))
+        self.assertEqual(
+            partial["previousNightLoss"]["completeness"], "lower_bound",
+        )
+        self.assertTrue(partial["forecast"]["finalized"])
+        self.assertEqual(
+            partial["forecast"]["basisCompleteness"], "lower_bound",
+        )
+
+    def test_next_night_callback_finalizes_a_missed_dawn_as_lower_bound(self):
+        engine = DecisionEngine()
+        first = payload(round_no=71)
+        first["robot"]["roles"] = [robot(30001, "smallRobot")]
+        decide(engine, first)
+        second = payload(round_no=201)
+        second["robot"]["roles"] = [robot(40001, "smallRobot")]
+
+        decide(engine, second)
+        prior = engine.state.state.wave_history[0]
+        prior_forecast = engine.state.state.wave_forecasts[0]
+
+        self.assertTrue(prior.finalized)
+        self.assertFalse(prior.complete)
+        self.assertTrue(prior_forecast.finalized)
+        self.assertEqual(prior_forecast.basis_completeness, "lower_bound")
 
     def test_late_observation_is_lower_bound_and_keeps_seen_ids_after_kills(self):
         # Break caught: a later smaller live set is mistaken for a smaller spawn.
@@ -105,14 +232,12 @@ class DefensePressureTests(unittest.TestCase):
     def test_adjacent_complete_nights_predict_latest_nonnegative_type_growth(self):
         # Break caught: forecast invents a multiplier or drops newly seen types.
         engine = DecisionEngine()
-        first = payload(round_no=71)
-        first["robot"]["roles"] = [
+        first_robots = [
             robot(30001, "smallRobot"), robot(30002, "smallRobot"),
             robot(30003, "middleRobot"),
         ]
-        decide(engine, first)
-        second = payload(round_no=201)
-        second["robot"]["roles"] = [
+        observe_full_night(engine, 1, first_robots)
+        second_robots = [
             robot(30001, "smallRobot"),
             robot(30002, "smallRobot"),
             robot(30003, "smallRobot"),
@@ -120,7 +245,7 @@ class DefensePressureTests(unittest.TestCase):
             robot(30005, "largeRobot"),
         ]
 
-        diagnostic = decide(engine, second)
+        diagnostic = observe_full_night(engine, 2, second_robots)
 
         self.assertEqual(diagnostic["forecast"], {
             "targetDay": 3,
@@ -138,23 +263,26 @@ class DefensePressureTests(unittest.TestCase):
                 "largeRobot": 1,
             },
             "uncertainTypes": [],
+            "basisCompleteness": "complete",
+            "finalized": True,
             "actualCounts": None,
             "absoluteError": None,
+            "actualCompleteness": None,
+            "actualFinalized": False,
         })
         self.assertIn("rising_pressure", diagnostic["assessment"]["reasons"])
 
     def test_negative_growth_does_not_predict_a_safer_next_night(self):
         # Break caught: a smaller second wave is extrapolated downward.
         engine = DecisionEngine()
-        first = payload(round_no=71)
-        first["robot"]["roles"] = [
+        first_robots = [
             robot(30001, "smallRobot"), robot(30002, "smallRobot"),
         ]
-        decide(engine, first)
-        second = payload(round_no=201)
-        second["robot"]["roles"] = [robot(30001, "smallRobot")]
+        observe_full_night(engine, 1, first_robots)
 
-        diagnostic = decide(engine, second)
+        diagnostic = observe_full_night(
+            engine, 2, [robot(30001, "smallRobot")],
+        )
 
         self.assertEqual(diagnostic["forecast"]["counts"], {"smallRobot": 2})
         self.assertEqual(diagnostic["forecast"]["growth"], {"smallRobot": 0})
@@ -171,15 +299,12 @@ class DefensePressureTests(unittest.TestCase):
     def test_missing_night_does_not_create_per_day_growth(self):
         # Break caught: non-adjacent complete samples are treated as consecutive.
         engine = DecisionEngine()
-        first = payload(round_no=71)
-        first["robot"]["roles"] = [robot(30001, "smallRobot")]
-        decide(engine, first)
-        third = payload(round_no=331)
-        third["robot"]["roles"] = [
+        observe_full_night(engine, 1, [robot(30001, "smallRobot")])
+        third_robots = [
             robot(30001, "smallRobot"), robot(30002, "smallRobot"),
         ]
 
-        diagnostic = decide(engine, third)
+        diagnostic = observe_full_night(engine, 3, third_robots)
 
         self.assertEqual(diagnostic["forecast"]["targetDay"], 4)
         self.assertEqual(diagnostic["forecast"]["basisDays"], [3])
@@ -189,14 +314,11 @@ class DefensePressureTests(unittest.TestCase):
     def test_forecast_is_preserved_and_scored_when_target_night_arrives(self):
         # Break caught: actual night data overwrites the old prediction.
         engine = DecisionEngine()
-        first = payload(round_no=71)
-        first["robot"]["roles"] = [robot(30001, "smallRobot")]
-        decide(engine, first)
-        second = payload(round_no=201)
-        second["robot"]["roles"] = [
+        observe_full_night(engine, 1, [robot(30001, "smallRobot")])
+        second_robots = [
             robot(30001, "smallRobot"), robot(30002, "smallRobot"),
         ]
-        predicted = decide(engine, second)["forecast"]
+        predicted = observe_full_night(engine, 2, second_robots)["forecast"]
         third = payload(round_no=331)
         third["robot"]["roles"] = [
             robot(30001, "smallRobot"),
@@ -234,14 +356,15 @@ class DefensePressureTests(unittest.TestCase):
     def test_dawn_records_previous_night_defense_losses(self):
         # Break caught: pressure history counts enemies but cannot explain our losses.
         engine = DecisionEngine()
-        night = payload(round_no=71)
-        night["teamOur"]["roles"].extend([
-            unit(10010, "worker", 7, 8, health=220),
-            unit(10020, "gatling", 8, 8, health=1000, level=2),
-            unit(10050, "wall", 12, 8, health=1000),
-        ])
-        night["robot"]["roles"] = [robot(30001, "smallRobot")]
-        decide(engine, night)
+        for round_no in range(71, 131):
+            night = payload(round_no=round_no)
+            night["teamOur"]["roles"].extend([
+                unit(10010, "worker", 7, 8, health=220),
+                unit(10020, "gatling", 8, 8, health=1000, level=2),
+                unit(10050, "wall", 12, 8, health=1000),
+            ])
+            night["robot"]["roles"] = [robot(30001, "smallRobot")]
+            decide(engine, night)
         dawn = payload(round_no=131)
         dawn["teamOur"]["roles"].extend([
             unit(10010, "worker", 7, 8, health=100),
@@ -275,11 +398,9 @@ class DefensePressureTests(unittest.TestCase):
     def test_daytime_uses_the_stored_forecast_for_the_coming_night(self):
         # Break caught: day 2 drops the target-day-2 forecast until night begins.
         engine = DecisionEngine()
-        night = payload(round_no=71)
-        night["robot"]["roles"] = [robot(30001, "smallRobot")]
-        decide(engine, night)
-
-        diagnostic = decide(engine, payload(round_no=131))
+        diagnostic = observe_full_night(
+            engine, 1, [robot(30001, "smallRobot")],
+        )
 
         self.assertEqual(diagnostic["forecast"]["targetDay"], 2)
         self.assertEqual(diagnostic["forecast"]["basisDays"], [1])
@@ -307,7 +428,7 @@ class DefensePressureTests(unittest.TestCase):
 
         self.assertEqual(diagnostic["forecast"]["targetDay"], 5)
         self.assertEqual(diagnostic["forecast"]["method"], "growth_unknown")
-        self.assertEqual(diagnostic["forecast"]["basisDays"], [2])
+        self.assertEqual(diagnostic["forecast"]["basisDays"], [4])
         self.assertIn("unknown", diagnostic["assessment"]["reasons"])
 
     def test_three_towers_with_one_controller_is_a_known_deficit(self):
@@ -327,18 +448,19 @@ class DefensePressureTests(unittest.TestCase):
     def test_previous_night_damage_remains_a_deficit_after_positions_recover(self):
         # Break caught: current counts erase a real base loss from the assessment.
         engine = DecisionEngine()
-        night = payload(round_no=71)
-        night["teamOur"]["roles"] = [
-            unit(10010, "worker", 7, 8),
-            unit(10011, "worker", 7, 9),
-            unit(10012, "pioneer", 7, 10),
-            unit(10013, "station", 9, 9, health=1500),
-            unit(10020, "gatling", 8, 8, health=1000),
-            unit(10030, "railgun", 9, 7, health=1000),
-            unit(10040, "rocket", 10, 7, health=1000),
-        ]
-        night["robot"]["roles"] = [robot(30001, "smallRobot")]
-        decide(engine, night)
+        for round_no in range(71, 131):
+            night = payload(round_no=round_no)
+            night["teamOur"]["roles"] = [
+                unit(10010, "worker", 7, 8),
+                unit(10011, "worker", 7, 9),
+                unit(10012, "pioneer", 7, 10),
+                unit(10013, "station", 9, 9, health=1500),
+                unit(10020, "gatling", 8, 8, health=1000),
+                unit(10030, "railgun", 9, 7, health=1000),
+                unit(10040, "rocket", 10, 7, health=1000),
+            ]
+            night["robot"]["roles"] = [robot(30001, "smallRobot")]
+            decide(engine, night)
         engine.state.state.fortification_targets = ()
         dawn = json.loads(json.dumps(night))
         dawn["roundNo"] = 131
@@ -407,18 +529,26 @@ class DefensePressureTests(unittest.TestCase):
 
     def test_robot_id_storage_cap_marks_wave_as_lower_bound(self):
         # Break caught: visible robot IDs create unbounded per-night state.
+        engine = DecisionEngine()
         value = payload(round_no=71)
         value["robot"]["roles"] = [
             robot(40000 + index, "smallRobot") for index in range(520)
         ]
 
-        diagnostic = decide(DecisionEngine(), value)
+        diagnostic = decide(engine, value)
 
         self.assertEqual(diagnostic["currentNight"]["robotIdsRetained"], 512)
         self.assertTrue(diagnostic["currentNight"]["truncated"])
         self.assertEqual(
             diagnostic["currentNight"]["completeness"], "lower_bound",
         )
+
+        for round_no in range(72, 131):
+            later = payload(round_no=round_no)
+            later["robot"]["roles"] = value["robot"]["roles"]
+            decide(engine, later)
+        dawn = decide(engine, payload(round_no=131))
+        self.assertEqual(dawn["forecast"]["basisCompleteness"], "lower_bound")
 
 
 if __name__ == "__main__":

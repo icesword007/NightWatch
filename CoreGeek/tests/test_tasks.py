@@ -116,6 +116,31 @@ class TaskTests(unittest.TestCase):
         self.assertIn("verified instructions", followup["prompt"])
         self.assertIn("untrusted task material", followup["prompt"])
 
+    def test_real_single_file_suffix_starts_bounded_read_and_injects_content(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1,
+            pioneer_pos=(3, 3),
+            phase_task="\n请阅读task_1_alpha.md，获取任务信息\n",
+        )
+
+        first = engine.decide(active)
+
+        self.assertEqual(first["prompt"], "")
+        self.assertIn("task_1_alpha.md", first["executeCmd"])
+        result = copy.deepcopy(active)
+        result["roundNo"] = 2
+        result["lastCmdResult"] = (
+            "[exitCode:0]\n[TASK_INPUT_PATH]\n"
+            "/tmp/selfEvolutionTask/example/task_1_alpha.md\n"
+            "[TASK_INPUT_CONTENT]\nverified real-format instructions"
+        )
+
+        followup = engine.decide(result)
+
+        self.assertEqual(followup["executeCmd"], "")
+        self.assertIn("verified real-format instructions", followup["prompt"])
+
     def test_entry_read_falls_back_when_unsafe_or_deadline_is_short(self):
         for text in (
             "比较a.md和b.md",

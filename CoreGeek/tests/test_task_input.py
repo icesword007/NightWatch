@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from agent import task_input as task_input_module
 from agent.task_input import _READER, build_task_input_command, extract_task_input
 
 
@@ -44,6 +45,10 @@ class TaskInputTests(unittest.TestCase):
             extract_task_input("请阅读文件说明.md"),
             ("filename", "文件说明.md"),
         )
+        self.assertEqual(
+            extract_task_input("\n  请阅读task_1_alpha.md，获取任务信息  \r\n"),
+            ("filename", "task_1_alpha.md"),
+        )
         for text in (
             "比较a.md和b.md",
             "分析这个工程任务，其中可能涉及task.md",
@@ -57,6 +62,57 @@ class TaskInputTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(extract_task_input(text))
+
+    def test_filename_search_uses_only_cwd_and_the_evidenced_task_root(self):
+        with (
+            tempfile.TemporaryDirectory() as cwd_directory,
+            tempfile.TemporaryDirectory() as task_directory,
+        ):
+            cwd = Path(cwd_directory)
+            task_root = Path(task_directory)
+            nested = task_root / "1-fixed-step" / "1-unknown-api"
+            nested.mkdir(parents=True)
+            target = nested / "task_1_beijing.md"
+            target.write_text("bounded external task", encoding="utf-8")
+
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+            ):
+                result = self._run(
+                    build_task_input_command("filename", target.name), cwd,
+                )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn(os.path.abspath(target), result.stdout)
+            self.assertIn("bounded external task", result.stdout)
+
+            local = cwd / target.name
+            local.write_text("local duplicate", encoding="utf-8")
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+            ):
+                ambiguous = self._run(
+                    build_task_input_command("filename", target.name), cwd,
+                )
+            self.assertNotEqual(ambiguous.returncode, 0)
+            self.assertIn("ambiguous", ambiguous.stdout)
+
+    def test_missing_evidenced_task_root_does_not_break_cwd_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "task.md"
+            target.write_text("cwd task", encoding="utf-8")
+            missing = root / "does-not-exist"
+
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(missing),),
+            ):
+                result = self._run(
+                    build_task_input_command("filename", target.name), root,
+                )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("cwd task", result.stdout)
 
     def test_filename_search_reads_unique_nested_utf8_file(self):
         with tempfile.TemporaryDirectory() as directory:

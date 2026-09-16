@@ -255,3 +255,17 @@ main f721702、投资分支776e8ac（墙升级）及其他旧树只读；本批�
 ## R162 已有应急道具本地验收
 
 主会话独立406项含16HTTP通过9.929秒；额外缺/空/多/越界目标拒绝、两阵营三火箭use后次轮原炮手恢复攻击、完整列表乱序稳定通过。允许主会话在本隔离分支本地提交；main和origin/main保持e7ff4c5送测，不合并/推送，不清理旧树/缓存。没有采购、主动任务抢占或正常炮火替换，实际库存来源与生存收益未验证。
+
+## R165 S2宝藏结构化条件与只读评估（用户授权继续开发）
+
+新增code/NightWatch-s2-treasure/为同仓库linked worktree，仅源码/测试/手册，沿命名约定、不放临时材料，清理须授权。分支codex/s2-treasure-conditions，基准e7ff4c563b51a44e047721eda6ae30700477dd77；main送测和应急db579b2保持只读，互不混入。新Sol+medium（01a0ab24-5617-70f1-9d03-2899e3ea7a95）唯一开发，按design/【codex】s2-treasure-conditions-plan.md实施。覆盖R113禁止候选内地点/配方/时间字段，仅允许带引用的结构化假设与本地约束检查；模型结论仍pending_validation，不自动买物品、移动、献祭、囤矿，不增新闻调用额度，不改任务/经济/战斗策略。允许现有agent/tests新增treasure.py/test_treasure.py与必要intelligence/state/brain/server修改。开发不commit/merge/push/reset/切分支/删除/派生任务；交付R166、主会话R167验收后可隔离提交，不自动合main或推送。
+
+
+## R170 本次统一送测扩展修复授权
+
+用户明确补充：刚发现的问题修复后一并送测。新Sol+medium切至code/NightWatch/main，在db579b2与4f6eb55待提交合并结果上，按design/【codex】s2-integrated-r2-repair-plan.md修任务入口文法/有界任务根、逐夜累计与预测冻结。主会话暂停源码编辑，唯一开发者为新Sol；旧树只读。开发不commit/merge/push/reset/删除；主会话验收后一并提交推送。此条覆盖R169“本次不修”限制，不扩经济优先级或攻击策略。
+
+
+## R172 统一r2本地验收与当前内网入口
+
+新Sol已完成R171并idle。主会话独立430/430含16HTTP通过10.412秒，原实际题面两变体、后续新ID累计/实际评分、黎明完整定稿反例通过，diff/cached diff/bash-n通过。构建nightwatch-s2-integrated-r2包含任务入口/有界任务根、波次累计修复、已有应急使用与宝藏条件只读评估。用户已授权提交推送，当前内网唯一入口【codex】s2-integrated-r2-intranet-prompt.md，旧条目中的暂停送测限制由本条覆盖；实战未验收，不关闭issue。

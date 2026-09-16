@@ -15,6 +15,8 @@ MAX_LIST_ITEMS = 8
 MAX_INTERPRETATION_CHARS = 1_024
 MAX_CONDITION_CHARS = 512
 MAX_CITATION_CHARS = 512
+MAX_TREASURE_ITEM_CHARS = 128
+MAX_TREASURE_ITEMS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,21 @@ class NewsCitation:
 
 
 @dataclass(frozen=True, slots=True)
+class CitedTreasureValue:
+    value: Any
+    citations: tuple[NewsCitation, ...]
+    source_sessions: tuple[int, ...]
+    source_truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TreasureConditions:
+    location: CitedTreasureValue | None
+    window: CitedTreasureValue | None
+    items: CitedTreasureValue | None
+
+
+@dataclass(frozen=True, slots=True)
 class NewsCandidate:
     request_id: str
     kind: str
@@ -57,6 +74,9 @@ class NewsCandidate:
     source_session: int
     issued_round: int
     status: str = "pending_validation"
+    citation_source_sessions: tuple[int, ...] = ()
+    citation_source_truncated: bool = False
+    treasure_conditions: TreasureConditions | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,12 +174,21 @@ def _render_prompt(
         "must remain missing conditions. A truncated source may omit conditions; "
         "do not fill them in. Return exactly one JSON object with "
         f'keys requestId and candidates. requestId must be "{request_id}". '
-        "candidates may be empty and each item must have exactly: type "
-        "(news or treasure), interpretation, citations, missingConditions, "
-        "conflicts. Each citation must have exactly sourceId and a non-empty "
-        "excerpt copied from that source. Do not return commands, actions, "
-        "coordinates, recipes, schedules, confidence scores, or prose outside "
-        "JSON. Limits: at most 8 sources, each source text at most 1024 characters; "
+        "candidates may be empty. A news candidate must have exactly: type, "
+        "interpretation, citations, missingConditions, conflicts. A treasure "
+        "candidate has those same keys and may additionally have "
+        "treasureConditions. treasureConditions, when present, must have exactly "
+        "location, window, items. Each is null when unknown, or an object with "
+        "exactly value and citations. location.value is exactly integer x/y; "
+        "window.value is exactly integer startRound/endRound in the absolute "
+        "current-session range 1..1300; items.value is an array of at most 8 "
+        "non-empty item names, preserving duplicates. Every top-level and field "
+        "citation must have exactly sourceId and a non-empty excerpt copied from "
+        "that sent source. Use only the supplied evidence: no inferred coordinates, "
+        "default recipes, or relative-date windows when publication time is "
+        "unknown. Do not return commands, actions, routes, purchases, sacrifices, "
+        "confidence scores, or prose outside JSON. Limits: at most 8 sources, "
+        "each source text at most 1024 characters; "
         "at most 8 candidates; per candidate at most 8 citations, 8 missing "
         "conditions, and 8 conflicts; interpretation at most 1024 characters; "
         "citation excerpts at most 512 characters; each condition or conflict "
@@ -205,25 +234,124 @@ def _parse_candidate(
     sources: dict[str, NewsSource],
     raw: Any,
 ) -> NewsCandidate | None:
-    if not isinstance(raw, dict) or set(raw) != {
+    base_keys = {
         "type", "interpretation", "citations", "missingConditions", "conflicts",
-    }:
+    }
+    if not isinstance(raw, dict):
         return None
     kind = raw.get("type")
+    allowed_keys = base_keys | ({"treasureConditions"} if kind == "treasure" else set())
+    if set(raw) not in (base_keys, allowed_keys):
+        return None
     interpretation = raw.get("interpretation")
     if kind not in ("news", "treasure") or not _bounded_text(
         interpretation, MAX_INTERPRETATION_CHARS,
     ):
         return None
-    raw_citations = raw.get("citations")
-    if (
-        not isinstance(raw_citations, list)
-        or not raw_citations
-        or len(raw_citations) > MAX_CITATIONS
+    citations = _parse_citations(raw.get("citations"), sources)
+    if citations is None:
+        return None
+    missing = _bounded_text_list(raw.get("missingConditions"))
+    conflicts = _bounded_text_list(raw.get("conflicts"))
+    if missing is None or conflicts is None:
+        return None
+    treasure_conditions = None
+    if "treasureConditions" in raw:
+        treasure_conditions = _parse_treasure_conditions(
+            raw.get("treasureConditions"), sources,
+        )
+        if treasure_conditions is None:
+            return None
+    cited_sources = [sources[citation.source_id] for citation in citations]
+    return NewsCandidate(
+        request_id=request.request_id,
+        kind=kind,
+        interpretation=interpretation,
+        citations=citations,
+        missing_conditions=missing,
+        conflicts=conflicts,
+        source_session=request.source_session,
+        issued_round=request.issued_round,
+        citation_source_sessions=tuple(sorted({
+            source.first_session for source in cited_sources
+        })),
+        citation_source_truncated=any(
+            source.truncated for source in cited_sources
+        ),
+        treasure_conditions=treasure_conditions,
+    )
+
+
+def _parse_treasure_conditions(
+    raw: Any,
+    sources: dict[str, NewsSource],
+) -> TreasureConditions | None:
+    if not isinstance(raw, dict) or set(raw) != {"location", "window", "items"}:
+        return None
+    location = _parse_treasure_field(raw.get("location"), sources, "location")
+    window = _parse_treasure_field(raw.get("window"), sources, "window")
+    items = _parse_treasure_field(raw.get("items"), sources, "items")
+    if any(
+        raw.get(name) is not None and parsed is None
+        for name, parsed in (
+            ("location", location), ("window", window), ("items", items),
+        )
     ):
         return None
+    return TreasureConditions(location=location, window=window, items=items)
+
+
+def _parse_treasure_field(
+    raw: Any,
+    sources: dict[str, NewsSource],
+    kind: str,
+) -> CitedTreasureValue | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"value", "citations"}:
+        return None
+    citations = _parse_citations(raw.get("citations"), sources)
+    if citations is None:
+        return None
+    value = raw.get("value")
+    if kind == "location":
+        if not _strict_int_object(value, ("x", "y")):
+            return None
+        parsed_value: Any = {"x": value["x"], "y": value["y"]}
+    elif kind == "window":
+        if not _strict_int_object(value, ("startRound", "endRound")):
+            return None
+        if not 1 <= value["startRound"] <= value["endRound"] <= 1300:
+            return None
+        parsed_value = {
+            "startRound": value["startRound"],
+            "endRound": value["endRound"],
+        }
+    else:
+        if (
+            not isinstance(value, list)
+            or len(value) > MAX_TREASURE_ITEMS
+            or not all(_bounded_text(item, MAX_TREASURE_ITEM_CHARS) for item in value)
+        ):
+            return None
+        parsed_value = tuple(value)
+    cited_sources = [sources[citation.source_id] for citation in citations]
+    return CitedTreasureValue(
+        value=parsed_value,
+        citations=citations,
+        source_sessions=tuple(sorted({source.first_session for source in cited_sources})),
+        source_truncated=any(source.truncated for source in cited_sources),
+    )
+
+
+def _parse_citations(
+    raw: Any,
+    sources: dict[str, NewsSource],
+) -> tuple[NewsCitation, ...] | None:
+    if not isinstance(raw, list) or not raw or len(raw) > MAX_CITATIONS:
+        return None
     citations = []
-    for raw_citation in raw_citations:
+    for raw_citation in raw:
         if not isinstance(raw_citation, dict) or set(raw_citation) != {
             "sourceId", "excerpt",
         }:
@@ -240,19 +368,14 @@ def _parse_candidate(
         ):
             return None
         citations.append(NewsCitation(cited.source_id, excerpt))
-    missing = _bounded_text_list(raw.get("missingConditions"))
-    conflicts = _bounded_text_list(raw.get("conflicts"))
-    if missing is None or conflicts is None:
-        return None
-    return NewsCandidate(
-        request_id=request.request_id,
-        kind=kind,
-        interpretation=interpretation,
-        citations=tuple(citations),
-        missing_conditions=missing,
-        conflicts=conflicts,
-        source_session=request.source_session,
-        issued_round=request.issued_round,
+    return tuple(citations)
+
+
+def _strict_int_object(value: Any, keys: tuple[str, str]) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == set(keys)
+        and all(type(value.get(key)) is int for key in keys)
     )
 
 

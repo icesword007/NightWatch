@@ -8,6 +8,7 @@ DEFAULT_MAX_DEPTH = 6
 DEFAULT_MAX_ENTRIES = 4_096
 DEFAULT_SCAN_SECONDS = 1.0
 DEFAULT_MAX_CONTENT_CHARS = 32_768
+DEFAULT_TASK_ROOTS = ("/tmp/selfEvolutionTask",)
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _TARGET_PATTERN = (
@@ -19,7 +20,8 @@ _CHINESE_ENTRY = re.compile(
     r"^\s*(?:请\s*)?(?:阅读|读取|打开)\s*"
     r"(?:文件(?:\s+|[：:]\s*))?" + _TARGET_PATTERN
     + r"\s*(?:(?:并|然后|后)\s*(?:回答(?:问题)?|解答(?:问题)?|"
-    r"完成(?:任务)?|处理(?:任务)?))?\s*[。！!]?\s*$"
+    r"完成(?:任务)?|处理(?:任务)?)|[，,]\s*获取(?:该)?任务信息)?"
+    r"\s*[。！!]?\s*$"
 )
 _ENGLISH_ENTRY = re.compile(
     r"(?i)^\s*(?:read|open)(?:\s+|[：:]\s*)"
@@ -36,6 +38,7 @@ _READER = r'''import os,stat,sys,time
 mode,target=sys.argv[1],sys.argv[2]
 max_depth,max_entries=int(sys.argv[3]),int(sys.argv[4])
 scan_seconds,max_chars=float(sys.argv[5]),int(sys.argv[6])
+task_roots=sys.argv[7:]
 def fail(reason,detail=""):
  print("[TASK_INPUT_STATUS:error] "+reason+(": "+detail if detail else ""))
  raise SystemExit(2)
@@ -48,7 +51,20 @@ def safe_regular(path):
 if mode=="path":
  path=safe_regular(target)
 else:
- start=time.monotonic(); stack=[(os.getcwd(),0)]; matches=[]; rejected=0; seen=0
+ roots=[os.path.abspath(os.getcwd())]
+ def contains(parent,child):
+  try: return os.path.commonpath((parent,child))==parent
+  except ValueError: return False
+ for candidate in task_roots:
+  try: info=os.stat(candidate,follow_symlinks=False)
+  except FileNotFoundError: continue
+  except OSError as exc: fail("scan_incomplete",type(exc).__name__)
+  if not stat.S_ISDIR(info.st_mode): continue
+  candidate=os.path.abspath(candidate)
+  if any(contains(root,candidate) for root in roots): continue
+  roots=[root for root in roots if not contains(candidate,root)]
+  roots.append(candidate)
+ start=time.monotonic(); stack=[(root,0) for root in reversed(roots)]; matches=[]; rejected=0; seen=0
  def expired(): return time.monotonic()-start>scan_seconds
  while stack:
   if expired(): fail("scan_incomplete","time_limit")
@@ -101,13 +117,15 @@ def extract_task_input(task_text: str) -> tuple[str, str] | None:
         not isinstance(task_text, str)
         or not task_text
         or len(task_text) > 32_768
-        or _CONTROL.search(task_text)
     ):
         return None
-    match = _CHINESE_ENTRY.fullmatch(task_text)
+    normalized = task_text.strip()
+    if not normalized or _CONTROL.search(normalized):
+        return None
+    match = _CHINESE_ENTRY.fullmatch(normalized)
     if match is None:
-        match = _ENGLISH_ENTRY.fullmatch(task_text)
-    references = list(_FILE_REFERENCE.finditer(task_text))
+        match = _ENGLISH_ENTRY.fullmatch(normalized)
+    references = list(_FILE_REFERENCE.finditer(normalized))
     if match is None or len(references) != 1:
         return None
     target = (match.group(1) or match.group(2)).strip()
@@ -148,6 +166,7 @@ def build_task_input_command(
         str(max_entries),
         str(scan_seconds),
         str(max_content_chars),
+        *DEFAULT_TASK_ROOTS,
     )
     command = "python3 -c " + shlex.quote(_READER) + " " + " ".join(
         shlex.quote(argument) for argument in arguments
