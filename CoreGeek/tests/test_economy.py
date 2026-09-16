@@ -8,6 +8,7 @@ from unittest.mock import patch
 import agent.economy as economy
 from agent.actions import ActionAllocator, ActionProposal
 from agent.brain import DecisionEngine
+from agent.grid import PathResult
 from agent.protocol import Pos, Turn
 from agent.state import (
     CompletedAction,
@@ -95,6 +96,398 @@ def with_completed_wall_line(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    @staticmethod
+    def _block_weapon(payload, weapon_id):
+        weapon = next(
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["id"] == weapon_id
+        )
+        x, y = weapon["pos"]["x"], weapon["pos"]["y"]
+        next_id = 49000
+        occupied = {
+            (entry["pos"]["x"], entry["pos"]["y"])
+            for entry in payload["teamOur"]["roles"]
+        }
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                pos = (x + dx, y + dy)
+                if (dx or dy) and pos not in occupied:
+                    payload["teamOur"]["roles"].append(
+                        role(next_id, "wall", *pos, health=1000)
+                    )
+                    next_id += 1
+
+    def test_held_voucher_skips_blocked_first_matching_weapon(self):
+        payload = economy_payload(
+            worker_pos=(7, 8), items=("WeaponUpgradeVoucher1",),
+        )
+        payload["teamOur"]["teamId"] = "investment-held-second-target"
+        self._block_weapon(payload, 10020)
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use",
+            "name": "WeaponUpgradeVoucher1",
+            "targetPos": [{"x": 8, "y": 8}],
+        })
+
+    def test_affordable_voucher_skips_blocked_first_matching_weapon(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=100)
+        payload["teamOur"]["teamId"] = "investment-buy-second-target"
+        self._block_weapon(payload, 10020)
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy",
+            "name": "WeaponUpgradeVoucher1",
+            "num": 1,
+        })
+        self.assertIn(":10030", engine.state.state.plans[10010].reason)
+
+    def test_active_voucher_plan_keeps_target_when_unit_order_changes(self):
+        payload = economy_payload(
+            worker_pos=(7, 8), items=("WeaponUpgradeVoucher1",),
+        )
+        payload["teamOur"]["teamId"] = "investment-stable-target"
+        payload["teamOur"]["roles"] = [
+            payload["teamOur"]["roles"][0],
+            payload["teamOur"]["roles"][1],
+            payload["teamOur"]["roles"][3],
+            payload["teamOur"]["roles"][2],
+            payload["teamOur"]["roles"][4],
+        ]
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(8, 8),
+            "fund:WeaponUpgradeVoucher1:10030:10030",
+            70, state.session_index,
+        )
+        payload["teamOur"]["roles"][2:4] = reversed(
+            payload["teamOur"]["roles"][2:4]
+        )
+
+        candidates = economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64,
+        )
+        action = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+
+        self.assertEqual(action.plan_reason, "use:WeaponUpgradeVoucher1:10030")
+        self.assertEqual(action.proposal.command["targetPos"], [{"x": 8, "y": 8}])
+
+    def test_held_voucher_prefers_immediate_complete_second_target(self):
+        payload = economy_payload(
+            worker_pos=(7, 8), items=("WeaponUpgradeVoucher1",),
+        )
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use", "name": "WeaponUpgradeVoucher1",
+            "targetPos": [{"x": 8, "y": 8}],
+        })
+
+    def test_confirmed_blocked_committed_target_reselects(self):
+        payload = economy_payload(
+            worker_pos=(7, 8), items=("WeaponUpgradeVoucher1",),
+        )
+        self._block_weapon(payload, 10020)
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(8, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020",
+            70, state.session_index,
+        )
+
+        candidates = economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64,
+        )
+        action = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+
+        self.assertEqual(action.proposal.command["action"], "use")
+        self.assertEqual(action.proposal.command["targetPos"], [{"x": 8, "y": 8}])
+
+    def test_second_target_purchase_use_and_return_chain(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=100)
+        payload["teamOur"]["teamId"] = "investment-second-target-chain"
+        self._block_weapon(payload, 10020)
+        engine = DecisionEngine()
+        actions = []
+
+        for _ in range(16):
+            response = engine.decide(payload)
+            command = response["roleCommandMap"]["10010"]
+            actions.append(command["action"])
+            worker = payload["teamOur"]["roles"][0]
+            if command["action"] == "move":
+                worker["pos"] = copy.deepcopy(command["targetPos"][0])
+            elif command["action"] == "buy":
+                payload["teamOur"]["goldNum"] = 0
+                worker["backpack"] = ["WeaponUpgradeVoucher1"]
+            elif command["action"] == "use":
+                self.assertEqual(command["targetPos"], [{"x": 8, "y": 8}])
+                worker["backpack"] = []
+                next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == 10030
+                )["level"] = 2
+                break
+            payload["roundNo"] += 1
+            payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        self.assertIn("buy", actions)
+        self.assertEqual(actions[-1], "use")
+        worker = payload["teamOur"]["roles"][0]
+        self.assertLessEqual(max(
+            abs(worker["pos"]["x"] - 8), abs(worker["pos"]["y"] - 8),
+        ), 1)
+
+    def test_destroyed_committed_wall_reselects_remaining_repair(self):
+        payload = economy_payload(worker_pos=(7, 8), items=("WallFixer",))
+        payload["teamOur"]["roles"].extend([
+            role(10050, "wall", 2, 2, health=100),
+            role(10060, "wall", 7, 9, health=100),
+        ])
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(2, 2), "fund:WallFixer:10030:10050",
+            70, state.session_index,
+        )
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["id"] != 10050
+        ]
+
+        candidates = economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64,
+        )
+        action = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+
+        self.assertEqual(action.proposal.command["action"], "use")
+        self.assertEqual(action.proposal.command["targetPos"], [{"x": 7, "y": 9}])
+
+    def test_repaired_committed_wall_reselects_remaining_repair(self):
+        payload = economy_payload(worker_pos=(7, 8), items=("WallFixer",))
+        payload["teamOur"]["roles"].extend([
+            role(10050, "wall", 2, 2, health=1000),
+            role(10060, "wall", 7, 9, health=100),
+        ])
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(2, 2), "use:WallFixer:10050",
+            70, state.session_index,
+        )
+
+        candidates = economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64,
+        )
+        action = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+        self.assertEqual(action.proposal.command["action"], "use")
+        self.assertEqual(action.proposal.command["targetPos"], [{"x": 7, "y": 9}])
+
+    def test_late_committed_target_reselects_timely_second_target(self):
+        payload = economy_payload(
+            round_no=69, worker_pos=(7, 8),
+            items=("WeaponUpgradeVoucher1",),
+        )
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10010, Pos(8, 2), "use:WeaponUpgradeVoucher1:10020", 70,
+        )
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use", "name": "WeaponUpgradeVoucher1",
+            "targetPos": [{"x": 8, "y": 8}],
+        })
+        self.assertEqual(
+            engine.state.state.plans[10010].reason,
+            "use:WeaponUpgradeVoucher1:10030",
+        )
+
+    def test_local_limit_keeps_committed_target_across_engine_rounds(self):
+        payload = economy_payload(
+            worker_pos=(7, 2), items=("WeaponUpgradeVoucher1",),
+        )
+        payload["teamOur"]["teamId"] = "investment-limit-stable-engine"
+        engine = DecisionEngine()
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10010, Pos(8, 8), "use:WeaponUpgradeVoucher1:10030", 70,
+        )
+
+        with patch.object(
+            economy, "next_step",
+            return_value=PathResult("expansion_limit", None, 64, None),
+        ):
+            engine.decide(payload)
+            payload["roundNo"] = 2
+            engine.decide(payload)
+
+        self.assertEqual(
+            engine.state.state.plans[10010].reason,
+            "use:WeaponUpgradeVoucher1:10030",
+        )
+
+    def test_invalid_committed_upgrade_target_safely_reselects(self):
+        payload = economy_payload(
+            worker_pos=(7, 2), items=("WeaponUpgradeVoucher1",),
+        )
+        payload["teamOur"]["teamId"] = "investment-invalid-target"
+        next(
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["id"] == 10030
+        )["level"] = 2
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(8, 8),
+            "fund:WeaponUpgradeVoucher1:10030:10030",
+            70, state.session_index,
+        )
+
+        candidates = economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64,
+        )
+        action = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+
+        self.assertEqual(action.proposal.command["action"], "use")
+        self.assertEqual(action.proposal.command["targetPos"], [{"x": 8, "y": 2}])
+
+    def test_local_search_limit_does_not_switch_committed_target(self):
+        payload = economy_payload(
+            worker_pos=(7, 2), items=("WeaponUpgradeVoucher1",),
+        )
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(8, 8),
+            "fund:WeaponUpgradeVoucher1:10030:10030",
+            70, state.session_index,
+        )
+
+        with patch.object(
+            economy, "next_step",
+            return_value=PathResult("expansion_limit", None, 64, None),
+        ):
+            candidates = economy.propose_economy(
+                Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+                max_expansions=64,
+            )
+
+        self.assertFalse(any(
+            candidate.proposal.command.get("action") == "use"
+            and candidate.proposal.command.get("targetPos")
+            == [{"x": 8, "y": 2}]
+            for candidate in candidates
+        ))
+
+    def test_later_target_truncation_keeps_completed_first_route(self):
+        payload = economy_payload(
+            worker_pos=(0, 0), items=("WeaponUpgradeVoucher1",),
+        )
+        turn = Turn.load(payload)
+        worker = turn.workers()[0]
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+
+        def routes(_turn, moving, target, *_args):
+            if target == Pos(8, 8) and moving.pos == Pos(0, 0):
+                context.truncated_reason = "search_limit"
+                return ()
+            if context.truncated_reason is not None:
+                return ()
+            if target == Pos(8, 2):
+                return ((Pos(7, 2), 7),)
+            return ()
+
+        try:
+            with patch.object(economy, "_routes_to_adjacent", side_effect=routes):
+                route = economy._held_item_route(
+                    turn, worker, "WeaponUpgradeVoucher1",
+                    lambda: 0.0, 1.0, 64,
+                )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertIsNotNone(route)
+        self.assertEqual(route.use_target_id, 10020)
+        self.assertEqual(context.truncated_reason, "search_limit")
+
+    def test_wall_fixer_skips_blocked_first_damaged_wall(self):
+        payload = economy_payload(worker_pos=(7, 8), items=("WallFixer",))
+        payload["teamOur"]["teamId"] = "investment-wall-second-target"
+        payload["teamOur"]["roles"].extend([
+            role(10050, "wall", 2, 2, health=100),
+            role(10060, "wall", 7, 9, health=100),
+        ])
+        occupied = {
+            (entry["pos"]["x"], entry["pos"]["y"])
+            for entry in payload["teamOur"]["roles"]
+        }
+        next_id = 49100
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                pos = (2 + dx, 2 + dy)
+                if (dx or dy) and pos not in occupied:
+                    payload["teamOur"]["roles"].append(
+                        role(next_id, "wall", *pos, health=1000)
+                    )
+                    next_id += 1
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use", "name": "WallFixer",
+            "targetPos": [{"x": 7, "y": 9}],
+        })
+
+    def test_investment_diagnostic_marks_stable_target_continuation(self):
+        payload = economy_payload(
+            worker_pos=(7, 8), items=("WeaponUpgradeVoucher1",),
+        )
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(8, 8),
+            "fund:WeaponUpgradeVoucher1:10030:10030",
+            70, state.session_index,
+        )
+        diagnostics = []
+
+        economy.propose_economy(
+            Turn.load(payload), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=64, diagnostic_sink=diagnostics.append,
+        )
+
+        self.assertEqual(diagnostics[0]["investmentTarget"], {
+            "item": "WeaponUpgradeVoucher1",
+            "targetId": "10030",
+            "selection": "continued",
+        })
+
     def test_existing_mine_plan_yields_to_current_single_funding_route(self):
         # Break caught: a valid old mine plan bypasses a newly executable sale chain.
         payload = economy_payload(
@@ -223,7 +616,7 @@ class EconomyTests(unittest.TestCase):
         funding = [
             candidate for candidate in candidates
             if candidate.plan_reason
-            == "fund:WeaponUpgradeVoucher1:10020:10020"
+            == "fund:WeaponUpgradeVoucher1:10030:10030"
         ]
         self.assertEqual(len(funding), 1)
         self.assertEqual(funding[0].proposal.command_owner_id, 10010)
@@ -317,7 +710,8 @@ class EconomyTests(unittest.TestCase):
 
         shop_moves = [
             candidate for candidate in candidates
-            if candidate.plan_reason == "shop:WeaponUpgradeVoucher1"
+            if candidate.plan_reason
+            == "fund:WeaponUpgradeVoucher1:10030:10030"
         ]
         self.assertEqual(len(shop_moves), 1)
         self.assertEqual(shop_moves[0].proposal.command, {
@@ -518,6 +912,37 @@ class EconomyTests(unittest.TestCase):
         )
         self.assertEqual(
             traces[0]["economyPlanning"]["jointStatus"], "accepted",
+        )
+
+    def test_three_towers_fourteen_wall_targets_stay_within_search_cap(self):
+        from agent.layout import plan_defense_layout
+
+        payload = economy_payload(round_no=30, worker_pos=(0, 0), gold=10)
+        payload["teamOur"]["teamId"] = "investment-14-wall-pressure"
+        payload["mapInfo"].update({"width": 41, "height": 32})
+        blueprint = plan_defense_layout(Turn.load(payload))
+        payload["teamOur"]["roles"].extend(
+            role(20000 + index, "wall", target.x, target.y, health=100)
+            for index, target in enumerate(blueprint.wall_targets)
+        )
+        diagnostics = []
+        candidates = economy.propose_economy(
+            Turn.load(payload), state_for(payload), clock=lambda: 0.0,
+            deadline=1.0, max_expansions=64,
+            diagnostic_sink=diagnostics.append,
+        )
+
+        command = next(
+            candidate.proposal.command for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+        self.assertIn(command["action"], {"move", "use"})
+        self.assertLessEqual(
+            diagnostics[0]["pathSearches"], 1600,
+        )
+        self.assertEqual(
+            diagnostics[0]["investmentTarget"]["item"],
+            "WallFixer",
         )
 
     def test_economy_uses_only_its_reserved_share_of_request_budget(self):
@@ -1162,6 +1587,33 @@ class EconomyTests(unittest.TestCase):
             second["roleCommandMap"]["10012"]["action"], "sell",
         )
         self.assertLess(payload["teamOur"]["goldNum"], 100)
+
+    def test_joint_funding_skips_blocked_first_matching_weapon(self):
+        payload = economy_payload(round_no=30, worker_pos=(1, 1))
+        payload["teamOur"]["teamId"] = "investment-joint-second-target"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 1, 3, items=("copper",) * 10),
+        )
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 10
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        self._block_weapon(payload, 10020)
+
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        joint = [
+            plan.reason for role_id, plan in engine.state.state.plans.items()
+            if role_id in (10010, 10012) and ":joint:" in plan.reason
+        ]
+        self.assertEqual(len(joint), 2)
+        self.assertTrue(all(":10030:joint:" in reason for reason in joint))
 
     def test_joint_funding_rejects_insufficient_or_late_combined_value(self):
         # Break caught: an incomplete or untimely pair is protected as critical funding.
@@ -2175,7 +2627,7 @@ class EconomyTests(unittest.TestCase):
         self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
         self.assertEqual(
             engine.state.state.plans[10010].reason,
-            "shop:WeaponUpgradeVoucher1",
+            "fund:WeaponUpgradeVoucher1:10020:10020",
         )
 
         second = copy.deepcopy(first)
@@ -2187,8 +2639,6 @@ class EconomyTests(unittest.TestCase):
 
         command = response["roleCommandMap"].get("10010", {})
         self.assertNotEqual(command.get("action"), "buy")
-        plan = engine.state.state.plans.get(10010)
-        self.assertTrue(plan is None or plan.reason != "shop:WeaponUpgradeVoucher1")
 
     def test_build_plan_stops_when_third_tower_appears(self):
         # Break caught: an en-route worker attempts a fourth tower next round.

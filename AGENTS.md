@@ -198,3 +198,13 @@
 ## R139 当前增量送测授权与入口
 
 用户授权将94ce77e（包含baab47e任务效率）快进main并推送；覆盖R138的当轮不合并/推送限制。本轮不启动其他S2开发。内网本轮优先读取【codex】s2-layout-r1-intranet-prompt.md及【codex】intranet-validation.md，构建nightwatch-s2-layout-r1，记录实际上传完整HEAD。旧s2-defense-r1提示只适用0bce507旧局，旧局结果与新版严格分开；不照搬6墙/混合阵容口径。不使用外网绝对目录作为内网工作路径，旧工作树与缓存保留。
+
+
+## R141 S2投资目标与计划稳定性（用户授权继续开发）
+
+新增`code/NightWatch-s2-investment/`为同仓库linked worktree，分支`codex/s2-investment-targets`，基准e084aed1c492bd51f0f43bb0f2eaa90d7ef0005c；仅源码、测试和手册，不放临时材料，删除须授权。原Sol+medium独占此树，按design/【codex】s2-investment-targets-plan.md实施。main正在送测，旧五树只读。本批只改现有投资物品的可执行目标选择与已启动目标稳定性，不调采购优先级/预算/波次公式，不新增墙升级采购、新闻宝藏或任务能力。开发不commit/merge/push/reset/切分支/删除，主会话验收后可本地提交；本轮不合main或推送。
+
+
+## R143 本批本地验收
+
+主会话独立360项回归及未绑定/封死/临夜超期额外反例通过，允许主会话在codex/s2-investment-targets本地提交。本轮不合main或推送；main e084aed仍在内网验证。实际投资收益与S2整体待实战，旧工作树和缓存保留。
