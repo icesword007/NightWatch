@@ -362,6 +362,14 @@ class ActionAllocator:
                 and target.kind == WALL
                 and distance(actor.pos, target.pos) == 1
             )
+        if name in ("Bomb", "DizzyWeapon"):
+            if targets is None or len(targets) != 1:
+                return False
+            target = targets[0]
+            return (
+                0 <= target.x < self._turn.width
+                and 0 <= target.y < self._turn.height
+            )
         voucher = self._voucher_target(name)
         if voucher is None:
             return True

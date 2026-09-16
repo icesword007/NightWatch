@@ -60,6 +60,47 @@ def turn_with_weapon():
 
 
 class ActionTests(unittest.TestCase):
+    def test_bomb_and_dizzy_require_one_in_bounds_target_and_own_inventory(self):
+        actions = load_actions_module(self)
+        for item in ("Bomb", "DizzyWeapon"):
+            with self.subTest(item=item):
+                allocator = actions.ActionAllocator(two_worker_turn(
+                    first_items=(item,),
+                ))
+                legal = actions.ActionProposal(
+                    10010,
+                    10010,
+                    {
+                        "action": "use",
+                        "name": item,
+                        "targetPos": [{"x": 4, "y": 4}],
+                    },
+                )
+                self.assertTrue(allocator.try_add(legal))
+
+                for command in (
+                    {"action": "use", "name": item},
+                    {
+                        "action": "use", "name": item,
+                        "targetPos": [{"x": 2, "y": 2}, {"x": 3, "y": 3}],
+                    },
+                    {
+                        "action": "use", "name": item,
+                        "targetPos": [{"x": -1, "y": 2}],
+                    },
+                ):
+                    rejected = actions.ActionAllocator(two_worker_turn(
+                        first_items=(item,),
+                    ))
+                    self.assertFalse(rejected.try_add(actions.ActionProposal(
+                        10010, 10010, command,
+                    )))
+
+                other_inventory = actions.ActionAllocator(two_worker_turn(
+                    first_items=(), second_items=(item,),
+                ))
+                self.assertFalse(other_inventory.try_add(legal))
+
     def test_owner_actor_and_action_shape_are_validated(self):
         # Break caught: a valid actor launders a command for a nonexistent owner.
         actions = load_actions_module(self)

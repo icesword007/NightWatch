@@ -239,7 +239,7 @@ class ServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(record["buildId"], "nightwatch-s2-integrated-r1")
+        self.assertEqual(record["buildId"], "nightwatch-s2-emergency-r1")
         self.assertEqual(
             record["team"], {"type": "challenger", "id": "s0-our"}
         )
@@ -632,7 +632,10 @@ class ServerTests(unittest.TestCase):
         })
         payload["teamOur"]["roles"][0].update({
             "backPackCapability": 8,
-            "backpack": ["stone", "stone", "Medicine", "private-item"],
+            "backpack": [
+                "stone", "stone", "Medicine", "Bomb", "DizzyWeapon",
+                "private-item",
+            ],
         })
         payload["teamOur"]["roles"].extend([
             {
@@ -704,7 +707,12 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(record["economy"], {"gold": 37, "score": 81})
         worker = record["controlledRoles"]["items"][0]
         self.assertEqual(worker["capacity"], 8)
-        self.assertEqual(worker["backpack"], {"Medicine": 1, "stone": 2})
+        self.assertEqual(worker["backpack"], {
+            "Bomb": 1,
+            "DizzyWeapon": 1,
+            "Medicine": 1,
+            "stone": 2,
+        })
         self.assertFalse(record["controlledRoles"]["truncated"])
         self.assertEqual(
             {item["type"] for item in record["ourStructures"]["items"]},

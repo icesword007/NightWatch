@@ -245,3 +245,13 @@ main f721702、投资分支776e8ac（墙升级）及其他旧树只读；本批�
 ## R159 S2统一集成送测（当前执行规则）
 
 用户已明确授权将投资目标/多人协同、围墙升级776e8ac与任务成功率5810d6d合入main，主会话处理集成冲突、完整验证、提交并推送。本条覆盖上述历史批次不合并/不推送限制。当前构建nightwatch-s2-integrated-r1，内网以【codex】s2-integrated-r1-intranet-prompt.md和通用手册当前轮次要求执行。停止旧版补证；旧版本资料仅历史参考。旧树/缓存/日志保留，不擅改策略，不以本地通过或推送作为实战验收，不自动关闭issue。
+
+
+## R160 S2已有应急道具使用（用户授权继续S2）
+
+新增code/NightWatch-s2-emergency/为同仓库linked worktree，仅同仓库源码/测试/手册，不放临时材料，清理仍须授权。分支codex/s2-held-emergency，基准e7ff4c563b51a44e047721eda6ae30700477dd77；main正在内网验证，保持不动。原Sol+medium唯一开发者，按design/【codex】s2-held-emergency-plan.md实现夜间已有Bomb/DizzyWeapon的保守原地救援。覆盖旧阶段禁止应急道具使用限制；不新增采购/筹资、不中断活动任务、不抢当前可发出的武器攻击、不扩展宝藏或投资策略。允许现有agent/tests目录新增emergency.py/test_emergency.py，必要actions/defense/protocol/server适配，不新增依赖。开发不提交/合并/推送/切分支/reset/删除/派生任务，交付R161由主会话R162独立验收后可本地提交；本轮不自动合main或推送。
+
+
+## R162 已有应急道具本地验收
+
+主会话独立406项含16HTTP通过9.929秒；额外缺/空/多/越界目标拒绝、两阵营三火箭use后次轮原炮手恢复攻击、完整列表乱序稳定通过。允许主会话在本隔离分支本地提交；main和origin/main保持e7ff4c5送测，不合并/推送，不清理旧树/缓存。没有采购、主动任务抢占或正常炮火替换，实际库存来源与生存收益未验证。

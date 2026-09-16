@@ -13,6 +13,7 @@ from .defense import (
     task_pioneer_day_return_action,
     task_pioneer_recall_action,
 )
+from .emergency import propose_held_emergency
 from .defense_pressure import pressure_diagnostic
 from .economy import propose_economy, wall_build_positions
 from .fortification import fortification_diagnostic, prepare_fortification
@@ -195,6 +196,24 @@ class DecisionEngine:
                 ),
                 reserved_weapon_ids=funding_posts,
             )
+            emergency = propose_held_emergency(
+                turn,
+                state,
+                defense_actions=defense_candidates,
+                unavailable_role_ids=(
+                    task_role_ids
+                    | funding_roles
+                    | frozenset(
+                        candidate.proposal.actor_id
+                        for candidate in critical_economy
+                    )
+                ),
+                reserved_weapon_ids=funding_posts,
+                clock=self.clock,
+                deadline=deadline,
+            )
+            if emergency is not None:
+                defense_candidates = (emergency, *defense_candidates)
             task_turn = propose_tasks(
                 turn,
                 state,
@@ -540,7 +559,10 @@ class DecisionEngine:
                 "deadlineRound": candidate.deadline_round,
             }
             if candidate.diagnostic is not None:
-                action["economy"] = copy.deepcopy(candidate.diagnostic)
+                if candidate.diagnostic.get("kind") == "heldEmergency":
+                    action["emergency"] = copy.deepcopy(candidate.diagnostic)
+                else:
+                    action["economy"] = copy.deepcopy(candidate.diagnostic)
             actions.append(action)
         trace = {
             "roundNo": turn.round_no,
@@ -656,7 +678,9 @@ class DecisionEngine:
             if reason.startswith("task:"):
                 return "task_route"
             prefix = reason.split(":", 1)[0]
-            if prefix in {"build", "fund", "gunner", "mine", "shop", "use"}:
+            if prefix in {
+                "build", "emergency", "fund", "gunner", "mine", "shop", "use",
+            }:
                 return prefix
             if reason in {"vendor", "s0_probe"}:
                 return reason
