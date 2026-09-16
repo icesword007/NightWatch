@@ -166,3 +166,10 @@
 - 本批唯一源码目录/分支：code/NightWatch-s2-defense / codex/s2-defense-recovery，基准7debfef73494be215ee7032c70792f3921f5a884。所有命令显式workdir到该树。main和NightWatch-s2-recovery只读，不混改。
 - 原Sol+medium按外层design/【codex】s2-defense-recovery-plan.md实施T38：固定目标毁墙跨日补建、逐夜波次观察/有界预测及资源缺口；可在CoreGeek/src/agent及tests现有目录加必要模块/测试，不另建目录，不改SDK/环境/依赖。
 - 不commit/push/merge/reset/切分支/删除；主会话独立验收。旧规则禁止补建的阶段限制由本批明确授权覆盖，仍保留6格足迹、2墙批次、逐目标每天有界尝试、现有失败/安全/持券/回岗边界。新预测不是裁判增长公式，也不授权无限投资或强制购券。
+
+
+## R131 当前S2首批送测（2026-09-16用户授权）
+
+- 用户授权将已验收S2首批68e24f7快进合入main并推送，本轮只送测，不启动下一批开发。覆盖R128的当轮禁止合并/推送及唯一开发树限制；原S2工作树与分支保留。
+- 内网使用实际克隆目录，以本仓库【codex】s2-defense-r1-intranet-prompt.md为本轮优先级，配合【codex】intranet-validation.md。不执行外网绝对目录指令，不照搬旧r10提示重跑完整S1验收。
+- S1已在7debfef完成功能验收（双阵营首夜、工程完整成功、失败恢复、726回合全量日志无已发现异常）；本版只作关键回归。裁判端到端时延不可得、本版部分提交未覆盖的边界保留。S2整体十天验收尚未完成。
