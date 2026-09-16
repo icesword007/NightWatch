@@ -86,6 +86,279 @@ def state_for(payload):
 
 
 class TaskTests(unittest.TestCase):
+    def test_explicit_file_task_starts_with_one_bounded_read_command(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1,
+            pioneer_pos=(3, 3),
+            phase_task="请阅读task_3_gamma.md并回答问题",
+        )
+
+        first = engine.decide(active)
+
+        self.assertEqual(first["prompt"], "")
+        self.assertIn("python3", first["executeCmd"])
+        self.assertIn("task_3_gamma.md", first["executeCmd"])
+        self.assertLessEqual(len(first["executeCmd"]), 4_096)
+        task = engine.state.state.active_task
+        self.assertTrue(task.entry_read_attempted)
+        self.assertEqual(task.command_count, 1)
+        self.assertEqual(task.pending_cmd_round, 1)
+
+        result = copy.deepcopy(active)
+        result["roundNo"] = 2
+        result["lastCmdResult"] = (
+            "[exitCode:0]\n[TASK_INPUT_PATH]\n/tmp/task_3_gamma.md\n"
+            "[TASK_INPUT_CONTENT]\nverified instructions"
+        )
+        followup = engine.decide(result)
+        self.assertEqual(followup["executeCmd"], "")
+        self.assertIn("verified instructions", followup["prompt"])
+        self.assertIn("untrusted task material", followup["prompt"])
+
+    def test_entry_read_falls_back_when_unsafe_or_deadline_is_short(self):
+        for text in (
+            "比较a.md和b.md",
+            "请阅读a.md并打开b.md",
+            "分析工程并给出答案，参考可能在task.md",
+            "readme.md",
+            "openapi.md",
+        ):
+            with self.subTest(text=text):
+                response = DecisionEngine().decide(task_payload(
+                    round_no=1, pioneer_pos=(3, 3), phase_task=text,
+                ))
+                self.assertEqual(response["executeCmd"], "")
+                self.assertTrue(response["prompt"])
+
+        tasks = importlib.import_module("agent.tasks")
+        short = task_payload(
+            round_no=2,
+            pioneer_pos=(3, 3),
+            phase_task="请阅读task.md并回答",
+        )
+        state = state_for(short)
+        state.active_task.timeout_round = 3
+        proposal = tasks.propose_tasks(
+            Turn.load(short),
+            state,
+            deadline=100.0,
+            max_expansions=10,
+        )
+        self.assertEqual(proposal.execute_cmd, "")
+        self.assertTrue(proposal.prompt)
+
+    def test_final_only_command_gets_exactly_one_correction_without_execution(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="solve from evidence",
+        )
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 4
+        task.final_answer_requested = True
+
+        violation = copy.deepcopy(active)
+        violation["roundNo"] = 2
+        violation["llmResp"] = '{"kind":"command","content":"unsafe-step"}'
+        corrected = engine.decide(violation)
+
+        self.assertEqual(corrected["executeCmd"], "")
+        self.assertTrue(corrected["prompt"])
+        self.assertIn("final-answer-only correction", corrected["prompt"])
+        self.assertTrue(task.final_only_correction_requested)
+        self.assertIsNone(task.solver_stopped_reason)
+
+        repeated = copy.deepcopy(active)
+        repeated["roundNo"] = 3
+        repeated["llmResp"] = '{"kind":"command","content":"unsafe-again"}'
+        left = engine.decide(repeated)
+        self.assertEqual(left["executeCmd"], "")
+        self.assertEqual(task.solver_stopped_reason, "command_after_final_request")
+
+    def test_remaining_two_correction_allows_partial_submit_at_remaining_one(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="solve from evidence",
+        )
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 4
+        task.final_answer_requested = True
+        violation = copy.deepcopy(active)
+        violation["roundNo"] = 2
+        violation["llmResp"] = '{"kind":"command","content":"too-late"}'
+
+        correction = engine.decide(violation)
+
+        self.assertIn("Known remaining task rounds: 2", correction["prompt"])
+        self.assertEqual(correction["executeCmd"], "")
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 3
+        answer["llmResp"] = (
+            '{"kind":"answer","content":"verified partial","complete":false}'
+        )
+        submitted = engine.decide(answer)
+        self.assertEqual(submitted["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "verified partial",
+        })
+        self.assertIsNone(task.solver_stopped_reason)
+
+    def test_coordination_deadline_is_not_extended_by_final_correction(self):
+        engine = DecisionEngine()
+        active = self._third_post_payload(59)
+        first = engine.decide(active)
+        self.assertIn("Known remaining task rounds: 3", first["prompt"])
+        task = engine.state.state.active_task
+        self.assertEqual(task.coordination_deadline_round, 62)
+        violation = self._third_post_payload(60)
+        violation["llmResp"] = '{"kind":"command","content":"too-late"}'
+
+        response = engine.decide(violation)
+
+        self.assertTrue(response["prompt"])
+        self.assertEqual(response["executeCmd"], "")
+        self.assertIn("Known remaining task rounds: 2", response["prompt"])
+        self.assertEqual(task.coordination_deadline_round, 62)
+        self.assertTrue(task.coordination_final_requested)
+        self.assertFalse(task.final_answer_requested)
+
+    def test_final_only_correction_preserves_partial_answer_and_abandon(self):
+        for envelope, expected_action, expected_reason in (
+            (
+                '{"kind":"answer","content":"verified partial","complete":false}',
+                "submitAnswer",
+                None,
+            ),
+            (
+                '{"kind":"abandon","reason":"insufficient evidence"}',
+                "move",
+                "solver_abandoned",
+            ),
+        ):
+            with self.subTest(envelope=envelope):
+                engine = DecisionEngine()
+                active = task_payload(
+                    round_no=1,
+                    pioneer_pos=(3, 3),
+                    phase_task="solve from evidence",
+                )
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.final_answer_requested = True
+                task.final_only_correction_requested = True
+                response_payload = copy.deepcopy(active)
+                response_payload["roundNo"] = 2
+                response_payload["llmResp"] = envelope
+
+                response = engine.decide(response_payload)
+
+                self.assertEqual(
+                    response["roleCommandMap"]["10011"]["action"],
+                    expected_action,
+                )
+                self.assertEqual(task.solver_stopped_reason, expected_reason)
+
+    def test_final_only_violation_with_one_round_left_is_not_corrected(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="solve from evidence",
+        )
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 3
+        task.final_answer_requested = True
+        violation = copy.deepcopy(active)
+        violation["roundNo"] = 2
+        violation["llmResp"] = '{"kind":"command","content":"too-late"}'
+
+        response = engine.decide(violation)
+
+        self.assertEqual(response["executeCmd"], "")
+        self.assertFalse(task.final_only_correction_requested)
+        self.assertEqual(task.solver_stopped_reason, "command_after_final_request")
+
+    def test_automatic_read_duplicate_request_and_new_task_are_isolated(self):
+        engine = DecisionEngine()
+        first_task = task_payload(
+            round_no=1,
+            pioneer_pos=(3, 3),
+            phase_task="请阅读first.md并回答问题",
+        )
+        first = engine.decide(first_task)
+        first_memory = engine.state.state.active_task
+        duplicate = engine.decide(copy.deepcopy(first_task))
+
+        self.assertEqual(duplicate, first)
+        self.assertEqual(first_memory.command_count, 1)
+        self.assertEqual(len(first_memory.solver_history), 1)
+
+        replacement = copy.deepcopy(first_task)
+        replacement["roundNo"] = 2
+        replacement["phaseTask"] = "请阅读second.md并回答问题"
+        replacement["lastCmdResult"] = (
+            "[exitCode:0]\n[TASK_INPUT_PATH]\n/tmp/first.md\n"
+            "[TASK_INPUT_CONTENT]\nstale first task content"
+        )
+        second = engine.decide(replacement)
+        second_memory = engine.state.state.active_task
+
+        self.assertTrue(second["executeCmd"])
+        self.assertIn("second.md", second["executeCmd"])
+        self.assertNotEqual(second_memory.instance_id, first_memory.instance_id)
+        self.assertEqual(second_memory.command_count, 1)
+        self.assertEqual(second_memory.solver_evidence, [])
+        self.assertNotIn(
+            "stale first task content", "\n".join(second_memory.solver_history),
+        )
+        self.assertEqual(engine.state.state.late_tool_results, 1)
+
+    def test_failed_automatic_read_is_not_verified_or_repeated(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1,
+            pioneer_pos=(3, 3),
+            phase_task="请阅读missing.md并回答",
+        )
+        first = engine.decide(active)
+        self.assertTrue(first["executeCmd"])
+
+        failed = copy.deepcopy(active)
+        failed["roundNo"] = 2
+        failed["lastCmdResult"] = (
+            "[exitCode:2]\n[TASK_INPUT_STATUS:error] not_found"
+        )
+        followup = engine.decide(failed)
+
+        task = engine.state.state.active_task
+        self.assertEqual(followup["executeCmd"], "")
+        self.assertTrue(followup["prompt"])
+        self.assertEqual(task.solver_evidence, [])
+        self.assertEqual(task.command_count, 1)
+        self.assertTrue(task.entry_read_attempted)
+        self.assertIn("not_found", followup["prompt"])
+
+        invalid = copy.deepcopy(active)
+        invalid["roundNo"] = 3
+        invalid["llmResp"] = "invalid"
+        retried = engine.decide(invalid)
+        self.assertEqual(retried["executeCmd"], "")
+
+    def test_task_trace_exposes_only_bounded_entry_and_correction_flags(self):
+        traces = []
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1,
+            pioneer_pos=(3, 3),
+            phase_task="请阅读task.md并回答",
+        )
+
+        engine.decide(active, trace_sink=traces.append)
+
+        self.assertTrue(traces[-1]["taskEntryReadAttempted"])
+        self.assertFalse(traces[-1]["taskFinalOnlyCorrectionRequested"])
+        self.assertNotIn("task.md", json.dumps(traces[-1]))
+
     def test_dead_task_owner_does_not_revive_old_instance_next_day(self):
         payload = task_payload(round_no=69, pioneer_pos=(3, 3))
         payload["teamOur"]["teamId"] = "s2-dead-task-owner-next-day"
@@ -950,7 +1223,7 @@ class TaskTests(unittest.TestCase):
 
         next_task = copy.deepcopy(active)
         next_task["roundNo"] = 4
-        next_task["phaseTask"] = "Read /b/input/specification.md and answer."
+        next_task["phaseTask"] = "Use the input at /b/input/specification.md."
         prompt = engine.decide(next_task)["prompt"]
 
         self.assertIn("/b/input/specification.md", prompt)
@@ -1012,7 +1285,7 @@ class TaskTests(unittest.TestCase):
         payload = task_payload(
             round_no=1,
             pioneer_pos=(3, 3),
-            phase_task="Read /sandbox/input/data.csv and compute the total.",
+            phase_task="The explicit input is /sandbox/input/data.csv; compute the total.",
         )
 
         prompt = DecisionEngine().decide(payload)["prompt"]
@@ -1030,6 +1303,11 @@ class TaskTests(unittest.TestCase):
         self.assertIn("compare every request field", prompt)
         self.assertIn("exit code 0 does not prove API success", prompt)
         self.assertIn("Do not invent credentials", prompt)
+        self.assertIn("outer JSON envelope", prompt)
+        self.assertIn("actual check or TOKEN evidence", prompt)
+        self.assertIn("actual API response conflict", prompt)
+        self.assertNotIn("Bearer", prompt)
+        self.assertNotIn("location=", prompt)
         self.assertIn("Observed environment path clues", prompt)
         self.assertNotIn("Previously verified environment paths", prompt)
 

@@ -489,6 +489,8 @@ class DecisionEngine:
         leave_reason = None
         task_instance_id = None
         cycle_fingerprint = None
+        entry_read_attempted = False
+        final_only_correction_requested = False
         if task is not None:
             task_instance_id = task.instance_id
             solver_state = task.phase
@@ -524,6 +526,10 @@ class DecisionEngine:
             cycle_fingerprint = DecisionEngine._short_fingerprint(
                 task.last_cycle_fingerprint,
             )
+            entry_read_attempted = task.entry_read_attempted
+            final_only_correction_requested = (
+                task.final_only_correction_requested
+            )
         actions = []
         for domain, candidate in accepted:
             action = {
@@ -553,6 +559,10 @@ class DecisionEngine:
                 else None,
             ),
             "cycleFingerprint": cycle_fingerprint,
+            "taskEntryReadAttempted": entry_read_attempted,
+            "taskFinalOnlyCorrectionRequested": (
+                final_only_correction_requested
+            ),
             "coordinationReason": coordination_reason,
             "taskStartSkipReason": task_start_skip_reason,
             "actions": actions,
