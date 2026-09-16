@@ -1,6 +1,6 @@
 # NightWatch S2投资目标稳定性候选版内网验证手册
 
-日期：2026-09-16。适用于构建标识nightwatch-s2-investment-r2。实际版本以参赛提交SHA和包内容为准，构建字符串不能替代SHA。
+日期：2026-09-16。适用于构建标识nightwatch-s2-investment-r3。实际版本以参赛提交SHA和包内容为准，构建字符串不能替代SHA。
 
 ## 1. 本次验证目标与职责
 
@@ -45,7 +45,7 @@ S2防线恢复首批只复用原先最多6个固定安全墙目标：墙必须�
 3. 记录`python3 --version`。赛方环境说明为Python 3.11.10，本地开发已验证3.13.3；内网须验证实际3.11环境。程序使用标准库，无需pip安装。
 4. 候选上传根目录为CoreGeek内容，其中run.sh、main3.py、src/agent/*.py必须保留相对布局；确认平台解包后实际运行位置。若平台要求不同，先报事实和所需调整，不擅自改程序。
 5. 启动方式：在CoreGeek目录执行`bash run.sh <平台指定端口>`；监听0.0.0.0，HTTP POST根路径。不要把尖括号占位文本当参数执行。
-6. 可以先在CoreGeek执行`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py' -v`，预期367项全数通过（含16项HTTP回环）。相对r1新增7项双工人投资owner反例，覆盖购券目标ID不同、持券不重复使用、重复历史计划确定性消解、夜间唯一使用、联合买方保持、唯一目标单采购及WallFixer同墙唯一修复；其余360项为既有回归。本地通过不替代对战。
+6. 可以先在CoreGeek执行`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py' -v`，预期374项全数通过（含16项HTTP回环）。本批新增7项围墙升级闭环、候选顺序、建设完成门控、session稳定蓝图、L2实际移动至L3、双工人不同目标及日夜持券兑现测试；其余367项为既有回归。本地通过不替代对战。
 7. 上传仅包含实际运行文件，排除.git、.DS_Store、__pycache__、*.pyc及本地环境文件；无需删除工作区文件。记录打包所依据SHA、包SHA256（工具可用时）、包含文件清单和启动设置。平台如另有构建步骤一并记录。
 
 本次没有内置对局ID字段，也不能仅靠buildId判断代码版本。若上传包有任何未提交源码差异，必须注明“修改版”，列明差异，不能称原SHA已通过。不要在记录中暴露凭据或带token的URL。

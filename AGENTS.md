@@ -218,3 +218,8 @@
 ## R147 投资协同本地验收
 
 主会话独立367项回归、6回合双目标购券使用链和owner释放矩阵通过，允许主会话在本隔离分支本地提交。本轮不合main/推送；main e084aed继续作为内网版本。
+
+
+## R151 S2围墙升级闭环（用户授权继续S2开发）
+
+原Sol+medium沿code/NightWatch-s2-investment/codex/s2-investment-targets，基准f72170214a2359b931f02d79d7bbd4a7a3c0ef35独占开发；main f721702与远端e084aed均保持。按design/【codex】s2-wall-upgrade-plan.md补围墙升级采购与兑现，覆盖此前不新增WallUpgrade采购的批次限制。保留现有物品相对优先级、合法路线/回岗/同轮预算/目标owner，不调布局、任务、波次公式、SDK或全局预算。不新增目录依赖、不改其他工作树。开发不commit/merge/push/reset/删除；主会话独立验收后可本地提交，本轮不自动合main/推送。交付R152，验收R153；内网待补证不是本批故障依据。

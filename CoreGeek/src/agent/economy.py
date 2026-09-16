@@ -105,6 +105,7 @@ class RouteSearchContext:
     joint_blocker: str | None = None
     investment_targets: set[int] = field(default_factory=set)
     investment_owners: dict[int, int] = field(default_factory=dict)
+    wall_upgrade_targets: tuple[Pos, ...] = ()
 
 
 _ROUTE_SEARCH_CONTEXT: ContextVar[RouteSearchContext | None] = ContextVar(
@@ -236,6 +237,8 @@ def _propose_economy(
         }
         context.investment_targets.update(context.investment_owners)
     ensure_defense_layout(turn, state)
+    if context is not None:
+        context.wall_upgrade_targets = state.layout_wall_targets
     candidates: list[PlannedAction] = []
     maintained_roles: set[int] = set()
     claimed_build_targets: set[Pos] = set()
@@ -2737,6 +2740,20 @@ def _purchase_candidates(turn: Turn, worker: Unit) -> tuple[str, ...]:
             item = f"{prefix}UpgradeVoucher{target.level}"
             if item in turn.weapon_prices and item not in candidates:
                 candidates.append(item)
+    wall_positions = {wall.pos for wall in turn.walls()}
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    layout_walls = context.wall_upgrade_targets if context is not None else ()
+    wall_levels = (
+        {wall.level for wall in turn.walls()}
+        if len(turn.weapons()) >= MAX_WEAPONS
+        and bool(layout_walls)
+        and set(layout_walls).issubset(wall_positions)
+        else set()
+    )
+    for required_level in (1, 2):
+        item = f"WallUpgradeVoucher{required_level}"
+        if required_level in wall_levels and item in turn.weapon_prices:
+            candidates.append(item)
     return tuple(candidates)
 
 
