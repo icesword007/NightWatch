@@ -91,7 +91,9 @@ class TaskMemory:
     last_cycle_fingerprint: str | None = None
     repeated_cycle_count: int = 0
     command_count: int = 0
+    entry_read_attempted: bool = False
     final_answer_requested: bool = False
+    final_only_correction_requested: bool = False
     coordination_final_requested: bool = False
     coordination_deadline_round: int | None = None
     abandon_move_attempted: bool = False
