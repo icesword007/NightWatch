@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from .defense_pressure import WaveForecast, WaveNight, observe_pressure
 from .intelligence import (
     MAX_NEWS_CALLS_PER_DAY,
     MAX_NEWS_CANDIDATES,
@@ -145,12 +146,21 @@ class SessionState:
     fortification_targets: tuple[Pos, ...] = ()
     fortification_batch_targets: tuple[Pos, ...] = ()
     fortification_completed: set[Pos] = field(default_factory=set)
+    fortification_observed_days: dict[Pos, int] = field(default_factory=dict)
+    fortification_recovery_targets: set[Pos] = field(default_factory=set)
+    fortification_attempt_days: dict[Pos, int] = field(
+        default_factory=dict
+    )
+    fortification_planning_day: int | None = None
     fortification_failed: set[Pos] = field(default_factory=set)
     fortification_deferred: dict[Pos, tuple[str, str, int]] = field(
         default_factory=dict
     )
     fortification_phase: str = "idle"
     fortification_skip_reason: str | None = None
+    wave_history: list[WaveNight] = field(default_factory=list)
+    wave_history_truncated: bool = False
+    wave_forecasts: list[WaveForecast] = field(default_factory=list)
     last_trace: dict[str, Any] | None = None
 
 
@@ -207,6 +217,8 @@ class StateStore:
         self._apply_feedback(turn, payload)
         self._release_dead_roles(turn)
         self._release_invalid_plans(turn)
+        self._observe_fortification(turn)
+        observe_pressure(turn, state)
         self._update_task(
             turn,
             payload,
@@ -257,6 +269,14 @@ class StateStore:
                     else None
                 ),
             )
+            if (
+                command.get("action") == "build"
+                and command.get("name") == "wall"
+                and target in state.fortification_targets
+            ):
+                state.fortification_attempt_days[target] = self._day(
+                    turn.round_no
+                )
             task = state.active_task
             if (
                 task is not None
@@ -562,6 +582,38 @@ class StateStore:
                     or target is None
                 ):
                     state.plans.pop(role_id)
+
+    def _observe_fortification(self, turn: Turn) -> None:
+        state = self._require_state()
+        if not state.fortification_initialized:
+            return
+        day = self._day(turn.round_no)
+        if state.fortification_planning_day is None:
+            state.fortification_planning_day = day
+        elif state.fortification_planning_day != day:
+            state.fortification_planning_day = day
+            state.fortification_batch_targets = ()
+            state.fortification_deferred.clear()
+        occupied_walls = {wall.pos for wall in turn.walls()}
+        observed = occupied_walls.intersection(state.fortification_targets)
+        for target in observed:
+            state.fortification_completed.add(target)
+            state.fortification_observed_days[target] = day
+            state.fortification_recovery_targets.discard(target)
+            state.fortification_attempt_days.pop(target, None)
+        if not turn.is_day:
+            return
+        reopened = {
+            target for target in state.fortification_completed
+            if target not in occupied_walls
+            and target not in state.fortification_failed
+            and state.fortification_observed_days.get(target, day) < day
+        }
+        if not reopened:
+            return
+        state.fortification_completed.difference_update(reopened)
+        state.fortification_recovery_targets.update(reopened)
+        state.fortification_batch_targets = ()
 
     def _update_task(
         self,

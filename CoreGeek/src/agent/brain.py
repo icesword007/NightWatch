@@ -13,6 +13,7 @@ from .defense import (
     task_pioneer_day_return_action,
     task_pioneer_recall_action,
 )
+from .defense_pressure import pressure_diagnostic
 from .economy import propose_economy, wall_build_positions
 from .fortification import fortification_diagnostic, prepare_fortification
 from .intelligence import MAX_NEWS_CALLS_PER_DAY, MAX_NEWS_CANDIDATES
@@ -618,6 +619,10 @@ class DecisionEngine:
                     copy.deepcopy(state.news_events) if state is not None else []
                 ),
             },
+            "defensePressure": (
+                pressure_diagnostic(turn, state)
+                if state is not None else None
+            ),
         }
         if economy_planning is not None:
             trace["economyPlanning"] = copy.deepcopy(economy_planning)

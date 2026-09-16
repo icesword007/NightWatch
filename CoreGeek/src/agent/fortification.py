@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from .grid import next_step
-from .protocol import STATION, Pos, Turn, distance
+from .protocol import ROUNDS_PER_DAY, STATION, Pos, Turn, distance
 
 MAX_WALL_TARGETS = 6
 MAX_WALL_BATCH = 2
@@ -261,6 +261,9 @@ def prepare_fortification(
         state.fortification_skip_reason = "tower_line_or_day"
         return None
     if not state.fortification_initialized:
+        state.fortification_planning_day = (
+            turn.round_no - 1
+        ) // ROUNDS_PER_DAY + 1
         remaining = max(MAX_WALL_TARGETS - len(turn.walls()), 0)
         state.fortification_targets = safe_wall_targets(
             turn, candidates,
@@ -277,9 +280,20 @@ def prepare_fortification(
         occupied_walls.intersection(state.fortification_targets)
     )
     remaining_targets = tuple(
-        target for target in state.fortification_targets
+        target for target in (
+            tuple(
+                target for target in state.fortification_targets
+                if target in state.fortification_recovery_targets
+            )
+            + tuple(
+                target for target in state.fortification_targets
+                if target not in state.fortification_recovery_targets
+            )
+        )
         if target not in state.fortification_completed
         and target not in state.fortification_failed
+        and state.fortification_attempt_days.get(target)
+        != (turn.round_no - 1) // ROUNDS_PER_DAY + 1
     )
     if not remaining_targets:
         state.fortification_phase = "complete"
@@ -551,6 +565,8 @@ def remaining_wall_targets(state: Any) -> tuple[Pos, ...]:
 
 def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
     direction = direction_prior(turn)
+    day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+    wall_positions = {wall.pos for wall in turn.walls()}
     gunner_stands = [
         plan.target.dump()
         for _, plan in sorted(state.plans.items())
@@ -564,6 +580,22 @@ def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
             target.dump() for target in state.fortification_batch_targets[:2]
         ],
         "completed": len(state.fortification_completed),
+        "observedFixedWalls": sum(
+            target in wall_positions for target in state.fortification_targets[:6]
+        ),
+        "missingConfirmedWalls": sum(
+            target not in wall_positions
+            for target in state.fortification_recovery_targets
+        ),
+        "recoveryTargets": [
+            target.dump()
+            for target in state.fortification_targets[:6]
+            if target in state.fortification_recovery_targets
+        ],
+        "attemptsToday": sum(
+            attempt_day == day
+            for attempt_day in state.fortification_attempt_days.values()
+        ),
         "failed": len(state.fortification_failed),
         "builderId": (
             str(state.fortification_builder_id)

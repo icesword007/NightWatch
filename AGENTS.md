@@ -159,3 +159,10 @@
 
 - 用户已授权推送当前main候选版并由内网执行验证。本条覆盖R123的当轮“不推送”限制，不授权其他开发、回滚或清理。
 - 内网以本仓库【codex】r10-intranet-run-prompt.md及【codex】intranet-validation.md执行送测；前者规定本轮优先级。不得使用外网机器绝对路径作为内网工作目录，使用实际克隆位置。
+
+
+## R128 当前S2开发授权（覆盖历史main与旧S2目录指向）
+
+- 本批唯一源码目录/分支：code/NightWatch-s2-defense / codex/s2-defense-recovery，基准7debfef73494be215ee7032c70792f3921f5a884。所有命令显式workdir到该树。main和NightWatch-s2-recovery只读，不混改。
+- 原Sol+medium按外层design/【codex】s2-defense-recovery-plan.md实施T38：固定目标毁墙跨日补建、逐夜波次观察/有界预测及资源缺口；可在CoreGeek/src/agent及tests现有目录加必要模块/测试，不另建目录，不改SDK/环境/依赖。
+- 不commit/push/merge/reset/切分支/删除；主会话独立验收。旧规则禁止补建的阶段限制由本批明确授权覆盖，仍保留6格足迹、2墙批次、逐目标每天有界尝试、现有失败/安全/持券/回岗边界。新预测不是裁判增长公式，也不授权无限投资或强制购券。

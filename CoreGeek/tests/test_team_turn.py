@@ -43,6 +43,160 @@ def base_payload(*, round_no, team_id):
 
 
 class TeamTurnTests(unittest.TestCase):
+    def test_destroyed_confirmed_wall_is_rebuilt_on_the_next_day(self):
+        # Break caught: historical completion permanently hides a destroyed wall.
+        payload = base_payload(round_no=5, team_id="s2-wall-next-day-recovery")
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 6, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+        target = engine.state.state.fortification_targets[0]
+
+        confirmed = json.loads(json.dumps(payload))
+        confirmed["roundNo"] = 6
+        confirmed["teamOur"]["roles"].append(
+            unit(10050, "wall", target.x, target.y, health=1000),
+        )
+        engine.decide(confirmed)
+        self.assertIn(target, engine.state.state.fortification_completed)
+
+        destroyed_at_night = json.loads(json.dumps(confirmed))
+        destroyed_at_night["roundNo"] = 80
+        destroyed_at_night["teamOur"]["roles"] = [
+            role for role in destroyed_at_night["teamOur"]["roles"]
+            if role["id"] != 10050
+        ]
+        night_response = engine.decide(destroyed_at_night)
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            for command in night_response["roleCommandMap"].values()
+        ))
+
+        next_day = json.loads(json.dumps(destroyed_at_night))
+        next_day["roundNo"] = 132
+        worker = next(
+            role for role in next_day["teamOur"]["roles"]
+            if role["id"] == 10010
+        )
+        worker["pos"] = {"x": target.x - 1, "y": target.y}
+        worker["backpack"] = ["stone"]
+        traces = []
+        command = engine.decide(
+            next_day, trace_sink=traces.append,
+        )["roleCommandMap"]["10010"]
+
+        self.assertEqual(command, {
+            "action": "build",
+            "targetPos": [target.dump()],
+            "name": "wall",
+        })
+        fortification = traces[0]["economyPlanning"]["fortification"]
+        self.assertEqual(fortification["recoveryTargets"], [target.dump()])
+        self.assertEqual(fortification["observedFixedWalls"], 0)
+        self.assertEqual(fortification["missingConfirmedWalls"], 1)
+        self.assertEqual(traces[0]["defensePressure"]["forecast"]["targetDay"], 2)
+
+        attempts_before = dict(engine.state.state.fortification_attempt_days)
+        replayed = engine.decide(next_day)
+        self.assertEqual(replayed["roleCommandMap"]["10010"], command)
+        self.assertEqual(
+            engine.state.state.fortification_attempt_days, attempts_before,
+        )
+
+        failed = json.loads(json.dumps(next_day))
+        failed["roundNo"] = 133
+        failed["lastRoundRoleActionResults"] = {"10010": False}
+        engine.decide(failed)
+        self.assertIn(target, engine.state.state.fortification_failed)
+        later = json.loads(json.dumps(failed))
+        later["roundNo"] = 262
+        later["lastRoundRoleActionResults"] = {}
+        later["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        response = engine.decide(later)
+        self.assertFalse(any(
+            candidate.get("name") == "wall"
+            and candidate.get("targetPos") == [target.dump()]
+            for candidate in response["roleCommandMap"].values()
+        ))
+
+    def test_confirmed_wall_missing_on_the_same_day_is_not_rebuilt(self):
+        # Break caught: a transient same-day omission is treated as night damage.
+        payload = base_payload(round_no=5, team_id="s2-wall-same-day")
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 6, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+        target = engine.state.state.fortification_targets[0]
+        present = json.loads(json.dumps(payload))
+        present["roundNo"] = 6
+        present["teamOur"]["roles"].append(
+            unit(10050, "wall", target.x, target.y, health=100),
+        )
+        engine.decide(present)
+        missing = json.loads(json.dumps(payload))
+        missing["roundNo"] = 7
+        missing["teamOur"]["roles"][0]["pos"] = {
+            "x": target.x - 1, "y": target.y,
+        }
+        missing["teamOur"]["roles"][0]["backpack"] = ["stone"]
+
+        response = engine.decide(missing)
+
+        self.assertIn(target, engine.state.state.fortification_completed)
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            and command.get("targetPos") == [target.dump()]
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_unknown_wall_feedback_does_not_create_a_later_day_retry(self):
+        # Break caught: an unconfirmed build is treated as a destroyed real wall.
+        payload = base_payload(round_no=5, team_id="s2-wall-unknown-day-limit")
+        worker = unit(10010, "worker", 11, 8)
+        worker["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        engine = DecisionEngine()
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        target = Pos.load(first["targetPos"][0])
+        self.assertEqual(first.get("name"), "wall")
+
+        unknown = json.loads(json.dumps(payload))
+        unknown["roundNo"] = 6
+        unknown["lastRoundRoleActionResults"] = {}
+        same_day = engine.decide(unknown)
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            and command.get("targetPos") == [target.dump()]
+            for command in same_day["roleCommandMap"].values()
+        ))
+        self.assertIn(target, engine.state.state.fortification_failed)
+
+        next_day = json.loads(json.dumps(unknown))
+        next_day["roundNo"] = 132
+        next_day["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        retried = engine.decide(next_day)
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            and command.get("targetPos") == [target.dump()]
+            for command in retried["roleCommandMap"].values()
+        ))
+
     def test_dawn_release_and_short_task_gate_coexist(self):
         # Integration break caught: S2 dawn release bypasses the S1 task gate.
         payload = base_payload(

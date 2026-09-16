@@ -239,7 +239,7 @@ class ServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(record["buildId"], "nightwatch-r10-s2")
+        self.assertEqual(record["buildId"], "nightwatch-s2-defense-r1")
         self.assertEqual(
             record["team"], {"type": "challenger", "id": "s0-our"}
         )
