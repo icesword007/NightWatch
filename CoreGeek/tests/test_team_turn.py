@@ -6,7 +6,8 @@ from unittest import mock
 
 from agent import server as server_module
 from agent.brain import DecisionEngine
-from agent.protocol import Pos, Turn
+from agent.layout import plan_defense_layout
+from agent.protocol import Pos, Turn, distance
 from agent.state import PlanState, request_fingerprint
 
 
@@ -911,6 +912,145 @@ class TeamTurnTests(unittest.TestCase):
 
         self.assertEqual(built, [(12, 8), (12, 9)])
 
+    def test_two_towers_interleave_full_layout_third_rocket_and_dusk_return(self):
+        # Break caught: the wall state machine is disabled until all three towers
+        # exist, so available stone cannot form the front segment while the other
+        # worker funds the last rocket.
+        for enemy_x in (17, 1):
+            with self.subTest(enemy_x=enemy_x):
+                payload = base_payload(
+                    round_no=1, team_id=f"layout-interleave-{enemy_x}",
+                )
+                payload["teamOur"]["goldNum"] = 0
+                payload["teamOur"]["roles"] = [
+                    unit(10013, "station", 9, 9, health=1500),
+                ]
+                payload["teamEnemy"]["roles"] = [
+                    unit(20013, "station", enemy_x, 9, health=1500),
+                ]
+                plan = plan_defense_layout(Turn.load(payload))
+                direction_x = plan.direction.x
+                builder = unit(
+                    10010, "worker",
+                    plan.wall_targets[0].x - direction_x,
+                    plan.wall_targets[0].y,
+                )
+                builder["backpack"] = ["stone"] * 14
+                funder = unit(10012, "worker", 4, 2)
+                funder["backpack"] = ["copper"] * 5
+                payload["teamOur"]["roles"] = [
+                    builder,
+                    funder,
+                    unit(10011, "pioneer", 3, 3),
+                    unit(10013, "station", 9, 9, health=1500),
+                    unit(
+                        10020, "rocket",
+                        plan.tower_targets[0].x, plan.tower_targets[0].y,
+                        health=1000,
+                    ),
+                    unit(
+                        10030, "rocket",
+                        plan.tower_targets[1].x, plan.tower_targets[1].y,
+                        health=1000,
+                    ),
+                ]
+                payload["mapInfo"]["zones"] = [
+                    {"pos": {"x": 5, "y": 2}, "neutralType": "vendor"},
+                ]
+                payload["vendorShopList"] = [
+                    {"name": "copper", "price": 5},
+                ]
+                engine = DecisionEngine()
+                built_walls = []
+                wall_rounds = []
+                built_rocket_round = None
+
+                for _ in range(70):
+                    response = engine.decide(payload)
+                    feedback = {}
+                    for owner_id, command in response["roleCommandMap"].items():
+                        role_id = int(owner_id)
+                        role_entry = next(
+                            entry for entry in payload["teamOur"]["roles"]
+                            if entry["id"] == role_id
+                        )
+                        action = command["action"]
+                        if action == "move":
+                            role_entry["pos"] = dict(command["targetPos"][0])
+                        elif action == "sell":
+                            count = command.get("num", 1)
+                            for _ in range(count):
+                                role_entry["backpack"].remove(command["name"])
+                            payload["teamOur"]["goldNum"] += 5 * count
+                        elif action == "build" and command["name"] == "rocket":
+                            target = command["targetPos"][0]
+                            payload["teamOur"]["goldNum"] -= 25
+                            payload["teamOur"]["roles"].append(unit(
+                                10040, "rocket", target["x"], target["y"],
+                                health=1000,
+                            ))
+                            built_rocket_round = payload["roundNo"]
+                        elif action == "build" and command["name"] == "wall":
+                            target = command["targetPos"][0]
+                            role_entry["backpack"].remove("stone")
+                            built_walls.append(Pos(target["x"], target["y"]))
+                            wall_rounds.append(payload["roundNo"])
+                            payload["teamOur"]["roles"].append(unit(
+                                10100 + len(built_walls), "wall",
+                                target["x"], target["y"], health=1000,
+                            ))
+                        feedback[owner_id] = True
+                    payload["lastRoundRoleActionResults"] = feedback
+                    payload["roundNo"] += 1
+                    if payload["roundNo"] > 70:
+                        break
+
+                turn = Turn.load(payload)
+                controllers = turn.controllable()
+                staffed = {
+                    weapon.unit_id
+                    for weapon in turn.weapons()
+                    if any(distance(controller.pos, weapon.pos) == 1 for controller in controllers)
+                }
+
+                self.assertIsNotNone(built_rocket_round)
+                self.assertGreater(len(built_walls), 0)
+                self.assertLess(wall_rounds[0], built_rocket_round)
+                self.assertEqual(tuple(built_walls), plan.wall_targets)
+                self.assertEqual(len(turn.weapons()), 3)
+                self.assertEqual(
+                    len(staffed), 3,
+                    ([(role.unit_id, role.pos) for role in controllers],
+                     [(weapon.unit_id, weapon.pos) for weapon in turn.weapons()],
+                     engine.state.state.plans),
+                )
+                self.assertTrue(all(
+                    controller.pos not in plan.wall_targets
+                    for controller in controllers
+                ))
+
+    def test_two_tower_partial_layout_stops_for_dusk_positioning(self):
+        payload = base_payload(round_no=60, team_id="layout-two-tower-dusk")
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 11, 8),
+            unit(10012, "worker", 7, 8),
+            unit(10011, "pioneer", 7, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "rocket", 8, 8, health=1000),
+            unit(10030, "rocket", 8, 9, health=1000),
+        ]
+        payload["teamOur"]["roles"][0]["backpack"] = ["stone"] * 2
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertFalse(any(
+            command.get("name") == "wall"
+            for command in response["roleCommandMap"].values()
+        ))
+
     def test_fortification_does_not_start_when_builder_cannot_build_and_return(self):
         # Break caught: a fixed dusk threshold ignores the real mine/build/return route.
         payload = base_payload(round_no=57, team_id="brain-r8-wall-deadline")
@@ -973,8 +1113,12 @@ class TeamTurnTests(unittest.TestCase):
         )
         self.assertEqual(
             {command["name"] for command in commands.values()},
-            {"gatling", "railgun"},
+            {"rocket"},
         )
+        self.assertEqual(len({
+            tuple(command["targetPos"][0].values())
+            for command in commands.values()
+        }), 2)
 
     def test_night_decision_engine_emits_real_attack(self):
         # Break caught: defense candidates are never selected by the coordinator.
@@ -1019,14 +1163,14 @@ class TeamTurnTests(unittest.TestCase):
 
         self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
         self.assertEqual(engine.state.state.fortification_builder_id, 10010)
-        self.assertEqual(len(engine.state.state.fortification_targets), 6)
+        self.assertEqual(len(engine.state.state.fortification_targets), 14)
 
         following = json.loads(json.dumps(payload))
         following["roundNo"] = 6
         following["lastRoundRoleActionResults"] = {"10010": False}
         response = engine.decide(following)
         self.assertEqual(engine.state.state.fortification_builder_id, 10010)
-        self.assertEqual(len(engine.state.state.fortification_targets), 6)
+        self.assertEqual(len(engine.state.state.fortification_targets), 14)
 
     def test_two_workers_share_one_fortification_builder(self):
         # Break caught: both workers are assigned to the same construction chain.

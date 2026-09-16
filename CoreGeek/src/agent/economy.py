@@ -12,6 +12,7 @@ from .fortification import (
     remaining_wall_targets,
 )
 from .grid import next_step
+from .layout import ensure_defense_layout
 from .protocol import (
     PIONEER,
     STATION,
@@ -31,7 +32,6 @@ from .protocol import (
 from .state import SessionState
 
 MINERALS = ("stone", "iron", "copper")
-TOWER_ORDER = ("gatling", "railgun", "rocket")
 MAX_WEAPONS = 3
 MAX_MINE_CANDIDATES = 16
 MINE_SWITCH_MARGIN_PERCENT = 10
@@ -175,16 +175,25 @@ def _propose_economy(
     fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
 ) -> tuple[PlannedAction, ...]:
+    ensure_defense_layout(turn, state)
     candidates: list[PlannedAction] = []
     maintained_roles: set[int] = set()
     claimed_build_targets: set[Pos] = set()
-    claimed_tower_types: set[str] = set()
+    claimed_tower_types: Counter[str] = Counter()
     claimed_gold = 0
     failed_builds = {
         completed.pending.target
         for completed in state.action_history
         if completed.pending.action == "build"
         and completed.success is False
+        and completed.pending.target is not None
+        and completed.pending.source_session == state.session_index
+    }
+    unconfirmed_builds = {
+        completed.pending.target
+        for completed in state.action_history
+        if completed.pending.action == "build"
+        and completed.success is None
         and completed.pending.target is not None
         and completed.pending.source_session == state.session_index
     }
@@ -202,9 +211,10 @@ def _propose_economy(
         and state.fortification_builder_id is None
     )
     if need_wall and not state.fortification_targets:
-        state.fortification_targets = ordered_wall_targets(
-            turn, wall_build_positions(turn),
-        )[:max(MAX_WALL_TARGETS - len(turn.walls()), 0)]
+        state.fortification_targets = (
+            state.layout_wall_targets[:MAX_WALL_TARGETS]
+            or ordered_wall_targets(turn, wall_build_positions(turn))
+        )
     if (
         direct_wall_request
         and fortification_builder_id is None
@@ -350,8 +360,9 @@ def _propose_economy(
         if candidate is None:
             candidate = _tower_action(
                 turn,
+                state,
                 worker,
-                failed_builds | claimed_build_targets,
+                failed_builds | unconfirmed_builds | claimed_build_targets,
                 claimed_tower_types,
                 turn.gold - claimed_gold,
                 clock,
@@ -379,7 +390,9 @@ def _propose_economy(
                 and candidate.plan_target is not None
             ):
                 claimed_build_targets.add(candidate.plan_target)
-                claimed_tower_types.add(candidate.plan_reason.rsplit(":", 1)[1])
+                claimed_tower_types[
+                    candidate.plan_reason.rsplit(":", 1)[1]
+                ] += 1
             action = candidate.proposal.command["action"]
             if action == "build" and candidate.proposal.command.get("name") in TOWER_TYPES:
                 claimed_gold += 25
@@ -651,9 +664,10 @@ def _wall_action(
 
 def _tower_action(
     turn: Turn,
+    state: SessionState,
     worker: Unit,
     excluded: set[Pos],
-    claimed_types: set[str],
+    claimed_types: Counter[str],
     available_gold: int,
     clock: Callable[[], float],
     deadline: float,
@@ -663,24 +677,23 @@ def _tower_action(
     if (
         not turn.is_day
         or turn.station() is None
-        or len(weapons) + len(claimed_types) >= MAX_WEAPONS
+        or len(weapons) + sum(claimed_types.values()) >= MAX_WEAPONS
     ):
         return None
-    existing = Counter(weapon.kind for weapon in weapons)
-    kind = next((
-        candidate for candidate in TOWER_ORDER
-        if existing[candidate] == 0 and candidate not in claimed_types
-    ), None)
-    if kind is None:
-        kind = next((
-            candidate for candidate in TOWER_ORDER
-            if existing[candidate] + (candidate in claimed_types) < 3
-        ), None)
-    if kind is None:
-        return None
-    target = _nearest(worker.pos, (
+    kind = "rocket"
+    preferred = tuple(
+        pos for pos in state.layout_tower_targets
+        if pos not in excluded
+        and pos not in turn.occupied_cells()
+        and turn.land(pos)
+    )
+    fallback = tuple(
         pos for pos in weapon_build_positions(turn) if pos not in excluded
-    ))
+    )
+    target = _nearest(
+        worker.pos,
+        preferred if state.layout_tower_targets else fallback,
+    )
     if target is None:
         return None
     if turn.rounds_until_night < distance(worker.pos, target):

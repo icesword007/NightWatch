@@ -338,7 +338,7 @@ def _assessment_reasons(
 def _defense_dump(turn: Turn, state: Any) -> dict[str, Any]:
     walls = turn.walls()
     wall_positions = {wall.pos for wall in walls}
-    targets = tuple(state.fortification_targets[:6])
+    targets = tuple(state.fortification_targets)
     return {
         "stationHealth": turn.station().health if turn.station() is not None else 0,
         "controllableRoles": len(turn.controllable()),

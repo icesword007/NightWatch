@@ -84,9 +84,12 @@ def state_for(payload):
 
 
 def with_completed_wall_line(payload):
+    from agent.layout import plan_defense_layout
+
+    targets = plan_defense_layout(Turn.load(payload)).wall_targets
     payload["teamOur"]["roles"].extend(
-        role(10100 + offset, "wall", offset, 11, health=1000)
-        for offset in range(6)
+        role(10100 + offset, "wall", target.x, target.y, health=1000)
+        for offset, target in enumerate(targets)
     )
     return payload
 

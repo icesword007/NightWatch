@@ -50,8 +50,8 @@ def layout_turn(*, our_x, enemy_x):
 
 
 class FortificationTests(unittest.TestCase):
-    def test_left_base_uses_four_front_and_two_side_targets(self):
-        # Break caught: filling the whole front edge omits the required side wings.
+    def test_left_base_uses_continuous_front_and_two_side_targets(self):
+        # Break caught: a six-wall prefix omits the required continuous side wings.
         turn = layout_turn(our_x=9, enemy_x=17)
 
         targets = ordered_wall_targets(turn, wall_build_positions(turn))
@@ -62,20 +62,27 @@ class FortificationTests(unittest.TestCase):
             Pos(12, 9),
             Pos(12, 7),
             Pos(12, 10),
-            Pos(11, 6),
-            Pos(11, 11),
+            Pos(12, 6), Pos(12, 11),
+            Pos(11, 6), Pos(11, 11),
+            Pos(10, 6), Pos(10, 11),
+            Pos(9, 6), Pos(9, 11),
+            Pos(8, 6), Pos(8, 11),
         ))
 
-    def test_right_base_is_horizontal_mirror_and_stays_at_six_targets(self):
+    def test_right_base_is_horizontal_mirror_with_fourteen_targets(self):
         turn = layout_turn(our_x=9, enemy_x=1)
 
         targets = ordered_wall_targets(turn, wall_build_positions(turn))
 
         self.assertEqual(targets, (
             Pos(7, 8), Pos(7, 9), Pos(7, 7), Pos(7, 10),
+            Pos(7, 6), Pos(7, 11),
             Pos(8, 6), Pos(8, 11),
+            Pos(9, 6), Pos(9, 11),
+            Pos(10, 6), Pos(10, 11),
+            Pos(11, 6), Pos(11, 11),
         ))
-        self.assertEqual(len(targets), 6)
+        self.assertEqual(len(targets), 14)
 
     def test_missing_enemy_uses_current_map_horizontal_x_fallback(self):
         turn = layout_turn(our_x=2, enemy_x=17)
@@ -121,6 +128,8 @@ class FortificationTests(unittest.TestCase):
         engine.decide(payload)
 
         self.assertNotIn(Pos(12, 8), engine.state.state.fortification_targets)
+        self.assertFalse(engine.state.state.layout_complete)
+        self.assertIsNotNone(engine.state.state.layout_degraded_reason)
 
     def test_decision_trace_has_bounded_current_map_fortification_diagnostic(self):
         # Break caught: intranet cannot correlate wall intent with map direction.
@@ -154,7 +163,9 @@ class FortificationTests(unittest.TestCase):
         self.assertEqual(
             diagnostic["directionSource"], "current_map_horizontal_enemy_x",
         )
-        self.assertLessEqual(len(diagnostic["targets"]), 6)
+        self.assertLessEqual(len(diagnostic["targets"]), 14)
+        self.assertIn("towerGaps", diagnostic["layout"])
+        self.assertIn("wallGaps", diagnostic["layout"])
         self.assertEqual(diagnostic["builderId"], "10010")
         self.assertEqual(diagnostic["phase"], "mining")
 

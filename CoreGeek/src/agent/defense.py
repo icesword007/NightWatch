@@ -1,3 +1,4 @@
+import heapq
 import time
 from dataclasses import replace
 from typing import Callable
@@ -5,6 +6,7 @@ from typing import Callable
 from .actions import ActionProposal, PlannedAction
 from .fortification import gunner_stand_sort_key
 from .grid import next_step
+from .layout import preferred_gunner_stand
 from .protocol import PlayerTask, Pos, Robot, Turn, Unit, distance, move_command
 from .state import SessionState
 
@@ -12,6 +14,7 @@ DUSK_POSITIONING_ROUNDS = 12
 EMERGENCY_MEDICINE_HEALTH = 40
 TASK_RECALL_THREAT_DISTANCE = 3
 MIN_TASK_INTERACTION_ROUNDS = 5
+MAX_ROCKET_TARGET_CANDIDATES = 128
 
 
 def protected_gunners(turn: Turn) -> frozenset[int]:
@@ -28,6 +31,7 @@ def task_pioneer_recall_action(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
+    state: SessionState | None = None,
 ) -> PlannedAction | None:
     if turn.is_day or turn.station() is None:
         return None
@@ -63,6 +67,7 @@ def task_pioneer_recall_action(
                 continue
             route = _gunner_route(
                 turn, pioneer, weapon, clock, deadline, max_expansions,
+                state=state,
             )
             if route is None:
                 continue
@@ -78,6 +83,7 @@ def task_pioneer_recall_action(
                     continue
                 other_route = _gunner_route(
                     turn, role, weapon, clock, deadline, max_expansions,
+                    state=state,
                 )
                 if other_route is not None and other_route[2] <= threat_distance:
                     other_can_arrive = True
@@ -189,6 +195,7 @@ def _task_pioneer_day_return_assessment(
             continue
         route = _gunner_route(
             turn, pioneer, weapon, clock, deadline, max_expansions,
+            state=state,
         )
         other_can_arrive = False
         for role in turn.controllable():
@@ -196,6 +203,7 @@ def _task_pioneer_day_return_assessment(
                 continue
             other_route = _gunner_route(
                 turn, role, weapon, clock, deadline, max_expansions,
+                state=state,
             )
             if (
                 other_route is not None
@@ -363,11 +371,20 @@ def propose_defense(
         staffed_weapons.add(weapon.unit_id)
         if turn.is_day or weapon.cooldown > 0:
             continue
-        target = _select_target(turn, weapon, projected_damage)
-        if target is None:
-            continue
         target_count = 1 if weapon.kind == "railgun" else max(weapon.level, 1)
-        targets = [target.pos for _ in range(target_count)]
+        if weapon.kind == "rocket":
+            rocket_targets = _select_rocket_targets(
+                turn, weapon, target_count, projected_damage,
+                clock=clock, deadline=deadline, state=state,
+            )
+            if not rocket_targets:
+                continue
+            targets = [target.pos for target in rocket_targets]
+        else:
+            target = _select_target(turn, weapon, projected_damage)
+            if target is None:
+                continue
+            targets = [target.pos for _ in range(target_count)]
         candidates.append(PlannedAction(
             ActionProposal(
                 command_owner_id=weapon.unit_id,
@@ -381,9 +398,10 @@ def propose_defense(
             controller.pos,
             f"gunner:{weapon.unit_id}",
         ))
-        _apply_projected_damage(
-            turn, weapon, target, target_count, projected_damage,
-        )
+        if weapon.kind != "rocket":
+            _apply_projected_damage(
+                turn, weapon, target, target_count, projected_damage,
+            )
 
     if clock() >= deadline:
         return tuple(candidates)
@@ -432,6 +450,177 @@ def _select_target(
         choices,
         key=lambda robot: (threat_score(turn, robot), -robot.robot_id),
     )
+
+
+def _select_rocket_targets(
+    turn: Turn,
+    weapon: Unit,
+    count: int,
+    projected_damage: dict[int, int],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
+    state: SessionState | None = None,
+) -> tuple[Robot, ...]:
+    if count <= 0 or clock() >= deadline:
+        return ()
+    in_range = []
+    robots_by_pos: dict[Pos, list[Robot]] = {}
+    anchors = _rocket_threat_anchors(turn)
+    for index, robot in enumerate(turn.robots):
+        if index % 16 == 0 and clock() >= deadline:
+            return ()
+        if robot.health <= 0:
+            continue
+        robots_by_pos.setdefault(robot.pos, []).append(robot)
+        if distance(weapon.pos, robot.pos) <= weapon.range_of_attack():
+            in_range.append(robot)
+    if not in_range:
+        return ()
+    shortlisted = heapq.nsmallest(
+        MAX_ROCKET_TARGET_CANDIDATES,
+        in_range,
+        key=lambda robot: (
+            -_rocket_threat_layer(turn, robot, anchors, state)[0],
+            -_rocket_threat_layer(turn, robot, anchors, state)[1],
+            *(-value for value in threat_score(turn, robot)),
+            robot.robot_id,
+        ),
+    )
+    selected: list[Robot] = []
+    local_projected = dict(projected_damage)
+    for _ in range(count):
+        if clock() >= deadline:
+            if not selected:
+                return ()
+            filler = selected[-1]
+            while len(selected) < count:
+                selected.append(filler)
+                _apply_rocket_projected_damage(
+                    robots_by_pos, filler.pos, local_projected,
+                )
+            break
+        uncovered = [
+            robot for robot in shortlisted
+            if local_projected.get(robot.robot_id, 0) < robot.health
+        ]
+        if not uncovered:
+            if selected:
+                filler = selected[-1]
+                while len(selected) < count:
+                    selected.append(filler)
+                    _apply_rocket_projected_damage(
+                        robots_by_pos, filler.pos, local_projected,
+                    )
+            break
+        best_layer = max(
+            _rocket_threat_layer(turn, robot, anchors, state)
+            for robot in uncovered
+        )
+        choices = [
+            robot for robot in uncovered
+            if _rocket_threat_layer(turn, robot, anchors, state) == best_layer
+        ]
+        target = max(
+            choices,
+            key=lambda robot: (
+                _rocket_effective_damage(
+                    turn, robot.pos, local_projected, robots_by_pos,
+                ),
+                threat_score(turn, robot),
+                -robot.robot_id,
+            ),
+        )
+        selected.append(target)
+        _apply_rocket_projected_damage(
+            robots_by_pos, target.pos, local_projected,
+        )
+    if len(selected) != count:
+        return ()
+    projected_damage.update(local_projected)
+    return tuple(selected)
+
+
+def _rocket_threat_anchors(turn: Turn) -> tuple[Pos, ...]:
+    station = turn.station()
+    anchors = [weapon.pos for weapon in turn.weapons()]
+    if station is not None:
+        anchors.extend(turn.footprint(station))
+    anchors.extend(
+        role.pos
+        for role in turn.controllable()
+        if any(distance(role.pos, weapon.pos) == 1 for weapon in turn.weapons())
+    )
+    return tuple(dict.fromkeys(anchors))
+
+
+def _rocket_threat_layer(
+    turn: Turn,
+    robot: Robot,
+    anchors: tuple[Pos, ...] | None = None,
+    state: SessionState | None = None,
+) -> tuple[int, int]:
+    station = turn.station()
+    anchors = anchors if anchors is not None else _rocket_threat_anchors(turn)
+    proximity = min((distance(robot.pos, anchor) for anchor in anchors), default=9999)
+    behind = False
+    if station is not None:
+        enemy_station = next(
+            (unit for unit in turn.enemies if unit.kind == "station"), None,
+        )
+        direction_x = (
+            state.layout_direction[0]
+            if state is not None and state.layout_initialized
+            else 1 if enemy_station is not None and enemy_station.pos.x > station.pos.x
+            else -1 if enemy_station is not None else 1
+        )
+        behind = (robot.pos.x - station.pos.x) * direction_x < 0
+    return (
+        int(robot.target_team == turn.team_type),
+        int(proximity <= TASK_RECALL_THREAT_DISTANCE or behind),
+    )
+
+
+def _rocket_effective_damage(
+    turn: Turn,
+    target: Pos,
+    projected_damage: dict[int, int],
+    robots_by_pos: dict[Pos, list[Robot]] | None = None,
+) -> int:
+    total = 0
+    if robots_by_pos is None:
+        victims = turn.robots
+    else:
+        victims = tuple(
+            robot
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for robot in robots_by_pos.get(Pos(target.x + dx, target.y + dy), ())
+        )
+    for robot in victims:
+        splash_distance = distance(robot.pos, target)
+        if splash_distance <= 1:
+            remaining = max(
+                robot.health - projected_damage.get(robot.robot_id, 0), 0,
+            )
+            damage = 20 if splash_distance == 0 else 10
+            total += min(damage, remaining)
+    return total
+
+
+def _apply_rocket_projected_damage(
+    robots_by_pos: dict[Pos, list[Robot]],
+    target: Pos,
+    projected: dict[int, int],
+) -> None:
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            pos = Pos(target.x + dx, target.y + dy)
+            per_missile = 20 if dx == 0 and dy == 0 else 10
+            for robot in robots_by_pos.get(pos, ()):
+                projected[robot.robot_id] = (
+                    projected.get(robot.robot_id, 0) + per_missile
+                )
 
 
 def _apply_projected_damage(
@@ -612,10 +801,12 @@ def _route_assignments(
     respect_positioning_window: bool = True,
 ) -> dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]]:
     routes: dict[tuple[int, int], tuple[Pos, Pos | None, int]] = {}
+    positioning_window = DUSK_POSITIONING_ROUNDS + max(len(weapons) - 1, 0)
     for role in roles:
         for weapon in weapons:
             route = _gunner_route(
                 turn, role, weapon, clock, deadline, max_expansions,
+                state=state,
             )
             if route is None:
                 continue
@@ -623,7 +814,7 @@ def _route_assignments(
             if (
                 respect_positioning_window
                 and turn.is_day
-                and turn.rounds_until_night > DUSK_POSITIONING_ROUNDS
+                and turn.rounds_until_night > positioning_window
                 and route[2] < turn.rounds_until_night
                 and (
                     planned is None
@@ -694,6 +885,7 @@ def _gunner_route(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
+    state: SessionState | None = None,
 ) -> tuple[Pos, Pos | None, int] | None:
     blocked = turn.blocked(role)
     choices = [
@@ -705,7 +897,10 @@ def _gunner_route(
     legal = [
         pos for pos in choices if turn.land(pos) and pos not in blocked
     ]
-    legal.sort(key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
+    preferred = preferred_gunner_stand(turn, weapon.pos, state)
+    legal.sort(key=lambda pos: (
+        pos != preferred, distance(role.pos, pos), pos.x, pos.y,
+    ))
     found = []
     for stand in legal:
         path = next_step(
@@ -739,7 +934,9 @@ def _gunner_route(
     if timely:
         def timely_key(route: tuple[Pos, Pos | None, int]) -> tuple[int, ...]:
             protection = gunner_stand_sort_key(turn, weapon.pos, route[0])
-            return protection[:1] + (route[2],) + protection[1:]
+            return (int(route[0] != preferred),) + protection[:1] + (
+                route[2],
+            ) + protection[1:]
 
         return min(timely, key=timely_key)
     return min(found, key=lambda route: (

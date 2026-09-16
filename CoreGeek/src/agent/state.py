@@ -144,6 +144,16 @@ class SessionState:
     news_skip_reason: str | None = None
     late_tool_results: int = 0
     task_environment_paths: list[str] = field(default_factory=list)
+    layout_initialized: bool = False
+    layout_direction: tuple[int, int] = (1, 0)
+    layout_direction_source: str = "uninitialized"
+    layout_tower_targets: tuple[Pos, ...] = ()
+    layout_gunner_stands: tuple[Pos, ...] = ()
+    layout_wall_targets: tuple[Pos, ...] = ()
+    layout_exit_cells: tuple[Pos, ...] = ()
+    layout_complete: bool = False
+    layout_degraded_reason: str | None = None
+    layout_observed_deviation: str | None = None
     fortification_initialized: bool = False
     fortification_builder_id: int | None = None
     fortification_targets: tuple[Pos, ...] = ()

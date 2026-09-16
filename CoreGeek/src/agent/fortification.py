@@ -4,9 +4,14 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from .grid import next_step
+from .layout import (
+    MAX_LAYOUT_WALLS,
+    layout_diagnostic,
+    plan_defense_layout,
+)
 from .protocol import ROUNDS_PER_DAY, STATION, Pos, Turn, distance
 
-MAX_WALL_TARGETS = 6
+MAX_WALL_TARGETS = MAX_LAYOUT_WALLS
 MAX_WALL_BATCH = 2
 MAX_TEMPORARY_RECHECKS = 2
 
@@ -19,76 +24,18 @@ class DirectionPrior:
 
 
 def direction_prior(turn: Turn) -> DirectionPrior:
-    station = turn.station()
-    if station is None:
-        return DirectionPrior(1, 0, "current_map_horizontal_no_station")
-    enemy_station = next(
-        (
-            unit for unit in turn.enemies
-            if unit.kind == STATION and unit.health > 0
-        ),
-        None,
+    plan = plan_defense_layout(turn)
+    return DirectionPrior(
+        plan.direction.x, plan.direction.y, plan.direction_source,
     )
-    if enemy_station is not None and enemy_station.pos.x != station.pos.x:
-        return DirectionPrior(
-            1 if enemy_station.pos.x > station.pos.x else -1,
-            0,
-            "current_map_horizontal_enemy_x",
-        )
-    station_center_x2 = station.pos.x * 2 + 1
-    map_center_x2 = turn.width - 1
-    if station_center_x2 != map_center_x2:
-        return DirectionPrior(
-            1 if station_center_x2 < map_center_x2 else -1,
-            0,
-            "current_map_horizontal_map_center_x",
-        )
-    return DirectionPrior(1, 0, "current_map_horizontal_equal_x_fallback")
 
 
 def ordered_wall_targets(
     turn: Turn,
     candidates: tuple[Pos, ...],
 ) -> tuple[Pos, ...]:
-    station = turn.station()
-    if station is None:
-        return ()
-    direction = direction_prior(turn)
-    center_x2 = station.pos.x * 2 + 1
-    center_y2 = station.pos.y * 2 - 1
-
-    def coordinates(pos: Pos) -> tuple[int, int]:
-        relative_x2 = pos.x * 2 - center_x2
-        relative_y2 = pos.y * 2 - center_y2
-        forward = relative_x2 * direction.dx + relative_y2 * direction.dy
-        cross = relative_y2 if direction.dx else relative_x2
-        return forward, cross
-
-    scored = [(pos, *coordinates(pos)) for pos in candidates]
-    if not scored:
-        return ()
-    front_edge = max(forward for _, forward, _ in scored)
-    front = sorted(
-        (entry for entry in scored if entry[1] == front_edge),
-        key=lambda entry: (abs(entry[2]), entry[2], entry[0].x, entry[0].y),
-    )[:4]
-    chosen = [entry[0] for entry in front]
-    for side in (-1, 1):
-        flank = [
-            entry for entry in scored
-            if entry[0] not in chosen
-            and entry[1] < front_edge
-            and entry[1] >= 0
-            and (entry[2] < 0 if side < 0 else entry[2] > 0)
-        ]
-        if flank:
-            chosen.append(max(
-                flank,
-                key=lambda entry: (
-                    abs(entry[2]), entry[1], -entry[0].x, -entry[0].y,
-                ),
-            )[0])
-    return tuple(chosen[:MAX_WALL_TARGETS])
+    del candidates
+    return plan_defense_layout(turn).wall_targets
 
 
 def safe_wall_targets(
@@ -97,7 +44,14 @@ def safe_wall_targets(
 ) -> tuple[Pos, ...]:
     accepted = []
     projected_zones = dict(turn.zones)
-    for target in ordered_wall_targets(turn, candidates):
+    planned = ordered_wall_targets(turn, candidates)
+    requested = set(candidates)
+    targets = (
+        tuple(target for target in planned if target in requested)
+        if requested and requested.issubset(set(planned))
+        else planned
+    )
+    for target in targets:
         trial_zones = dict(projected_zones)
         trial_zones[target] = "wall"
         if not _has_distinct_weapon_stands(turn, trial_zones):
@@ -125,13 +79,17 @@ def _has_distinct_weapon_stands(
         for cell in turn.footprint(unit)
     }
     choices = []
-    for weapon in turn.weapons():
+    weapon_positions = list(dict.fromkeys(
+        [weapon.pos for weapon in turn.weapons()]
+        + list(plan_defense_layout(turn).tower_targets)
+    ))[:3]
+    for weapon_pos in weapon_positions:
         legal = tuple(
             pos
             for dx in (-1, 0, 1)
             for dy in (-1, 0, 1)
             if (dx or dy)
-            for pos in (Pos(weapon.pos.x + dx, weapon.pos.y + dy),)
+            for pos in (Pos(weapon_pos.x + dx, weapon_pos.y + dy),)
             if (
                 0 <= pos.x < turn.width
                 and 0 <= pos.y < turn.height
@@ -256,24 +214,37 @@ def prepare_fortification(
     deadline: float = float("inf"),
     max_expansions: int = 256,
 ) -> int | None:
-    if not turn.is_day or len(turn.weapons()) < 3 or turn.station() is None:
+    if not turn.is_day or len(turn.weapons()) < 2 or turn.station() is None:
         state.fortification_phase = "waiting"
         state.fortification_skip_reason = "tower_line_or_day"
+        return None
+    partial_tower_line = len(turn.weapons()) == 2
+    partial_builders = [
+        worker for worker in turn.workers()
+        if "stone" in worker.backpack
+        and not _worker_protected(worker, state, reserved_role_ids)
+    ]
+    if partial_tower_line and (
+        len(turn.workers()) < 2 or not partial_builders
+    ):
+        state.fortification_phase = "waiting"
+        state.fortification_skip_reason = "third_tower_priority"
         return None
     if not state.fortification_initialized:
         state.fortification_planning_day = (
             turn.round_no - 1
         ) // ROUNDS_PER_DAY + 1
-        remaining = max(MAX_WALL_TARGETS - len(turn.walls()), 0)
         state.fortification_targets = safe_wall_targets(
             turn, candidates,
-        )[:remaining]
+        )[:MAX_WALL_TARGETS]
+        if len(state.fortification_targets) < len(state.layout_wall_targets):
+            state.layout_complete = False
+            if state.layout_degraded_reason is None:
+                state.layout_degraded_reason = "layout_access_or_construction_gap"
         state.fortification_initialized = True
         if not state.fortification_targets:
-            state.fortification_phase = "complete" if remaining == 0 else "waiting"
-            state.fortification_skip_reason = (
-                None if remaining == 0 else "no_safe_targets"
-            )
+            state.fortification_phase = "waiting"
+            state.fortification_skip_reason = "no_safe_targets"
             return None
     occupied_walls = {wall.pos for wall in turn.walls()}
     state.fortification_completed.update(
@@ -319,6 +290,7 @@ def prepare_fortification(
         eligible = [
             worker for worker in turn.workers()
             if not _worker_protected(worker, state, reserved_role_ids)
+            and (not partial_tower_line or "stone" in worker.backpack)
         ]
         if not eligible:
             state.fortification_phase = "waiting"
@@ -328,6 +300,7 @@ def prepare_fortification(
         builder = min(
             eligible,
             key=lambda worker: (
+                "stone" not in worker.backpack,
                 distance(worker.pos, first_target), worker.unit_id,
             ),
         )
@@ -572,16 +545,19 @@ def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
         for _, plan in sorted(state.plans.items())
         if plan.reason.startswith("gunner:")
     ][:3]
-    return {
+    result = {
         "direction": {"x": direction.dx, "y": direction.dy},
         "directionSource": direction.source,
-        "targets": [target.dump() for target in state.fortification_targets[:6]],
+        "targets": [
+            target.dump() for target in state.fortification_targets[:MAX_WALL_TARGETS]
+        ],
         "batchTargets": [
             target.dump() for target in state.fortification_batch_targets[:2]
         ],
         "completed": len(state.fortification_completed),
         "observedFixedWalls": sum(
-            target in wall_positions for target in state.fortification_targets[:6]
+            target in wall_positions
+            for target in state.fortification_targets[:MAX_WALL_TARGETS]
         ),
         "missingConfirmedWalls": sum(
             target not in wall_positions
@@ -589,7 +565,7 @@ def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
         ),
         "recoveryTargets": [
             target.dump()
-            for target in state.fortification_targets[:6]
+            for target in state.fortification_targets[:MAX_WALL_TARGETS]
             if target in state.fortification_recovery_targets
         ],
         "attemptsToday": sum(
@@ -606,6 +582,8 @@ def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
         "skipReason": state.fortification_skip_reason,
         "gunnerStands": gunner_stands,
     }
+    result["layout"] = layout_diagnostic(turn, state)
+    return result
 
 
 def _can_build_and_return(

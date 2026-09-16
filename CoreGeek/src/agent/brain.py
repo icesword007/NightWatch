@@ -17,6 +17,7 @@ from .defense_pressure import pressure_diagnostic
 from .economy import propose_economy, wall_build_positions
 from .fortification import fortification_diagnostic, prepare_fortification
 from .intelligence import MAX_NEWS_CALLS_PER_DAY, MAX_NEWS_CANDIDATES
+from .layout import ensure_defense_layout
 from .protocol import (
     ROUNDS_PER_DAY,
     TOWER_TYPES,
@@ -90,6 +91,7 @@ class DecisionEngine:
 
             allocator = ActionAllocator(turn)
             state = self.state.state
+            ensure_defense_layout(turn, state)
             task_role_ids = self._active_task_role_ids(turn, state)
             task_pioneer = next((
                 turn.unit(role_id) for role_id in task_role_ids
@@ -172,6 +174,7 @@ class DecisionEngine:
                     clock=self.clock,
                     deadline=deadline,
                     max_expansions=self.max_search_expansions,
+                    state=state,
                 )
                 if task_pioneer is not None
                 else None
@@ -707,7 +710,7 @@ class DecisionEngine:
         if (
             not turn.is_day
             or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
-            or len(turn.weapons()) < 3
+            or len(turn.weapons()) < 2
         ):
             return False
         return bool(state.fortification_targets)
