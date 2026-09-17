@@ -156,11 +156,15 @@ class SessionState:
     layout_complete: bool = False
     layout_degraded_reason: str | None = None
     layout_observed_deviation: str | None = None
+    day_return_day: int | None = None
+    day_return_weapons: dict[int, int] = field(default_factory=dict)
+    day_return_stands: dict[int, Pos] = field(default_factory=dict)
     fortification_initialized: bool = False
     fortification_builder_id: int | None = None
     fortification_targets: tuple[Pos, ...] = ()
     fortification_batch_targets: tuple[Pos, ...] = ()
     fortification_batch_signature: str | None = None
+    fortification_return_stand: Pos | None = None
     fortification_builder_snapshot: tuple[Pos, tuple[str, ...]] | None = None
     fortification_completed: set[Pos] = field(default_factory=set)
     fortification_observed_days: dict[Pos, int] = field(default_factory=dict)

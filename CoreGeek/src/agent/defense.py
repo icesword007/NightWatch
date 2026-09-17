@@ -9,6 +9,7 @@ from .grid import next_step
 from .layout import preferred_gunner_stand
 from .protocol import (
     DUSK_POSITIONING_ROUNDS,
+    ROUNDS_PER_DAY,
     PlayerTask,
     Pos,
     Robot,
@@ -23,6 +24,229 @@ EMERGENCY_MEDICINE_HEALTH = 40
 TASK_RECALL_THREAT_DISTANCE = 3
 MIN_TASK_INTERACTION_ROUNDS = 5
 MAX_ROCKET_TARGET_CANDIDATES = 128
+DAY_WORK_RETURN_MARGIN = 2
+DAY_WORK_MINERALS = ("stone", "iron", "copper")
+
+
+def daytime_post_assignments(
+    turn: Turn,
+    state: SessionState,
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    unavailable_role_ids: frozenset[int] = frozenset(),
+    reserved_weapon_ids: frozenset[int] = frozenset(),
+) -> dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]] | None:
+    """Return one bounded, deterministic role/stand assignment per weapon."""
+    if not turn.is_day or clock() >= deadline:
+        return None
+    day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+    if state.day_return_day != day:
+        state.day_return_day = day
+        state.day_return_weapons.clear()
+        state.day_return_stands.clear()
+    available = [
+        role for role in turn.controllable()
+        if role.unit_id not in unavailable_role_ids
+        and not _needs_emergency_medicine(role)
+    ]
+    weapons = [
+        weapon for weapon in turn.weapons()
+        if weapon.unit_id not in reserved_weapon_ids
+    ]
+    result = _route_assignments(
+        turn,
+        state,
+        available,
+        weapons,
+        clock,
+        deadline,
+        max_expansions,
+        respect_positioning_window=False,
+    )
+    if clock() >= deadline:
+        return None
+    state.day_return_weapons = {
+        role.unit_id: weapon_id
+        for weapon_id, (role, _) in result.items()
+    }
+    state.day_return_stands = {
+        role.unit_id: route[0]
+        for role, route in result.values()
+    }
+    return result
+
+
+def daytime_work_can_return(
+    turn: Turn,
+    worker: Unit,
+    candidate: PlannedAction,
+    assigned_route: tuple[Pos, Pos | None, int],
+    assignments: dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]],
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    safety_margin: int = DAY_WORK_RETURN_MARGIN,
+) -> bool:
+    """Check one finite work commitment and return to its exact assigned stand."""
+    if not turn.is_day or clock() >= deadline:
+        return False
+    completion = _day_work_completion(
+        turn, worker, candidate, clock, deadline, max_expansions,
+    )
+    if completion is None:
+        return False
+    work_rounds, work_pos, projected_zones = completion
+    projected_ours = []
+    assigned_positions = {
+        role.unit_id: route[0]
+        for role, route in assignments.values()
+        if role.unit_id != worker.unit_id
+    }
+    for unit in turn.ours:
+        if unit.unit_id == worker.unit_id:
+            projected_ours.append(replace(unit, pos=work_pos))
+        elif unit.unit_id in assigned_positions:
+            projected_ours.append(replace(
+                unit, pos=assigned_positions[unit.unit_id],
+            ))
+        else:
+            projected_ours.append(unit)
+    projected_worker = replace(worker, pos=work_pos)
+    projected_turn = replace(
+        turn, ours=tuple(projected_ours), zones=projected_zones,
+    )
+    result = next_step(
+        projected_turn,
+        projected_worker,
+        assigned_route[0],
+        clock=clock,
+        deadline=deadline,
+        max_expansions=max_expansions,
+    )
+    if result.status == "already_there":
+        return_rounds = 0
+    elif result.status == "found" and result.cost is not None:
+        return_rounds = result.cost
+    else:
+        return False
+    return (
+        work_rounds + return_rounds + safety_margin
+        <= turn.rounds_until_night
+    )
+
+
+def _day_work_completion(
+    turn: Turn,
+    worker: Unit,
+    candidate: PlannedAction,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[int, Pos, dict[Pos, str]] | None:
+    command = candidate.proposal.command
+    action = command.get("action")
+    reason = candidate.plan_reason or ""
+    target = candidate.plan_target
+    supported = (
+        action in ("collect", "sell", "build")
+        or action == "move"
+        and target is not None
+        and reason.startswith(("mine:", "vendor", "build:"))
+    )
+    if not supported:
+        return None
+    work_pos = worker.pos
+    work_rounds = 1
+    if action == "move":
+        route = _day_work_route(
+            turn, worker, target, clock, deadline, max_expansions,
+        )
+        if route is None or route[2] != candidate.proposal.destination:
+            return None
+        work_pos, travel_rounds, _ = route
+        work_rounds = travel_rounds + 1
+    sale_actions = len({
+        item for item in worker.backpack if item in DAY_WORK_MINERALS
+    })
+    if action == "sell":
+        work_rounds = max(sale_actions, 1)
+    elif action == "move" and reason == "vendor":
+        work_rounds = travel_rounds + max(sale_actions, 1)
+    projected_zones = dict(turn.zones)
+    if reason.startswith("build:") or action == "build":
+        if target is None:
+            return None
+        projected_zones[target] = reason.split(":", 1)[1]
+    if action == "collect" or action == "move" and reason.startswith("mine:"):
+        mine = target
+        if mine is None:
+            return None
+        if not turn.zones_of("vendor"):
+            if turn.rounds_until_night > DUSK_POSITIONING_ROUNDS:
+                return work_rounds, work_pos, projected_zones
+            return None
+        projected_worker = replace(worker, pos=work_pos)
+        vendor_routes = [
+            route
+            for vendor in turn.zones_of("vendor")
+            if (route := _day_work_route(
+                turn, projected_worker, vendor, clock, deadline,
+                max_expansions,
+            )) is not None
+        ]
+        if not vendor_routes:
+            return None
+        work_pos, vendor_rounds, _ = min(
+            vendor_routes, key=lambda route: (route[1], route[0].x, route[0].y),
+        )
+        mineral = turn.zones.get(mine)
+        sale_actions = len({
+            item for item in (*worker.backpack, mineral)
+            if item in DAY_WORK_MINERALS
+        })
+        work_rounds += vendor_rounds + max(sale_actions, 1)
+    return work_rounds, work_pos, projected_zones
+
+
+def _day_work_route(
+    turn: Turn,
+    worker: Unit,
+    target: Pos,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[Pos, int, Pos | None] | None:
+    blocked = turn.blocked(worker)
+    stands = sorted(
+        (
+            Pos(target.x + dx, target.y + dy)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            if dx or dy
+        ),
+        key=lambda pos: (distance(worker.pos, pos), pos.x, pos.y),
+    )
+    for stand in stands:
+        if not turn.land(stand) or stand in blocked:
+            continue
+        path = next_step(
+            turn,
+            worker,
+            stand,
+            clock=clock,
+            deadline=deadline,
+            max_expansions=max_expansions,
+        )
+        if path.status == "already_there":
+            return stand, 0, None
+        if path.status == "found" and path.cost is not None:
+            return stand, path.cost, path.step
+        if path.status == "deadline":
+            return None
+    return None
 
 
 def night_clearance_status(turn: Turn) -> str:
@@ -384,6 +608,10 @@ def propose_defense(
     unavailable_role_ids: frozenset[int] = frozenset(),
     reserved_weapon_ids: frozenset[int] = frozenset(),
     night_cleared: bool = False,
+    daytime_assignments: dict[
+        int, tuple[Unit, tuple[Pos, Pos | None, int]]
+    ] | None = None,
+    urgent_day_return_ids: frozenset[int] = frozenset(),
 ) -> tuple[PlannedAction, ...]:
     if night_cleared:
         return ()
@@ -449,6 +677,8 @@ def propose_defense(
         deadline,
         max_expansions,
         unavailable_role_ids,
+        daytime_assignments=daytime_assignments,
+        urgent_day_return_ids=urgent_day_return_ids,
     ))
     return tuple(candidates)
 
@@ -737,7 +967,8 @@ def _adjacent_assignments(
             planned = 0
             if state is not None:
                 planned = sum(
-                    state.plans.get(role.unit_id) is not None
+                    state.day_return_weapons.get(role.unit_id) == weapon_id
+                    or state.plans.get(role.unit_id) is not None
                     and state.plans[role.unit_id].reason == f"gunner:{weapon_id}"
                     for weapon_id, role in assigned.items()
                 )
@@ -785,6 +1016,11 @@ def _position_gunners(
     deadline: float,
     max_expansions: int,
     unavailable_role_ids: frozenset[int],
+    *,
+    daytime_assignments: dict[
+        int, tuple[Unit, tuple[Pos, Pos | None, int]]
+    ] | None = None,
+    urgent_day_return_ids: frozenset[int] = frozenset(),
 ) -> list[PlannedAction]:
     result = []
     available = [
@@ -797,15 +1033,38 @@ def _position_gunners(
         weapon for weapon in turn.weapons()
         if weapon.unit_id not in staffed_weapons
     ]
-    assignments = _route_assignments(
-        turn, state, available, unstaffed, clock, deadline, max_expansions,
+    assignments = (
+        {
+            weapon.unit_id: daytime_assignments[weapon.unit_id]
+            for weapon in unstaffed
+            if weapon.unit_id in daytime_assignments
+            and daytime_assignments[weapon.unit_id][0] in available
+        }
+        if turn.is_day and daytime_assignments is not None
+        else _route_assignments(
+            turn, state, available, unstaffed, clock, deadline, max_expansions,
+        )
     )
+    positioning_window = DUSK_POSITIONING_ROUNDS + max(len(unstaffed) - 1, 0)
     for weapon in unstaffed:
         assigned = assignments.get(weapon.unit_id)
         if assigned is None:
             continue
         role, route = assigned
         stand, step, route_cost = route
+        planned = state.plans.get(role.unit_id)
+        if (
+            turn.is_day
+            and daytime_assignments is not None
+            and role.unit_id not in urgent_day_return_ids
+            and turn.rounds_until_night > positioning_window
+            and route_cost < turn.rounds_until_night
+            and (
+                planned is None
+                or planned.reason != f"gunner:{weapon.unit_id}"
+            )
+        ):
+            continue
         if step is None:
             used_roles.add(role.unit_id)
             continue
@@ -870,6 +1129,7 @@ def _route_assignments(
     def search(
         index: int,
         used_roles: set[int],
+        used_stands: set[Pos],
         assigned: dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]],
     ) -> None:
         nonlocal best, best_score, best_pairs
@@ -878,7 +1138,8 @@ def _route_assignments(
                 sum(route[2] <= turn.rounds_until_night for _, route in assigned.values()),
                 len(assigned),
                 sum(
-                    state.plans.get(role.unit_id) is not None
+                    state.day_return_weapons.get(role.unit_id) == weapon_id
+                    or state.plans.get(role.unit_id) is not None
                     and state.plans[role.unit_id].reason == f"gunner:{weapon_id}"
                     for weapon_id, (role, _) in assigned.items()
                 ),
@@ -898,18 +1159,24 @@ def _route_assignments(
                 best_pairs = pairs
             return
         weapon = weapons[index]
-        search(index + 1, used_roles, assigned)
+        search(index + 1, used_roles, used_stands, assigned)
         for role in roles:
             route = routes.get((role.unit_id, weapon.unit_id))
-            if route is None or role.unit_id in used_roles:
+            if (
+                route is None
+                or role.unit_id in used_roles
+                or route[0] in used_stands
+            ):
                 continue
             used_roles.add(role.unit_id)
+            used_stands.add(route[0])
             assigned[weapon.unit_id] = (role, route)
-            search(index + 1, used_roles, assigned)
+            search(index + 1, used_roles, used_stands, assigned)
             assigned.pop(weapon.unit_id)
+            used_stands.remove(route[0])
             used_roles.remove(role.unit_id)
 
-    search(0, set(), {})
+    search(0, set(), set(), {})
     return best
 
 
@@ -932,9 +1199,18 @@ def _gunner_route(
     legal = [
         pos for pos in choices if turn.land(pos) and pos not in blocked
     ]
+    stable = None
+    if (
+        state is not None
+        and state.day_return_weapons.get(role.unit_id) == weapon.unit_id
+        and state.day_return_stands.get(role.unit_id) in legal
+    ):
+        stable = state.day_return_stands[role.unit_id]
     preferred = preferred_gunner_stand(turn, weapon.pos, state)
     legal.sort(key=lambda pos: (
-        pos != preferred, distance(role.pos, pos), pos.x, pos.y,
+        pos != stable if stable is not None else pos != preferred,
+        pos != preferred,
+        distance(role.pos, pos), pos.x, pos.y,
     ))
     found = []
     for stand in legal:
@@ -947,7 +1223,11 @@ def _gunner_route(
             max_expansions=max_expansions,
         )
         if path.status == "already_there":
-            return stand, None, 0
+            candidate = (stand, None, 0)
+            if not turn.is_day or stable is None or stand == stable:
+                return candidate
+            found.append(candidate)
+            continue
         if (
             path.status == "found"
             and path.step is not None
@@ -969,7 +1249,10 @@ def _gunner_route(
     if timely:
         def timely_key(route: tuple[Pos, Pos | None, int]) -> tuple[int, ...]:
             protection = gunner_stand_sort_key(turn, weapon.pos, route[0])
-            return (int(route[0] != preferred),) + protection[:1] + (
+            return (
+                int(stable is not None and route[0] != stable),
+                int(route[0] != preferred),
+            ) + protection[:1] + (
                 route[2],
             ) + protection[1:]
 

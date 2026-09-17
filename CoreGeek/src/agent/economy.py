@@ -1719,7 +1719,6 @@ def _trade_or_mine(
             )
         if (
             worker.backpack_full
-            or turn.is_day and turn.rounds_until_night <= 12
             or not turn.is_day and not night_cleared
         ):
             target = _nearest(worker.pos, vendors)
@@ -1786,6 +1785,32 @@ def _trade_or_mine(
         max_expansions,
         excluded_targets=failed_mines,
     )
+
+
+def daytime_liquidation_actions(
+    turn: Turn,
+    worker: Unit,
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[PlannedAction, ...]:
+    """Return bounded sale candidates for inventory already earned."""
+    if not any(item in MINERALS for item in worker.backpack):
+        return ()
+    result = []
+    for vendor in sorted(
+        turn.zones_of("vendor"),
+        key=lambda pos: (distance(worker.pos, pos), pos.x, pos.y),
+    ):
+        if clock() >= deadline:
+            break
+        candidate = _sell_or_move(
+            turn, worker, vendor, clock, deadline, max_expansions,
+        )
+        if candidate is not None:
+            result.append(candidate)
+    return tuple(result)
 
 
 def _single_funding_action(

@@ -257,6 +257,7 @@ def prepare_fortification(
     deadline: float = float("inf"),
     max_expansions: int = 256,
     reserved_rounds: int = 0,
+    return_stands: dict[int, Pos] | None = None,
 ) -> int | None:
     if not turn.is_day or len(turn.weapons()) < 2 or turn.station() is None:
         state.fortification_phase = "waiting"
@@ -371,6 +372,20 @@ def prepare_fortification(
         state.fortification_batch_signature = None
         state.fortification_builder_snapshot = None
     continuing_batch = bool(batch_targets)
+    builder_return_stand = (return_stands or {}).get(builder.unit_id)
+    planning_turn = replace(
+        turn,
+        ours=tuple(
+            replace(unit, pos=return_stands[unit.unit_id])
+            if (
+                return_stands is not None
+                and unit.unit_id != builder.unit_id
+                and unit.unit_id in return_stands
+            )
+            else unit
+            for unit in turn.ours
+        ),
+    )
     progress_confirmed = (
         continuing_batch
         and _batch_progress_confirmed(turn, state, builder.unit_id)
@@ -387,6 +402,7 @@ def prepare_fortification(
         continuing_batch
         and progress_confirmed
         and state.fortification_batch_signature == current_batch_signature
+        and state.fortification_return_stand == builder_return_stand
     )
     if not batch_targets:
         state.fortification_batch_targets = ()
@@ -467,7 +483,7 @@ def prepare_fortification(
         batch_targets
         if can_continue_without_replan
         else _largest_feasible_wall_prefix(
-            turn,
+            planning_turn,
             builder,
             batch_targets[:max_batch],
             failed_mines,
@@ -475,6 +491,7 @@ def prepare_fortification(
             deadline,
             max_expansions,
             reserved_rounds,
+            return_target=builder_return_stand,
         )
     )
     if not feasible_targets:
@@ -486,6 +503,7 @@ def prepare_fortification(
         return None
     state.fortification_batch_targets = feasible_targets
     state.fortification_batch_signature = current_batch_signature
+    state.fortification_return_stand = builder_return_stand
     state.fortification_builder_snapshot = (
         builder.pos, tuple(sorted(builder.backpack)),
     )
@@ -824,6 +842,7 @@ def _can_build_and_return(
     deadline: float,
     max_expansions: int,
     reserved_rounds: int = 0,
+    return_target: Pos | None = None,
 ) -> bool:
     projected_turn = turn
     projected_builder = builder
@@ -878,12 +897,15 @@ def _can_build_and_return(
         zones = dict(projected_turn.zones)
         zones[wall_target] = "wall"
         projected_turn = replace(projected_turn, zones=zones)
-    post_targets = tuple(
-        Pos(weapon.pos.x + dx, weapon.pos.y + dy)
-        for weapon in projected_turn.weapons()
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        if (dx or dy)
+    post_targets = (
+        (return_target,)
+        if return_target is not None else tuple(
+            Pos(weapon.pos.x + dx, weapon.pos.y + dy)
+            for weapon in projected_turn.weapons()
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            if (dx or dy)
+        )
     )
     post_route = _best_route(
         projected_turn,
@@ -910,6 +932,7 @@ def _largest_feasible_wall_prefix(
     deadline: float,
     max_expansions: int,
     reserved_rounds: int = 0,
+    return_target: Pos | None = None,
 ) -> tuple[Pos, ...]:
     if not wall_targets:
         return ()
@@ -926,6 +949,7 @@ def _largest_feasible_wall_prefix(
             return _largest_existing_stone_prefix(
                 turn, builder, wall_targets, failed_mines, clock, deadline,
                 max_expansions, reserved_rounds=reserved_rounds,
+                return_target=return_target,
             )
         mine_route = _best_adjacent_route(
             projected_turn, projected_builder, (mine,), clock, deadline,
@@ -975,12 +999,15 @@ def _largest_feasible_wall_prefix(
 
     feasible = ()
     for size, spent, trial_turn, trial_builder in reversed(projections):
-        post_targets = tuple(
-            Pos(weapon.pos.x + dx, weapon.pos.y + dy)
-            for weapon in trial_turn.weapons()
-            for dx in (-1, 0, 1)
-            for dy in (-1, 0, 1)
-            if (dx or dy)
+        post_targets = (
+            (return_target,)
+            if return_target is not None else tuple(
+                Pos(weapon.pos.x + dx, weapon.pos.y + dy)
+                for weapon in trial_turn.weapons()
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+                if (dx or dy)
+            )
         )
         post_route = (
             (trial_builder.pos, 0)
@@ -1002,6 +1029,7 @@ def _largest_feasible_wall_prefix(
             turn, builder, wall_targets, failed_mines, clock, deadline,
             max_expansions, minimum_size=len(feasible) + 1,
             reserved_rounds=reserved_rounds,
+            return_target=return_target,
         )
         if existing:
             return existing
@@ -1019,6 +1047,7 @@ def _largest_existing_stone_prefix(
     *,
     minimum_size: int = 1,
     reserved_rounds: int = 0,
+    return_target: Pos | None = None,
 ) -> tuple[Pos, ...]:
     limit = min(builder.backpack.count("stone"), len(wall_targets))
     for size in range(limit, minimum_size - 1, -1):
@@ -1026,6 +1055,7 @@ def _largest_existing_stone_prefix(
         if _can_build_and_return(
             turn, builder, trial, failed_mines, clock, deadline,
             max_expansions, reserved_rounds,
+            return_target,
         ):
             return trial
     return ()

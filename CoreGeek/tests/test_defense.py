@@ -3,8 +3,10 @@ import json
 import unittest
 from pathlib import Path
 
-from agent.actions import ActionAllocator, ActionProposal
+from agent.actions import ActionAllocator, ActionProposal, PlannedAction
 from agent.brain import DecisionEngine
+from agent.defense import daytime_post_assignments, daytime_work_can_return
+from agent.protocol import sell_command
 from agent.protocol import Pos, Turn
 from agent.state import StateStore, request_fingerprint
 
@@ -88,6 +90,84 @@ def proposals(payload):
 
 
 class DefenseTests(unittest.TestCase):
+    def test_mixed_inventory_requires_every_sale_before_return(self):
+        payload = defense_payload(round_no=67)
+        worker = unit(10010, "worker", 5, 5)
+        worker["backpack"] = ["stone", "copper"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 7, 5, health=1000),
+        ]
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 6}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [
+            {"name": "stone", "price": 1},
+            {"name": "copper", "price": 10},
+        ]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+        parsed_worker = turn.unit(10010)
+        candidate = PlannedAction(ActionProposal(
+            10010, 10010, sell_command("copper", 1),
+        ))
+        assignments = {
+            10020: (parsed_worker, (Pos(6, 5), Pos(6, 5), 1)),
+        }
+
+        self.assertFalse(daytime_work_can_return(
+            turn,
+            parsed_worker,
+            candidate,
+            assignments[10020][1],
+            assignments,
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=256,
+        ))
+
+    def test_daytime_assignments_keep_unique_exact_posts_after_reordering(self):
+        payload = defense_payload(round_no=54)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 5),
+            unit(10012, "worker", 5, 7),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 12, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+        state = state_for(payload)
+
+        first = daytime_post_assignments(
+            turn, state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=256,
+        )
+        self.assertIsNotNone(first)
+        first_by_role = {
+            role.unit_id: (weapon_id, route[0])
+            for weapon_id, (role, route) in first.items()
+        }
+        self.assertEqual(len(first_by_role), 2)
+        self.assertEqual(len({stand for _, stand in first_by_role.values()}), 2)
+
+        reordered = json.loads(json.dumps(payload))
+        reordered["roundNo"] = 55
+        reordered["teamOur"]["roles"] = list(reversed(
+            reordered["teamOur"]["roles"],
+        ))
+        second = daytime_post_assignments(
+            Turn.load(reordered), state, clock=lambda: 0.0, deadline=1.0,
+            max_expansions=256,
+        )
+        second_by_role = {
+            role.unit_id: (weapon_id, route[0])
+            for weapon_id, (role, route) in second.items()
+        }
+
+        self.assertEqual(second_by_role, first_by_role)
+
     def test_daytime_gunner_route_prefers_back_side_of_tower(self):
         # Break caught: nearest front-side stands ignore the directional wall plan.
         defense = importlib.import_module("agent.defense")

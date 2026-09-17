@@ -1,6 +1,7 @@
 import io
 import json
 import unittest
+from itertools import product
 from pathlib import Path
 from unittest import mock
 
@@ -46,6 +47,248 @@ def base_payload(*, round_no, team_id):
 
 
 class TeamTurnTests(unittest.TestCase):
+    def test_near_dusk_worker_builds_then_all_roles_reach_distinct_posts(self):
+        # Break caught: the fixed 12-round cutoff suppresses a one-round wall
+        # build even though the builder can still return to its assigned post.
+        payload = base_payload(
+            round_no=59, team_id="s2-dynamic-day-work-build",
+        )
+        builder = unit(10010, "worker", 11, 8)
+        builder["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            builder,
+            unit(10012, "worker", 9, 6),
+            unit(10011, "pioneer", 9, 10),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "rocket", 10, 7, health=1000),
+            unit(10030, "rocket", 10, 8, health=1000),
+            unit(10040, "rocket", 10, 9, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        built_rounds = []
+
+        while payload["roundNo"] <= 70:
+            response = engine.decide(payload)
+            feedback = {}
+            for owner_id, command in response["roleCommandMap"].items():
+                role = next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == int(owner_id)
+                )
+                if command["action"] == "move":
+                    role["pos"] = dict(command["targetPos"][0])
+                elif command["action"] == "build" and command["name"] == "wall":
+                    target = command["targetPos"][0]
+                    role["backpack"].remove("stone")
+                    payload["teamOur"]["roles"].append(unit(
+                        10100, "wall", target["x"], target["y"], health=1000,
+                    ))
+                    built_rounds.append(payload["roundNo"])
+                feedback[owner_id] = True
+            payload["lastRoundRoleActionResults"] = feedback
+            payload["roundNo"] += 1
+
+        self.assertEqual(built_rounds, [59])
+        turn = Turn.load(payload)
+        controllers = turn.controllable()
+        choices = tuple(
+            tuple(
+                weapon.unit_id for weapon in turn.weapons()
+                if distance(role.pos, weapon.pos) == 1
+            )
+            for role in controllers
+        )
+        self.assertTrue(all(choices), choices)
+        self.assertTrue(any(
+            len(set(assignment)) == len(controllers)
+            for assignment in product(*choices)
+        ), choices)
+
+    def test_long_route_worker_returns_before_old_dusk_window(self):
+        # Break caught: a worker with a >12-round real route keeps collecting
+        # at R56 because the old positioning window has not opened yet.
+        payload = base_payload(
+            round_no=57, team_id="s2-dynamic-day-work-long-return",
+        )
+        payload["mapInfo"].update({
+            "width": 30,
+            "height": 20,
+            "zones": [{
+                "pos": {"x": 4, "y": 9}, "neutralType": "stone",
+            }],
+        })
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 4, 8),
+            unit(10012, "worker", 17, 6),
+            unit(10011, "pioneer", 17, 10),
+            unit(10013, "station", 20, 9, health=1500),
+            unit(10020, "rocket", 18, 7, health=1000),
+            unit(10030, "rocket", 18, 8, health=1000),
+            unit(10040, "rocket", 18, 9, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 1, 9, health=1500),
+        ]
+
+        response = DecisionEngine().decide(payload)
+        command = response["roleCommandMap"].get("10010")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command["action"], "move")
+        self.assertNotEqual(command.get("targetPos"), [{"x": 4, "y": 9}])
+
+    def test_unknown_long_return_route_never_falls_through_to_mining(self):
+        payload = base_payload(
+            round_no=57, team_id="s2-day-work-unknown-return",
+        )
+        payload["mapInfo"].update({
+            "width": 30,
+            "height": 20,
+            "zones": [{
+                "pos": {"x": 4, "y": 9}, "neutralType": "stone",
+            }],
+        })
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 4, 8),
+            unit(10012, "worker", 17, 6),
+            unit(10011, "pioneer", 17, 10),
+            unit(10013, "station", 20, 9, health=1500),
+            unit(10020, "rocket", 18, 7, health=1000),
+            unit(10030, "rocket", 18, 8, health=1000),
+            unit(10040, "rocket", 18, 9, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 1, 9, health=1500),
+        ]
+
+        response = DecisionEngine(max_search_expansions=1).decide(payload)
+        command = response["roleCommandMap"].get("10010")
+
+        self.assertIsNone(command)
+
+    def test_stale_wall_batch_is_not_proof_after_current_planning_exhausts(self):
+        payload = base_payload(
+            round_no=40, team_id="s2-day-work-stale-wall-proof",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10011, "worker", 3, 3),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first["action"], "collect")
+        self.assertTrue(engine.state.state.fortification_batch_targets)
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 41
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        with mock.patch.object(
+            fortification_module,
+            "_batch_environment_signature",
+            side_effect=fortification_module._PlanningBudgetExhausted,
+        ):
+            response = engine.decide(following)
+        command = response["roleCommandMap"].get("10010")
+
+        self.assertTrue(
+            command is None or command["action"] not in {
+                "collect", "sell", "build", "buy", "use",
+            },
+            command,
+        )
+        self.assertEqual(
+            engine.state.state.fortification_skip_reason,
+            "planning_budget_exhausted",
+        )
+
+    def test_near_dusk_mining_liquidates_then_returns_to_bound_post(self):
+        payload = base_payload(
+            round_no=60, team_id="s2-day-work-liquidate-return",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 4, "y": 9}, "neutralType": "copper"},
+            {"pos": {"x": 4, "y": 11}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 4, 8),
+            unit(10013, "station", 10, 9, health=1500),
+            unit(10020, "rocket", 9, 8, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        actions = []
+
+        while payload["roundNo"] <= 70:
+            response = engine.decide(payload)
+            command = response["roleCommandMap"].get("10010")
+            if command is not None:
+                actions.append(command["action"])
+                worker = payload["teamOur"]["roles"][0]
+                if command["action"] == "move":
+                    worker["pos"] = dict(command["targetPos"][0])
+                elif command["action"] == "collect":
+                    worker["backpack"].append("copper")
+                elif command["action"] == "sell":
+                    for _ in range(command["num"]):
+                        worker["backpack"].remove(command["name"])
+                payload["lastRoundRoleActionResults"] = {"10010": True}
+            else:
+                payload["lastRoundRoleActionResults"] = {}
+            payload["roundNo"] += 1
+
+        worker = payload["teamOur"]["roles"][0]
+        self.assertIn("collect", actions)
+        self.assertIn("sell", actions)
+        self.assertEqual(worker["backpack"], [])
+        self.assertEqual(
+            distance(Pos.load(worker["pos"]), Pos(9, 8)), 1,
+            (actions, worker["pos"]),
+        )
+
+    def test_second_day_mirrored_worker_can_finish_short_wall_before_return(self):
+        payload = base_payload(
+            round_no=189, team_id="s2-day-work-defender-mirror",
+        )
+        builder = unit(10010, "worker", 8, 8)
+        builder["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            builder,
+            unit(10012, "worker", 10, 6),
+            unit(10011, "pioneer", 10, 10),
+            unit(10013, "station", 10, 9, health=1500),
+            unit(10020, "rocket", 9, 7, health=1000),
+            unit(10030, "rocket", 9, 8, health=1000),
+            unit(10040, "rocket", 9, 9, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 2, 9, health=1500),
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertTrue(any(
+            command.get("action") == "build"
+            and command.get("name") == "wall"
+            for command in response["roleCommandMap"].values()
+        ))
+
     def test_night_clearance_releases_worker_for_continuous_mining(self):
         # Break caught: an empty complete post-first-frame robot observation
         # leaves the worker protected at its gunner post; after release the
@@ -1215,8 +1458,8 @@ class TeamTurnTests(unittest.TestCase):
         self.assertLess(early["collectBlocks"], legacy["collectBlocks"])
 
         for start_round, expected in (
-            (30, (6, 6, 58)),
-            (40, (4, 4, 59)),
+            (30, (8, 8, 67)),
+            (40, (6, 6, 68)),
         ):
             with self.subTest(start_round=start_round):
                 metrics = run(start_round)
@@ -1229,8 +1472,7 @@ class TeamTurnTests(unittest.TestCase):
 
     def test_mine_refresh_rechecks_active_batch_feasibility(self):
         # Break caught: a successful collect reuses the old batch after the
-        # nearby mine disappears, sending the builder toward a newly distant
-        # mine without rechecking the dusk deadline.
+        # nearby mine disappears without rechecking the changed full route.
         payload = base_payload(
             round_no=40, team_id="s2-wall-mine-refresh-replan",
         )
@@ -1254,7 +1496,7 @@ class TeamTurnTests(unittest.TestCase):
         self.assertEqual(first, {
             "action": "collect", "targetPos": [{"x": 5, "y": 8}],
         })
-        self.assertEqual(len(engine.state.state.fortification_batch_targets), 4)
+        self.assertEqual(len(engine.state.state.fortification_batch_targets), 6)
 
         following = json.loads(json.dumps(payload))
         following["roundNo"] = 41
@@ -1267,11 +1509,11 @@ class TeamTurnTests(unittest.TestCase):
         second = engine.decide(following)["roleCommandMap"]["10010"]
 
         self.assertEqual(second, {
-            "action": "move", "targetPos": [{"x": 6, "y": 8}],
+            "action": "move", "targetPos": [{"x": 4, "y": 8}],
         })
         self.assertEqual(
             engine.state.state.fortification_batch_targets,
-            (Pos(12, 8),),
+            (Pos(12, 8), Pos(12, 9)),
         )
 
     def test_unrelated_successful_move_does_not_reuse_active_batch(self):
@@ -1466,7 +1708,7 @@ class TeamTurnTests(unittest.TestCase):
                     for controller in controllers
                 ))
 
-    def test_two_tower_partial_layout_stops_for_dusk_positioning(self):
+    def test_two_tower_partial_layout_allows_safe_dusk_wall_work(self):
         payload = base_payload(round_no=60, team_id="layout-two-tower-dusk")
         payload["teamOur"]["roles"] = [
             unit(10010, "worker", 11, 8),
@@ -1483,7 +1725,7 @@ class TeamTurnTests(unittest.TestCase):
 
         response = DecisionEngine().decide(payload)
 
-        self.assertFalse(any(
+        self.assertTrue(any(
             command.get("name") == "wall"
             for command in response["roleCommandMap"].values()
         ))

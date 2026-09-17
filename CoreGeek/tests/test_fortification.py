@@ -895,7 +895,7 @@ class FortificationTests(unittest.TestCase):
         self.assertEqual(builder_id, 10010)
         self.assertEqual(len(state.fortification_batch_targets), 1)
 
-    def test_dusk_does_not_pass_stable_builder_as_economy_reservation(self):
+    def test_dusk_passes_exactly_returnable_builder_to_economy(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
         payload["roundNo"] = 65
         payload["mapInfo"].update({"width": 20, "height": 20, "zones": []})
@@ -927,7 +927,62 @@ class FortificationTests(unittest.TestCase):
         with patch("agent.brain.propose_economy", side_effect=capture_economy):
             engine.decide(payload)
 
-        self.assertIsNone(captured["builder"])
+        self.assertEqual(captured["builder"], 10010)
+
+    def test_batch_route_reserves_other_roles_exact_return_stands(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 60
+        payload["mapInfo"].update({"width": 10, "height": 5})
+        open_cells = {Pos(x, 2) for x in range(10)} | {Pos(7, 1)}
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": x, "y": y}, "neutralType": "wall"}
+            for x in range(10)
+            for y in range(5)
+            if Pos(x, y) not in open_cells
+        ]
+        builder = unit(10010, "worker", 7, 2)
+        builder["backpack"] = ["stone"]
+        payload["teamOur"].update({
+            "teamId": "fortification-exact-return-reservations",
+            "roles": [
+                builder,
+                unit(10011, "worker", 9, 2),
+                unit(10013, "station", 0, 0),
+                unit(10020, "gatling", 0, 1),
+                unit(10030, "railgun", 9, 4),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = []
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+        state = SessionState(
+            "fortification-exact-return-reservations", "challenger",
+        )
+        state.fortification_initialized = True
+        state.fortification_targets = (Pos(7, 1),)
+        state.fortification_builder_id = 10010
+
+        with patch.object(
+            fortification_module,
+            "_current_safe_prefix",
+            return_value=(Pos(7, 1),),
+        ):
+            builder_id = prepare_fortification(
+                turn,
+                state,
+                (Pos(7, 1),),
+                clock=lambda: 0.0,
+                deadline=1.0,
+                max_expansions=256,
+                reserved_rounds=2,
+                return_stands={
+                    10010: Pos(1, 2),
+                    10011: Pos(4, 2),
+                },
+            )
+
+        self.assertIsNone(builder_id)
+        self.assertEqual(state.fortification_skip_reason, "return_deadline")
 
     def test_large_map_fortification_search_and_response_stay_bounded(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))

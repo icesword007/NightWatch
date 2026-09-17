@@ -6,7 +6,10 @@ from typing import Any, Callable
 
 from .actions import ActionAllocator, ActionProposal
 from .defense import (
+    DAY_WORK_RETURN_MARGIN,
     DUSK_POSITIONING_ROUNDS,
+    daytime_post_assignments,
+    daytime_work_can_return,
     night_clearance_status,
     propose_defense,
     protected_gunners,
@@ -16,7 +19,11 @@ from .defense import (
 )
 from .emergency import propose_held_emergency
 from .defense_pressure import pressure_diagnostic
-from .economy import propose_economy, wall_build_positions
+from .economy import (
+    daytime_liquidation_actions,
+    propose_economy,
+    wall_build_positions,
+)
 from .fortification import fortification_diagnostic, prepare_fortification
 from .intelligence import MAX_NEWS_CALLS_PER_DAY, MAX_NEWS_CANDIDATES
 from .layout import ensure_defense_layout
@@ -118,21 +125,34 @@ class DecisionEngine:
                 * ECONOMY_BUDGET_FRACTION
                 * FORTIFICATION_BUDGET_FRACTION,
             )
-            if turn.is_day and turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS:
-                fortification_builder_id = None
-                state.fortification_phase = "waiting"
-                state.fortification_skip_reason = "dusk_positioning"
-            else:
-                fortification_builder_id = prepare_fortification(
+            unavailable_for_defense = self._task_reserved_roles(
+                turn, state,
+            )
+            preliminary_assignments = (
+                daytime_post_assignments(
                     turn,
                     state,
-                    wall_build_positions(turn),
-                    reserved_role_ids=task_role_ids,
                     clock=self.clock,
                     deadline=fortification_deadline,
                     max_expansions=self.max_search_expansions,
-                    reserved_rounds=DUSK_POSITIONING_ROUNDS,
+                    unavailable_role_ids=unavailable_for_defense,
                 )
+                if turn.is_day else None
+            )
+            fortification_builder_id = prepare_fortification(
+                turn,
+                state,
+                wall_build_positions(turn),
+                reserved_role_ids=task_role_ids,
+                clock=self.clock,
+                deadline=fortification_deadline,
+                max_expansions=self.max_search_expansions,
+                reserved_rounds=DAY_WORK_RETURN_MARGIN,
+                return_stands={
+                    role.unit_id: route[0]
+                    for role, route in (preliminary_assignments or {}).values()
+                },
+            )
             economy_candidates = propose_economy(
                 turn,
                 state,
@@ -163,6 +183,120 @@ class DecisionEngine:
                 turn,
                 include_existing=turn.is_day,
             )
+            daytime_assignments = (
+                preliminary_assignments
+                if not funding_roles and not funding_posts
+                else daytime_post_assignments(
+                    turn, state, clock=self.clock, deadline=economy_deadline,
+                    max_expansions=self.max_search_expansions,
+                    unavailable_role_ids=unavailable_for_defense | funding_roles,
+                    reserved_weapon_ids=funding_posts,
+                )
+                if turn.is_day else None
+            )
+            assignment_by_role = {
+                role.unit_id: route
+                for role, route in (daytime_assignments or {}).values()
+            }
+            required_day_posts = {
+                weapon.unit_id for weapon in turn.weapons()
+                if weapon.unit_id not in funding_posts
+            }
+            all_day_posts_covered = (
+                daytime_assignments is not None
+                and required_day_posts.issubset(daytime_assignments)
+            )
+            safe_day_work = []
+            unsafe_day_work_ids = set()
+            urgent_day_return_ids = set()
+            if turn.is_day and not turn.weapons():
+                safe_day_work.extend(ordinary_economy)
+            elif daytime_assignments is not None:
+                for candidate in ordinary_economy:
+                    actor = turn.unit(candidate.proposal.actor_id)
+                    assigned_route = assignment_by_role.get(
+                        candidate.proposal.actor_id,
+                    )
+                    if (
+                        actor is None
+                        or actor.kind != "worker"
+                        or not self._is_day_work_candidate(candidate)
+                    ):
+                        continue
+                    if assigned_route is None:
+                        if all_day_posts_covered:
+                            safe_day_work.append(candidate)
+                        else:
+                            unsafe_day_work_ids.add(id(candidate))
+                            urgent_day_return_ids.add(actor.unit_id)
+                        continue
+                    wall_batch_work = (
+                        actor.unit_id == state.fortification_builder_id
+                        and bool(state.fortification_batch_targets)
+                        and (candidate.plan_reason or "").startswith(
+                            ("mine:stone", "build:wall")
+                        )
+                    )
+                    active_wall_work = (
+                        wall_batch_work
+                        and fortification_builder_id == actor.unit_id
+                        and state.fortification_return_stand
+                        == assigned_route[0]
+                    )
+                    work_is_safe = active_wall_work or (
+                        not wall_batch_work
+                        and daytime_work_can_return(
+                            turn,
+                            actor,
+                            candidate,
+                            assigned_route,
+                            daytime_assignments,
+                            clock=self.clock,
+                            deadline=economy_deadline,
+                            max_expansions=self.max_search_expansions,
+                        )
+                    )
+                    if work_is_safe:
+                        safe_day_work.append(candidate)
+                    else:
+                        unsafe_day_work_ids.add(id(candidate))
+                        urgent_day_return_ids.add(actor.unit_id)
+                        if (
+                            (candidate.plan_reason or "").startswith("mine:")
+                            and not wall_batch_work
+                        ):
+                            for liquidation in daytime_liquidation_actions(
+                                turn,
+                                actor,
+                                clock=self.clock,
+                                deadline=economy_deadline,
+                                max_expansions=self.max_search_expansions,
+                            ):
+                                if daytime_work_can_return(
+                                    turn,
+                                    actor,
+                                    liquidation,
+                                    assigned_route,
+                                    daytime_assignments,
+                                    clock=self.clock,
+                                    deadline=economy_deadline,
+                                    max_expansions=self.max_search_expansions,
+                                ):
+                                    safe_day_work.append(liquidation)
+                                    urgent_day_return_ids.discard(actor.unit_id)
+                                    break
+                for role, route in daytime_assignments.values():
+                    if (
+                        role.kind == "worker"
+                        and route[2] + DAY_WORK_RETURN_MARGIN
+                        >= turn.rounds_until_night
+                    ):
+                        urgent_day_return_ids.add(role.unit_id)
+            elif turn.is_day:
+                unsafe_day_work_ids.update(
+                    id(candidate) for candidate in ordinary_economy
+                    if self._is_day_work_candidate(candidate)
+                )
             day_return = (
                 task_pioneer_day_return_action(
                     turn,
@@ -198,9 +332,6 @@ class DecisionEngine:
                 if task_pioneer is not None
                 else None
             )
-            unavailable_for_defense = self._task_reserved_roles(
-                turn, state,
-            )
             defense_candidates = propose_defense(
                 turn,
                 state,
@@ -214,6 +345,8 @@ class DecisionEngine:
                 ),
                 reserved_weapon_ids=funding_posts,
                 night_cleared=night_cleared,
+                daytime_assignments=daytime_assignments,
+                urgent_day_return_ids=frozenset(urgent_day_return_ids),
             )
             emergency = propose_held_emergency(
                 turn,
@@ -276,13 +409,20 @@ class DecisionEngine:
                 or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
                 or bool(defense_candidates)
             )
+            safe_day_work_ids = {id(candidate) for candidate in safe_day_work}
+            deferred_ordinary = tuple(
+                candidate for candidate in ordinary_economy
+                if id(candidate) not in safe_day_work_ids
+                and id(candidate) not in unsafe_day_work_ids
+            )
             domains = (
                 ("economy", critical_economy),
+                ("economy", tuple(safe_day_work)),
                 ("defense", defense_candidates),
                 ("tasks", task_turn.actions),
-                ("economy", ordinary_economy),
+                ("economy", deferred_ordinary),
             )
-            if not defense_first:
+            if not defense_first and not unsafe_day_work_ids:
                 domains = (
                     ("tasks", task_turn.actions),
                     ("economy", economy_candidates),
@@ -312,6 +452,7 @@ class DecisionEngine:
                     if (
                         domain == "economy"
                         and candidate.proposal.actor_id in protected
+                        and id(candidate) not in safe_day_work_ids
                         and not (
                             candidate.proposal.command.get("action") == "use"
                             and candidate.proposal.command.get("name") == "Medicine"
@@ -349,6 +490,7 @@ class DecisionEngine:
                 not accepted
                 and not turn.phase_task
                 and not (defense_first and turn.weapons())
+                and not unsafe_day_work_ids
             ):
                 last_valid = fallback
 
@@ -420,6 +562,15 @@ class DecisionEngine:
             candidate.proposal.command.get("action") == "use"
             and isinstance(candidate.diagnostic, dict)
             and candidate.diagnostic.get("kind") == "heldInvestment"
+        )
+
+    @staticmethod
+    def _is_day_work_candidate(candidate: Any) -> bool:
+        action = candidate.proposal.command.get("action")
+        reason = candidate.plan_reason or ""
+        return action in ("collect", "sell", "build") or (
+            action == "move"
+            and reason.startswith(("mine:", "vendor", "build:"))
         )
 
     @staticmethod
@@ -796,7 +947,6 @@ class DecisionEngine:
     def _needs_fortification(turn: Turn, state: Any) -> bool:
         if (
             not turn.is_day
-            or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
             or len(turn.weapons()) < 2
         ):
             return False
