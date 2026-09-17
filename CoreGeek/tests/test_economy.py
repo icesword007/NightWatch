@@ -2656,6 +2656,251 @@ class EconomyTests(unittest.TestCase):
             for command in response["roleCommandMap"].values()
         ))
 
+    def test_micro_medicine_purchase_yields_to_next_economic_candidate(self):
+        payload = economy_payload(round_no=10, worker_pos=(2, 1), gold=100)
+        payload["teamOur"]["roles"][0]["health"] = 219
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state_for(payload),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )
+        worker_action = next(
+            action for action in actions
+            if action.proposal.actor_id == 10010
+        )
+
+        self.assertIn("WeaponUpgradeVoucher1", worker_action.plan_reason)
+        self.assertNotEqual(
+            worker_action.proposal.command.get("name"), "Medicine",
+        )
+
+    def test_micro_wall_repair_binds_heavier_worthwhile_wall_instead(self):
+        payload = economy_payload(round_no=10, worker_pos=(5, 2), gold=10)
+        payload["teamOur"]["roles"].extend((
+            role(10050, "wall", 5, 3, health=999),
+            role(10051, "wall", 7, 3, health=500),
+        ))
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+        ]
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state_for(payload),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )
+        worker_action = next(
+            action for action in actions
+            if action.proposal.actor_id == 10010
+        )
+
+        self.assertTrue(
+            worker_action.plan_reason.startswith("fund:WallFixer:"),
+        )
+        self.assertEqual(economy._plan_use_target_id(worker_action), 10051)
+
+    def test_full_purchase_cost_does_not_hide_far_heavy_wall(self):
+        payload = economy_payload(round_no=10, worker_pos=(1, 1), gold=10)
+        payload["teamOur"]["roles"].extend((
+            role(10050, "wall", 7, 3, health=997),
+            role(10051, "wall", 7, 5, health=500),
+        ))
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+        ]
+
+        route = economy._purchase_route(
+            Turn.load(payload), Turn.load(payload).workers()[0],
+            "WallFixer", lambda: 0.0, 1.0, 64,
+        )
+
+        self.assertIsNotNone(route)
+        self.assertEqual(route.use_target_id, 10051)
+        self.assertEqual(route.rounds, 10)
+
+    def test_sale_and_joint_routes_enumerate_wall_value_at_full_cost(self):
+        payload = economy_payload(
+            round_no=10, worker_pos=(1, 1), items=("copper",), gold=0,
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+        ]
+        payload["teamOur"]["roles"].extend((
+            role(10050, "wall", 7, 3, health=997),
+            role(10051, "wall", 7, 5, health=500),
+        ))
+        turn = Turn.load(payload)
+        sale_route = economy._funding_chain(
+            turn, turn.workers()[0], "WallFixer", 10,
+            lambda: 0.0, 1.0, 64,
+        )
+        self.assertEqual(sale_route.use_target_id, 10051)
+        self.assertEqual(sale_route.rounds, 11)
+
+        payload["teamOur"]["roles"][0]["backpack"] = ["copper"] * 6
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 1, 3, items=("copper",) * 6),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 100},
+        ]
+        turn = Turn.load(payload)
+        joint_route = economy._joint_funding_route(
+            turn, turn.workers()[0], turn.workers()[1], "WallFixer", None,
+            lambda: 0.0, 1.0, 64,
+        )
+        self.assertEqual(joint_route.use_target_id, 10051)
+        self.assertEqual(
+            joint_route.buyer_rounds + joint_route.contributor_rounds, 17,
+        )
+
+    def test_only_micro_wall_repair_yields_to_upgrade_candidate(self):
+        payload = economy_payload(round_no=10, worker_pos=(5, 2), gold=100)
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=999),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state_for(payload),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )
+        worker_action = next(
+            action for action in actions
+            if action.proposal.actor_id == 10010
+        )
+
+        self.assertIn("WeaponUpgradeVoucher1", worker_action.plan_reason)
+
+    def test_held_micro_maintenance_items_bypass_new_purchase_gate(self):
+        medicine = economy_payload(items=("Medicine",))
+        medicine["teamOur"]["roles"][0]["health"] = 219
+        medicine_action = economy.propose_economy(
+            Turn.load(medicine), state_for(medicine),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )[0]
+        self.assertEqual(medicine_action.proposal.command, {
+            "action": "use", "name": "Medicine",
+        })
+
+        fixer = economy_payload(worker_pos=(7, 8), items=("WallFixer",))
+        fixer["teamOur"]["roles"].append(
+            role(10050, "wall", 7, 9, health=999),
+        )
+        fixer_action = economy.propose_economy(
+            Turn.load(fixer), state_for(fixer),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )[0]
+        self.assertEqual(fixer_action.proposal.command["name"], "WallFixer")
+
+    def test_emergency_medicine_purchase_remains_eligible(self):
+        payload = economy_payload(round_no=10, worker_pos=(1, 1), gold=10)
+        payload["teamOur"]["roles"][0]["health"] = 40
+        payload["weaponShopList"] = [
+            {"name": "Medicine", "price": 10},
+        ]
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state_for(payload),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )
+        worker_action = next(
+            action for action in actions
+            if action.proposal.actor_id == 10010
+        )
+
+        self.assertTrue(worker_action.plan_reason.startswith("fund:Medicine:"))
+
+    def test_heavy_medicine_need_still_starts_complete_funding_route(self):
+        payload = economy_payload(round_no=10, worker_pos=(2, 1), gold=10)
+        payload["teamOur"]["roles"][0]["health"] = 100
+        payload["weaponShopList"] = [
+            {"name": "Medicine", "price": 10},
+        ]
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state_for(payload),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )
+        worker_action = next(
+            action for action in actions
+            if action.proposal.actor_id == 10010
+        )
+
+        self.assertTrue(worker_action.plan_reason.startswith("fund:Medicine:"))
+
+    def test_existing_micro_medicine_funding_commitment_is_not_regated(self):
+        payload = economy_payload(round_no=10, worker_pos=(2, 1), gold=10)
+        payload["teamOur"]["roles"][0]["health"] = 219
+        payload["weaponShopList"] = [
+            {"name": "Medicine", "price": 10},
+        ]
+        state = state_for(payload)
+        state.plans[10010] = PlanState(
+            10010, Pos(6, 2), "fund:Medicine:10020:0", 69,
+            source_session=state.session_index,
+        )
+
+        actions = economy.propose_economy(
+            Turn.load(payload), state,
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )
+        worker_action = next(
+            action for action in actions
+            if action.proposal.actor_id == 10010
+        )
+
+        self.assertTrue(worker_action.plan_reason.startswith("fund:Medicine:"))
+
+    def test_two_workers_cannot_bypass_micro_medicine_gate(self):
+        payload = economy_payload(round_no=10, worker_pos=(5, 2), gold=20)
+        payload["teamOur"]["roles"][0]["health"] = 219
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 5, 3, health=219),
+        )
+        payload["weaponShopList"] = [
+            {"name": "Medicine", "price": 10},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertFalse(any(
+            command.get("action") == "buy"
+            and command.get("name") == "Medicine"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_night_micro_medicine_purchase_uses_same_value_gate(self):
+        payload = economy_payload(round_no=71, worker_pos=(5, 2), gold=10)
+        payload["teamOur"]["teamId"] = "night-micro-medicine-gate"
+        payload["teamOur"]["roles"][0]["health"] = 219
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:2]
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 6, "y": 2}, "neutralType": "weaponShop"},
+        ]
+        payload["weaponShopList"] = [
+            {"name": "Medicine", "price": 10},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertFalse(any(
+            command.get("action") == "buy"
+            and command.get("name") == "Medicine"
+            for command in response["roleCommandMap"].values()
+        ))
+
+        emergency = copy.deepcopy(payload)
+        emergency["teamOur"]["teamId"] = "night-emergency-medicine"
+        emergency["teamOur"]["roles"][0]["health"] = 40
+        response = DecisionEngine().decide(emergency)
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy", "name": "Medicine", "num": 1,
+        })
+
     def test_full_backpack_and_insufficient_gold_do_not_advance_chain(self):
         # Break caught: collection/purchase is issued despite current hard limits.
         economy = importlib.import_module("agent.economy")

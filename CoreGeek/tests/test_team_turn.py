@@ -5,10 +5,11 @@ from pathlib import Path
 from unittest import mock
 
 from agent import server as server_module
+from agent import fortification as fortification_module
 from agent.brain import DecisionEngine
 from agent.layout import plan_defense_layout
 from agent.protocol import Pos, Turn, distance
-from agent.state import PlanState, request_fingerprint
+from agent.state import PendingAction, PlanState, request_fingerprint
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
@@ -566,7 +567,7 @@ class TeamTurnTests(unittest.TestCase):
         self.assertEqual(second["name"], "wall")
         self.assertNotEqual(second["targetPos"][0], first_target)
 
-    def test_fortification_collects_a_two_wall_batch_before_construction(self):
+    def test_fortification_collects_a_larger_batch_before_construction(self):
         # Break caught: the builder walks back after every single stone.
         payload = base_payload(round_no=5, team_id="brain-r8-mine-build")
         payload["mapInfo"]["zones"] = [
@@ -601,8 +602,10 @@ class TeamTurnTests(unittest.TestCase):
         ready["teamOur"]["roles"][0]["backpack"] = ["stone", "stone"]
         third = engine.decide(ready)["roleCommandMap"]["10010"]
 
-        self.assertIn(third["action"], ("move", "build"))
-        self.assertNotEqual(third["action"], "collect")
+        self.assertEqual(third["action"], "collect")
+        self.assertGreater(
+            len(engine.state.state.fortification_batch_targets), 2,
+        )
 
     def test_fortification_shrinks_batch_when_stone_disappears(self):
         payload = base_payload(round_no=5, team_id="brain-r9-stone-disappears")
@@ -676,7 +679,7 @@ class TeamTurnTests(unittest.TestCase):
         builder_actions = []
         economic_actions = []
 
-        for _ in range(12):
+        for _ in range(30):
             response = engine.decide(payload)
             commands = response["roleCommandMap"]
             if "10010" in commands:
@@ -787,6 +790,9 @@ class TeamTurnTests(unittest.TestCase):
         following["teamOur"]["roles"][0]["pos"] = {"x": 11, "y": 8}
         with mock.patch(
             "agent.fortification.safe_wall_targets", return_value=(),
+        ), mock.patch(
+            "agent.fortification._batch_progress_confirmed",
+            return_value=False,
         ):
             response = engine.decide(following)
 
@@ -817,7 +823,11 @@ class TeamTurnTests(unittest.TestCase):
         following["lastRoundRoleActionResults"] = {"10010": True}
         following["teamOur"]["roles"][0]["pos"] = {"x": 11, "y": 8}
         with mock.patch(
-            "agent.fortification._can_build_and_return", return_value=False,
+            "agent.fortification._largest_feasible_wall_prefix",
+            return_value=(),
+        ), mock.patch(
+            "agent.fortification._batch_progress_confirmed",
+            return_value=False,
         ):
             response = engine.decide(following)
 
@@ -911,6 +921,232 @@ class TeamTurnTests(unittest.TestCase):
                 break
 
         self.assertEqual(built, [(12, 8), (12, 9)])
+
+    def test_real_engine_batches_depleting_mine_without_dusk_overcollection(self):
+        def run(start_round, batch_cap=None):
+            payload = base_payload(
+                round_no=start_round,
+                team_id=f"s2-wall-depleting-{start_round}-{batch_cap}",
+            )
+            payload["mapInfo"]["zones"] = [
+                {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+            ]
+            payload["teamOur"]["roles"] = [
+                unit(10010, "worker", 5, 9),
+                unit(10011, "worker", 3, 3),
+                unit(10013, "station", 9, 9, health=1500),
+                unit(10020, "gatling", 8, 8, health=1000),
+                unit(10030, "railgun", 9, 7, health=1000),
+                unit(10040, "rocket", 10, 7, health=1000),
+            ]
+            payload["teamEnemy"]["roles"] = [
+                unit(20013, "station", 17, 9, health=1500),
+            ]
+            engine = DecisionEngine()
+            metrics = {
+                "collects": 0, "moves": 0, "builds": 0,
+                "collectBlocks": 0, "stopRound": None,
+            }
+            previous_action = None
+            real_prefix = fortification_module._largest_feasible_wall_prefix
+
+            def limited_prefix(*args, **kwargs):
+                prefix = real_prefix(*args, **kwargs)
+                return prefix if batch_cap is None else prefix[:batch_cap]
+
+            with mock.patch.object(
+                fortification_module,
+                "_largest_feasible_wall_prefix",
+                side_effect=limited_prefix,
+            ):
+                for _ in range(80):
+                    response = engine.decide(payload)
+                    command = response["roleCommandMap"].get("10010")
+                    if command is None:
+                        metrics["stopRound"] = payload["roundNo"]
+                        break
+                    action = command["action"]
+                    worker = payload["teamOur"]["roles"][0]
+                    if action == "collect":
+                        if previous_action != "collect":
+                            metrics["collectBlocks"] += 1
+                        metrics["collects"] += 1
+                        worker["backpack"].append("stone")
+                        if metrics["collects"] == 10:
+                            payload["mapInfo"]["zones"] = []
+                    elif action == "move":
+                        metrics["moves"] += 1
+                        worker["pos"] = json.loads(json.dumps(
+                            command["targetPos"][0],
+                        ))
+                    elif action == "build" and command.get("name") == "wall":
+                        metrics["builds"] += 1
+                        worker["backpack"].remove("stone")
+                        target = command["targetPos"][0]
+                        payload["teamOur"]["roles"].append(unit(
+                            10100 + metrics["builds"], "wall",
+                            target["x"], target["y"], health=1000,
+                        ))
+                    previous_action = action
+                    payload["lastRoundRoleActionResults"] = {"10010": True}
+                    payload["roundNo"] += 1
+
+            worker = payload["teamOur"]["roles"][0]
+            metrics["stones"] = worker["backpack"].count("stone")
+            metrics["atPost"] = any(
+                distance(
+                    Pos.load(worker["pos"]), Pos.load(role["pos"]),
+                ) == 1
+                for role in payload["teamOur"]["roles"]
+                if role["roleType"] in ("gatling", "railgun", "rocket")
+            )
+            return metrics
+
+        early = run(5)
+        legacy = run(5, batch_cap=2)
+        self.assertEqual(early, {
+            "collects": 10, "moves": 33, "builds": 10,
+            "collectBlocks": 1, "stopRound": 58,
+            "stones": 0, "atPost": True,
+        })
+        self.assertGreater(early["builds"], legacy["builds"])
+        self.assertLess(early["moves"], legacy["moves"])
+        self.assertLess(early["collectBlocks"], legacy["collectBlocks"])
+
+        for start_round, expected in (
+            (30, (6, 6, 58)),
+            (40, (4, 4, 59)),
+        ):
+            with self.subTest(start_round=start_round):
+                metrics = run(start_round)
+                self.assertEqual(
+                    (metrics["collects"], metrics["builds"], metrics["stopRound"]),
+                    expected,
+                )
+                self.assertEqual(metrics["stones"], 0)
+                self.assertTrue(metrics["atPost"])
+
+    def test_mine_refresh_rechecks_active_batch_feasibility(self):
+        # Break caught: a successful collect reuses the old batch after the
+        # nearby mine disappears, sending the builder toward a newly distant
+        # mine without rechecking the dusk deadline.
+        payload = base_payload(
+            round_no=40, team_id="s2-wall-mine-refresh-replan",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10011, "worker", 3, 3),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first, {
+            "action": "collect", "targetPos": [{"x": 5, "y": 8}],
+        })
+        self.assertEqual(len(engine.state.state.fortification_batch_targets), 4)
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 41
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        following["mapInfo"]["zones"] = [
+            {"pos": {"x": 0, "y": 0}, "neutralType": "stone"},
+        ]
+
+        second = engine.decide(following)["roleCommandMap"]["10010"]
+
+        self.assertEqual(second, {
+            "action": "move", "targetPos": [{"x": 6, "y": 8}],
+        })
+        self.assertEqual(
+            engine.state.state.fortification_batch_targets,
+            (Pos(12, 8),),
+        )
+
+    def test_unrelated_successful_move_does_not_reuse_active_batch(self):
+        payload = base_payload(
+            round_no=40, team_id="s2-wall-unrelated-move-replan",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+        state = engine.state.state
+        state.pending_actions[10010] = PendingAction(
+            40, 10010, 10010, "move", Pos(5, 9),
+            source_session=state.session_index,
+        )
+        state.plans[10010] = PlanState(
+            10010, Pos(8, 8), "gunner:10020", None, state.session_index,
+        )
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 41
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        real_prefix = fortification_module._largest_feasible_wall_prefix
+        with mock.patch.object(
+            fortification_module,
+            "_largest_feasible_wall_prefix",
+            wraps=real_prefix,
+        ) as prefix:
+            engine.decide(following)
+
+        self.assertEqual(prefix.call_count, 1)
+
+    def test_external_inventory_change_does_not_reuse_active_batch(self):
+        payload = base_payload(
+            round_no=40, team_id="s2-wall-inventory-change-replan",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 8}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 9),
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9, health=1500),
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        following = json.loads(json.dumps(payload))
+        following["roundNo"] = 41
+        following["lastRoundRoleActionResults"] = {"10010": True}
+        following["teamOur"]["roles"][0]["backpack"] = ["stone", "stone"]
+        real_prefix = fortification_module._largest_feasible_wall_prefix
+        with mock.patch.object(
+            fortification_module,
+            "_largest_feasible_wall_prefix",
+            wraps=real_prefix,
+        ) as prefix:
+            engine.decide(following)
+
+        self.assertEqual(prefix.call_count, 1)
 
     def test_two_towers_interleave_full_layout_third_rocket_and_dusk_return(self):
         # Break caught: the wall state machine is disabled until all three towers

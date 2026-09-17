@@ -116,6 +116,7 @@ class DecisionEngine:
                     clock=self.clock,
                     deadline=economy_deadline,
                     max_expansions=self.max_search_expansions,
+                    reserved_rounds=DUSK_POSITIONING_ROUNDS,
                 )
             economy_candidates = propose_economy(
                 turn,

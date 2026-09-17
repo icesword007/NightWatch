@@ -269,3 +269,17 @@ main f721702、投资分支776e8ac（墙升级）及其他旧树只读；本批�
 ## R172 统一r2本地验收与当前内网入口
 
 新Sol已完成R171并idle。主会话独立430/430含16HTTP通过10.412秒，原实际题面两变体、后续新ID累计/实际评分、黎明完整定稿反例通过，diff/cached diff/bash-n通过。构建nightwatch-s2-integrated-r2包含任务入口/有界任务根、波次累计修复、已有应急使用与宝藏条件只读评估。用户已授权提交推送，当前内网唯一入口【codex】s2-integrated-r2-intranet-prompt.md，旧条目中的暂停送测限制由本条覆盖；实战未验收，不关闭issue。
+
+
+## R178 回合效率首批开发授权
+
+本批唯一源码入口为`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-round-efficiency`，分支`codex/s2-round-efficiency`，基准`42be0e34bf303b8acc5b81d55eb40baefab5aac0`；本条覆盖历史工作区指向。新Sol+medium独占此树，按外层`design/【codex】s2-round-efficiency-plan.md`实施稳定墙段批量备料与低收益新维护采购门控，构建标识`nightwatch-s2-efficiency-r1`。`main`和全部旧工作树只读。
+
+不得修改固定回防12回合或炮手窗口、普通采矿/采购批量、任务reader与deadline、布局、攻击、新闻、应急、SDK、依赖或环境。门控仅限制新Medicine/WallFixer采购，不阻断已有物品或有效在途承诺，并保留多工人排他和目标筛选。开发不commit/merge/push/reset/切分支/删除/派生任务；交付R179，主会话R180独立验收，本轮不自动合main或推送。
+
+
+## R180 回合效率首批本地验收
+
+主会话独立446项（含HTTP）通过30.699秒，矿刷新原反例确认完整重算后batch1并向墙施工。稳定批次按容量、路线和原12轮停工窗口计算，环境/计划外动作/库存变化使缓存失效；不改变回防窗口值。受控第10采矿消失，旧版6墙/42移动/3采集区段，新版10墙/33移动/1区段；不代表平台收益已验收。
+
+新Medicine/WallFixer按有效恢复HP与完整承诺人员回合过滤低收益路线，普通门槛1 HP/人员回合，紧急例外及已有物品/有效承诺保留；现金、出售和联合路线逐目标评估，夜间购药按购买和使用两轮计算。构建nightwatch-s2-efficiency-r1，仅本地验收与隔离提交；main送测42be0e3不变，不自动合并推送。夜间清场离岗、动态回防和普通采购批量未实施。

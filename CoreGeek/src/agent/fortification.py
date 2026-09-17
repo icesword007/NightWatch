@@ -9,10 +9,16 @@ from .layout import (
     layout_diagnostic,
     plan_defense_layout,
 )
-from .protocol import ROUNDS_PER_DAY, STATION, Pos, Turn, distance
+from .protocol import (
+    ROUNDS_PER_DAY,
+    STATION,
+    Pos,
+    Turn,
+    distance,
+)
 
 MAX_WALL_TARGETS = MAX_LAYOUT_WALLS
-MAX_WALL_BATCH = 2
+UNKNOWN_CAPACITY_WALL_BATCH = 2
 MAX_TEMPORARY_RECHECKS = 2
 
 
@@ -213,6 +219,7 @@ def prepare_fortification(
     clock: Callable[[], float] = time.monotonic,
     deadline: float = float("inf"),
     max_expansions: int = 256,
+    reserved_rounds: int = 0,
 ) -> int | None:
     if not turn.is_day or len(turn.weapons()) < 2 or turn.station() is None:
         state.fortification_phase = "waiting"
@@ -276,6 +283,8 @@ def prepare_fortification(
     if builder is None and state.fortification_builder_id is not None:
         state.fortification_builder_id = None
         state.fortification_batch_targets = ()
+        state.fortification_batch_signature = None
+        state.fortification_builder_snapshot = None
         if turn.round_in_day != 1:
             state.fortification_phase = "waiting"
             state.fortification_skip_reason = "builder_unavailable"
@@ -309,12 +318,37 @@ def prepare_fortification(
         target for target in state.fortification_batch_targets
         if target in remaining_targets
     )
+    if (
+        batch_targets
+        and remaining_targets[0] in state.fortification_recovery_targets
+        and remaining_targets[0] not in batch_targets
+    ):
+        batch_targets = ()
+        state.fortification_batch_targets = ()
+        state.fortification_batch_signature = None
+        state.fortification_builder_snapshot = None
+    continuing_batch = bool(batch_targets)
+    progress_confirmed = (
+        continuing_batch
+        and _batch_progress_confirmed(turn, state, builder.unit_id)
+    )
+    current_batch_signature = _batch_environment_signature(
+        turn, state, builder.unit_id,
+    )
+    cache_environment_valid = (
+        continuing_batch
+        and progress_confirmed
+        and state.fortification_batch_signature == current_batch_signature
+    )
     if not batch_targets:
         state.fortification_batch_targets = ()
         batch_targets = _current_safe_prefix(
             turn, state, remaining_targets, candidates,
         )
-    else:
+    elif not (
+        cache_environment_valid
+        and all(target in candidates for target in batch_targets)
+    ):
         batch_targets = _current_safe_prefix(
             turn, state, batch_targets, candidates,
         )
@@ -348,35 +382,50 @@ def prepare_fortification(
         state.fortification_phase = "waiting"
         state.fortification_skip_reason = "stone_unavailable"
         return None
-    feasible_targets = ()
     available_slots = (
-        MAX_WALL_BATCH
+        UNKNOWN_CAPACITY_WALL_BATCH
         if builder.capacity is None
         else max(builder.capacity - len(builder.backpack), 0)
     )
     max_batch = min(
         len(batch_targets),
-        MAX_WALL_BATCH,
         builder.backpack.count("stone") + available_slots,
     )
-    for size in range(max_batch, 0, -1):
-        trial = batch_targets[:size]
-        if _can_build_and_return(
+    if not continuing_batch and builder.backpack.count("stone"):
+        max_batch = min(max_batch, builder.backpack.count("stone"))
+    can_continue_without_replan = (
+        continuing_batch
+        and max_batch >= len(batch_targets)
+        and cache_environment_valid
+        and (
+            builder.backpack.count("stone") >= len(batch_targets)
+            or fortification_stone_target(turn, builder, failed_mines)
+            is not None
+        )
+    )
+    feasible_targets = (
+        batch_targets
+        if can_continue_without_replan
+        else _largest_feasible_wall_prefix(
             turn,
             builder,
-            trial,
+            batch_targets[:max_batch],
             failed_mines,
             clock,
             deadline,
             max_expansions,
-        ):
-            feasible_targets = trial
-            break
+            reserved_rounds,
+        )
+    )
     if not feasible_targets:
         state.fortification_phase = "waiting"
         state.fortification_skip_reason = "return_deadline"
         return None
     state.fortification_batch_targets = feasible_targets
+    state.fortification_batch_signature = current_batch_signature
+    state.fortification_builder_snapshot = (
+        builder.pos, tuple(sorted(builder.backpack)),
+    )
     state.fortification_phase = (
         "building"
         if builder.backpack.count("stone") >= len(feasible_targets)
@@ -384,6 +433,89 @@ def prepare_fortification(
     )
     state.fortification_skip_reason = None
     return builder.unit_id
+
+
+def _batch_progress_confirmed(
+    turn: Turn,
+    state: Any,
+    builder_id: int,
+) -> bool:
+    builder = turn.unit(builder_id)
+    snapshot = state.fortification_builder_snapshot
+    if builder is None or snapshot is None:
+        return False
+    completed = next((
+        completed
+        for completed in reversed(state.action_history)
+        if completed.pending.actor_id == builder_id
+        and completed.pending.round_no == turn.round_no - 1
+        and completed.pending.source_session == state.session_index
+    ), None)
+    if completed is None or completed.success is not True:
+        return False
+    pending = completed.pending
+    previous_pos, previous_backpack = snapshot
+    expected_pos = previous_pos
+    expected_backpack = list(previous_backpack)
+    if pending.action == "move":
+        plan = state.plans.get(builder_id)
+        if (
+            pending.target is None
+            or plan is None
+            or plan.source_session != state.session_index
+            or not (
+                plan.reason == "build:wall"
+                and plan.target in state.fortification_targets
+                or plan.reason == "mine:stone"
+                and turn.zones.get(plan.target) == "stone"
+            )
+        ):
+            return False
+        expected_pos = pending.target
+    elif pending.action == "collect":
+        if pending.target is None or turn.zones.get(pending.target) != "stone":
+            return False
+        expected_backpack.append("stone")
+    elif pending.action == "build":
+        if (
+            pending.name != "wall"
+            or pending.target not in state.fortification_targets
+            or "stone" not in expected_backpack
+        ):
+            return False
+        expected_backpack.remove("stone")
+    else:
+        return False
+    return (
+        builder.pos == expected_pos
+        and tuple(sorted(builder.backpack)) == tuple(sorted(expected_backpack))
+    )
+
+
+def _batch_environment_signature(
+    turn: Turn,
+    state: Any,
+    builder_id: int,
+) -> str:
+    planned = set(state.fortification_targets)
+    parts = [
+        f"zone:{pos.x}:{pos.y}:{kind}"
+        for pos, kind in sorted(
+            turn.zones.items(), key=lambda entry: (entry[0].x, entry[0].y)
+        )
+    ]
+    parts.extend(
+        f"unit:{side}:{unit.unit_id}:{unit.kind}:{unit.pos.x}:{unit.pos.y}"
+        for side, units in (("our", turn.ours), ("enemy", turn.enemies))
+        for unit in sorted(units, key=lambda entry: entry.unit_id)
+        if unit.unit_id != builder_id
+        and not (unit.kind == "wall" and unit.pos in planned)
+    )
+    parts.extend(
+        f"robot:{robot.robot_id}:{robot.pos.x}:{robot.pos.y}:{robot.health}"
+        for robot in sorted(turn.robots, key=lambda entry: entry.robot_id)
+    )
+    return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
 
 
 def _current_safe_prefix(
@@ -404,8 +536,6 @@ def _current_safe_prefix(
         if target in candidates and safe_wall_targets(turn, trial) == trial:
             state.fortification_deferred.pop(target, None)
             accepted.append(target)
-            if len(accepted) >= MAX_WALL_BATCH:
-                break
             continue
         blocker_signature = _temporary_blocker_signature(
             turn, target, candidates,
@@ -552,7 +682,8 @@ def fortification_diagnostic(turn: Turn, state: Any) -> dict[str, Any]:
             target.dump() for target in state.fortification_targets[:MAX_WALL_TARGETS]
         ],
         "batchTargets": [
-            target.dump() for target in state.fortification_batch_targets[:2]
+            target.dump()
+            for target in state.fortification_batch_targets[:MAX_WALL_TARGETS]
         ],
         "completed": len(state.fortification_completed),
         "observedFixedWalls": sum(
@@ -594,6 +725,7 @@ def _can_build_and_return(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
+    reserved_rounds: int = 0,
 ) -> bool:
     projected_turn = turn
     projected_builder = builder
@@ -666,7 +798,139 @@ def _can_build_and_return(
     )
     if post_route is None:
         return False
-    return rounds + post_route[1] <= turn.rounds_until_night
+    return rounds + post_route[1] <= max(
+        turn.rounds_until_night - reserved_rounds, 0,
+    )
+
+
+def _largest_feasible_wall_prefix(
+    turn: Turn,
+    builder: Any,
+    wall_targets: tuple[Pos, ...],
+    failed_mines: frozenset[Pos],
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    reserved_rounds: int = 0,
+) -> tuple[Pos, ...]:
+    if not wall_targets:
+        return ()
+    projected_turn = turn
+    projected_builder = builder
+    rounds = 0
+    initial_stone = builder.backpack.count("stone")
+    needed_stone = max(
+        len(wall_targets) - initial_stone, 0,
+    )
+    if needed_stone:
+        mine = fortification_stone_target(turn, builder, failed_mines)
+        if mine is None:
+            return _largest_existing_stone_prefix(
+                turn, builder, wall_targets, failed_mines, clock, deadline,
+                max_expansions, reserved_rounds=reserved_rounds,
+            )
+        mine_route = _best_adjacent_route(
+            projected_turn, projected_builder, (mine,), clock, deadline,
+            max_expansions, [8],
+        )
+        if mine_route is None:
+            return ()
+        mine_stand, mine_cost = mine_route
+        rounds += mine_cost
+        projected_builder, projected_turn = _project_role(
+            projected_turn,
+            projected_builder,
+            mine_stand,
+            (*projected_builder.backpack, *(("stone",) * needed_stone)),
+        )
+
+    projections = []
+    for index, wall_target in enumerate(wall_targets, start=1):
+        wall_route = (
+            (projected_builder.pos, 0)
+            if (
+                distance(projected_builder.pos, wall_target) == 1
+                and projected_turn.land(projected_builder.pos)
+                and projected_builder.pos
+                not in projected_turn.blocked(projected_builder)
+            )
+            else _best_adjacent_route(
+                projected_turn, projected_builder, (wall_target,), clock,
+                deadline, max_expansions, [8],
+            )
+        )
+        if wall_route is None:
+            break
+        wall_stand, wall_cost = wall_route
+        rounds += wall_cost + 1 + (index > initial_stone)
+        backpack = list(projected_builder.backpack)
+        backpack.remove("stone")
+        projected_builder, projected_turn = _project_role(
+            projected_turn, projected_builder, wall_stand, tuple(backpack),
+        )
+        zones = dict(projected_turn.zones)
+        zones[wall_target] = "wall"
+        projected_turn = replace(projected_turn, zones=zones)
+        projections.append((index, rounds, projected_turn, projected_builder))
+        if rounds > max(turn.rounds_until_night - reserved_rounds, 0):
+            break
+
+    feasible = ()
+    for size, spent, trial_turn, trial_builder in reversed(projections):
+        post_targets = tuple(
+            Pos(weapon.pos.x + dx, weapon.pos.y + dy)
+            for weapon in trial_turn.weapons()
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            if (dx or dy)
+        )
+        post_route = (
+            (trial_builder.pos, 0)
+            if trial_builder.pos in post_targets
+            else _best_route(
+                trial_turn, trial_builder, post_targets, clock, deadline,
+                max_expansions, [16],
+            )
+        )
+        if (
+            post_route is not None
+            and spent + post_route[1]
+            <= max(turn.rounds_until_night - reserved_rounds, 0)
+        ):
+            feasible = wall_targets[:size]
+            break
+    if initial_stone and len(feasible) <= initial_stone:
+        existing = _largest_existing_stone_prefix(
+            turn, builder, wall_targets, failed_mines, clock, deadline,
+            max_expansions, minimum_size=len(feasible) + 1,
+            reserved_rounds=reserved_rounds,
+        )
+        if existing:
+            return existing
+    return feasible
+
+
+def _largest_existing_stone_prefix(
+    turn: Turn,
+    builder: Any,
+    wall_targets: tuple[Pos, ...],
+    failed_mines: frozenset[Pos],
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    minimum_size: int = 1,
+    reserved_rounds: int = 0,
+) -> tuple[Pos, ...]:
+    limit = min(builder.backpack.count("stone"), len(wall_targets))
+    for size in range(limit, minimum_size - 1, -1):
+        trial = wall_targets[:size]
+        if _can_build_and_return(
+            turn, builder, trial, failed_mines, clock, deadline,
+            max_expansions, reserved_rounds,
+        ):
+            return trial
+    return ()
 
 
 def _best_adjacent_route(

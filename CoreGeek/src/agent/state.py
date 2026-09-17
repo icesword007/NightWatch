@@ -160,6 +160,8 @@ class SessionState:
     fortification_builder_id: int | None = None
     fortification_targets: tuple[Pos, ...] = ()
     fortification_batch_targets: tuple[Pos, ...] = ()
+    fortification_batch_signature: str | None = None
+    fortification_builder_snapshot: tuple[Pos, tuple[str, ...]] | None = None
     fortification_completed: set[Pos] = field(default_factory=set)
     fortification_observed_days: dict[Pos, int] = field(default_factory=dict)
     fortification_recovery_targets: set[Pos] = field(default_factory=set)

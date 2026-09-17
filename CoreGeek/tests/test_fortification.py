@@ -544,6 +544,46 @@ class FortificationTests(unittest.TestCase):
         self.assertEqual(builder_id, 10010)
         self.assertEqual(len(state.fortification_batch_targets), 1)
 
+    def test_existing_stone_avoids_unneeded_mine_detour_near_dusk(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 61
+        payload["mapInfo"].update({
+            "width": 20,
+            "height": 20,
+            "zones": [{"pos": {"x": 0, "y": 0}, "neutralType": "stone"}],
+        })
+        builder = unit(10010, "worker", 11, 8)
+        builder["backpack"] = ["stone"]
+        payload["teamOur"].update({
+            "teamId": "fortification-held-stone-prefix",
+            "roles": [
+                builder,
+                unit(10013, "station", 9, 9),
+                unit(10020, "gatling", 8, 8),
+                unit(10030, "railgun", 9, 7),
+                unit(10040, "rocket", 10, 7),
+            ],
+        })
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 17, 9),
+        ]
+        payload["robot"]["roles"] = []
+        state = SessionState(
+            "fortification-held-stone-prefix", "challenger",
+        )
+
+        builder_id = prepare_fortification(
+            Turn.load(payload),
+            state,
+            wall_build_positions(Turn.load(payload)),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=256,
+        )
+
+        self.assertEqual(builder_id, 10010)
+        self.assertEqual(len(state.fortification_batch_targets), 1)
+
     def test_batch_never_exceeds_current_backpack_capacity(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
         payload["roundNo"] = 5

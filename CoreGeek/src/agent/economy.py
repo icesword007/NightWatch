@@ -41,6 +41,8 @@ INVESTMENT_ITEM_PREFIXES = (
     "WeaponUpgradeVoucher",
     "WallUpgradeVoucher",
 )
+EMERGENCY_MEDICINE_HEALTH = 40
+ROBOT_ATTACK_RANGE = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -785,6 +787,7 @@ def _continue_plan(
             max_expansions,
             preferred_post_id=post_weapon_id,
             preferred_use_target_id=use_target_id,
+            gate_new_maintenance=False,
         )
     if plan.reason.startswith("mine:"):
         if worker.backpack_full or turn.zones.get(plan.target) not in MINERALS:
@@ -1181,12 +1184,48 @@ def _joint_funding_route(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
+    *,
+    candidate_use_target_id: int | None = None,
 ) -> JointFundingRoute | None:
     context = _ROUTE_SEARCH_CONTEXT.get()
     price = turn.weapon_prices.get(item)
     if price is None:
         return None
-    preferred_use_target_id = existing[2] if existing is not None else None
+    if (
+        existing is None
+        and item == "WallFixer"
+        and candidate_use_target_id is None
+    ):
+        options = tuple(
+            option
+            for target in _item_targets(turn, item)
+            for option in (
+                _joint_funding_route(
+                    turn,
+                    buyer,
+                    contributor,
+                    item,
+                    None,
+                    clock,
+                    deadline,
+                    max_expansions,
+                    candidate_use_target_id=target.unit_id,
+                ),
+            )
+            if option is not None
+        )
+        return min(
+            options,
+            key=lambda option: (
+                max(option.buyer_rounds, option.contributor_rounds),
+                option.buyer_rounds + option.contributor_rounds,
+                option.use_target_id or 0,
+            ),
+            default=None,
+        )
+    preferred_use_target_id = (
+        existing[2] if existing is not None else candidate_use_target_id
+    )
     preferred_target = (
         turn.unit(preferred_use_target_id)
         if preferred_use_target_id is not None else None
@@ -1263,6 +1302,7 @@ def _joint_funding_route(
                 max_expansions,
                 preferred_post_id=preferred_buyer_post,
                 preferred_use_target_id=preferred_use_target_id,
+                gate_new_maintenance=existing is None,
             )
         )
         if purchase is None:
@@ -1290,6 +1330,19 @@ def _joint_funding_route(
                     or contributor_rounds > turn.rounds_until_night
                 ):
                     deadline_rejected = True
+                    continue
+                if (
+                    existing is None
+                    and not _maintenance_purchase_worthwhile(
+                        turn,
+                        buyer,
+                        item,
+                        replace(
+                            purchase,
+                            rounds=buyer_rounds + contributor_rounds,
+                        ),
+                    )
+                ):
                     continue
                 candidate = JointFundingRoute(
                     buyer.unit_id,
@@ -1671,7 +1724,7 @@ def _trade_or_mine(
             price = turn.weapon_prices.get(purchase)
             if price is None or price > available_gold:
                 continue
-            if _is_investment_item(purchase):
+            if turn.is_day:
                 route = _purchase_route(
                     turn, worker, purchase, clock, deadline, max_expansions,
                 )
@@ -1689,6 +1742,11 @@ def _trade_or_mine(
                 )
                 if candidate is not None:
                     return candidate
+                continue
+            if (
+                purchase == "Medicine"
+                and not _medicine_purchase_worthwhile(worker, 2)
+            ):
                 continue
             for target in sorted(
                 shops,
@@ -2135,6 +2193,7 @@ def _funding_action(
     preferred_post_id: int | None = None,
     preferred_use_target_id: int | None = None,
     verified_route: FundingRoute | None = None,
+    gate_new_maintenance: bool = True,
 ) -> PlannedAction | None:
     if hard_deadline is not None and turn.round_no > hard_deadline:
         return None
@@ -2229,6 +2288,7 @@ def _funding_action(
             max_expansions,
             preferred_post_id=preferred_post_id,
             preferred_use_target_id=preferred_use_target_id,
+            gate_new_maintenance=gate_new_maintenance,
         )
         if route is None or route.rounds > turn.rounds_until_night:
             return None
@@ -2271,6 +2331,7 @@ def _funding_action(
         max_expansions,
         preferred_post_id=preferred_post_id,
         preferred_use_target_id=preferred_use_target_id,
+        gate_new_maintenance=gate_new_maintenance,
     )
     route = verified_route or chain
     if route is None or route.rounds > turn.rounds_until_night:
@@ -2346,6 +2407,7 @@ def _funding_chain(
     *,
     preferred_post_id: int | None = None,
     preferred_use_target_id: int | None = None,
+    gate_new_maintenance: bool = True,
 ) -> FundingRoute | None:
     minerals = Counter(entry for entry in worker.backpack if entry in MINERALS)
     sale_actions = 0
@@ -2385,6 +2447,8 @@ def _funding_chain(
             max_expansions,
             preferred_post_id=preferred_post_id,
             preferred_use_target_id=preferred_use_target_id,
+            gate_new_maintenance=gate_new_maintenance,
+            maintenance_round_prefix=vendor_cost + sale_actions,
         )
         if purchase is None:
             continue
@@ -2399,6 +2463,13 @@ def _funding_chain(
             purchase.post_weapon_id,
             purchase.post_stand,
         )
+        if (
+            gate_new_maintenance
+            and not _maintenance_purchase_worthwhile(
+                turn, worker, item, candidate,
+            )
+        ):
+            continue
         if best is None or _funding_route_key(candidate) < _funding_route_key(best):
             best = candidate
     return best
@@ -2414,7 +2485,42 @@ def _purchase_route(
     *,
     preferred_post_id: int | None = None,
     preferred_use_target_id: int | None = None,
+    gate_new_maintenance: bool = True,
+    maintenance_round_prefix: int = 0,
 ) -> FundingRoute | None:
+    if (
+        gate_new_maintenance
+        and item == "WallFixer"
+        and preferred_use_target_id is None
+    ):
+        routes = tuple(
+            route
+            for target in _item_targets(turn, item)
+            for route in (
+                _purchase_route(
+                    turn,
+                    worker,
+                    item,
+                    clock,
+                    deadline,
+                    max_expansions,
+                    preferred_post_id=preferred_post_id,
+                    preferred_use_target_id=target.unit_id,
+                    gate_new_maintenance=False,
+                ),
+            )
+            if route is not None
+            and _maintenance_purchase_worthwhile(
+                turn,
+                worker,
+                item,
+                replace(
+                    route,
+                    rounds=maintenance_round_prefix + route.rounds,
+                ),
+            )
+        )
+        return min(routes, key=_funding_route_key, default=None)
     best = None
     for shop in turn.zones_of("weaponShop"):
         shop_route = _best_adjacent_route(
@@ -2433,6 +2539,7 @@ def _purchase_route(
             max_expansions,
             preferred_post_id=preferred_post_id,
             preferred_use_target_id=preferred_use_target_id,
+            gate_new_maintenance=gate_new_maintenance,
         )
         if held is None:
             continue
@@ -2447,9 +2554,57 @@ def _purchase_route(
             held.post_weapon_id,
             held.post_stand,
         )
+        if (
+            gate_new_maintenance
+            and not _maintenance_purchase_worthwhile(
+                turn,
+                worker,
+                item,
+                replace(
+                    candidate,
+                    rounds=maintenance_round_prefix + candidate.rounds,
+                ),
+            )
+        ):
+            continue
         if best is None or _funding_route_key(candidate) < _funding_route_key(best):
             best = candidate
     return best
+
+
+def _maintenance_purchase_worthwhile(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    route: FundingRoute,
+) -> bool:
+    if item == "Medicine":
+        return _medicine_purchase_worthwhile(worker, route.rounds)
+    elif item == "WallFixer":
+        target = (
+            turn.unit(route.use_target_id)
+            if route.use_target_id is not None else None
+        )
+        if target is None or target.kind != WALL:
+            return False
+        recovery = _max_building_health(target) - target.health
+        urgent = any(
+            robot.target_team == turn.team_type
+            and distance(robot.pos, target.pos) <= ROBOT_ATTACK_RANGE
+            and robot.attack_power >= target.health
+            for robot in turn.robots
+        )
+    else:
+        return True
+    return recovery > 0 and (urgent or recovery >= max(route.rounds, 1))
+
+
+def _medicine_purchase_worthwhile(worker: Unit, rounds: int) -> bool:
+    recovery = _max_role_health(worker) - worker.health
+    return recovery > 0 and (
+        worker.health <= EMERGENCY_MEDICINE_HEALTH
+        or recovery >= max(rounds, 1)
+    )
 
 
 def _held_item_route(
@@ -2462,6 +2617,7 @@ def _held_item_route(
     *,
     preferred_post_id: int | None = None,
     preferred_use_target_id: int | None = None,
+    gate_new_maintenance: bool = False,
 ) -> FundingRoute | None:
     targets = _item_targets(turn, item)
     context = _ROUTE_SEARCH_CONTEXT.get()
@@ -2516,6 +2672,13 @@ def _held_item_route(
                     weapon.unit_id,
                     post_stand,
                 )
+                if (
+                    gate_new_maintenance
+                    and not _maintenance_purchase_worthwhile(
+                        turn, worker, item, candidate,
+                    )
+                ):
+                    continue
                 key = (_funding_route_key(candidate), target_id or 0)
                 if best is None or key < best[0]:
                     best = (key, candidate)

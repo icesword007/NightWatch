@@ -7,10 +7,18 @@ from .actions import ActionProposal, PlannedAction
 from .fortification import gunner_stand_sort_key
 from .grid import next_step
 from .layout import preferred_gunner_stand
-from .protocol import PlayerTask, Pos, Robot, Turn, Unit, distance, move_command
+from .protocol import (
+    DUSK_POSITIONING_ROUNDS,
+    PlayerTask,
+    Pos,
+    Robot,
+    Turn,
+    Unit,
+    distance,
+    move_command,
+)
 from .state import SessionState
 
-DUSK_POSITIONING_ROUNDS = 12
 EMERGENCY_MEDICINE_HEALTH = 40
 TASK_RECALL_THREAT_DISTANCE = 3
 MIN_TASK_INTERACTION_ROUNDS = 5
