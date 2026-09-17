@@ -178,7 +178,8 @@ class EconomyTests(unittest.TestCase):
             {"name": "WallUpgradeVoucher1", "price": 20},
         ]
 
-        response = DecisionEngine().decide(payload)
+        engine = DecisionEngine()
+        response = engine.decide(payload)
 
         self.assertFalse(any(
             command.get("name") == "WallUpgradeVoucher1"
@@ -328,7 +329,8 @@ class EconomyTests(unittest.TestCase):
                     items=("WeaponUpgradeVoucher1",)),
         )
 
-        response = DecisionEngine().decide(payload)
+        engine = DecisionEngine()
+        response = engine.decide(payload)
 
         uses = [
             command["targetPos"][0]
@@ -1356,6 +1358,654 @@ class EconomyTests(unittest.TestCase):
         self.assertTrue(
             engine.state.state.plans[10010].reason.startswith("fund:")
         )
+
+    def test_wall_fixer_batch_collects_and_realizes_two_purchases_in_one_trip(self):
+        payload = economy_payload(
+            round_no=10,
+            worker_pos=(2, 1),
+            items=("copper",),
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-procurement-batch"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        payload["teamOur"]["roles"].extend([
+            role(10100, "wall", 7, 4, health=900),
+            role(10101, "wall", 7, 6, health=900),
+        ])
+        def run_chain(run_payload):
+            engine = DecisionEngine()
+            actions = []
+            for _ in range(30):
+                response = engine.decide(run_payload)
+                command = response["roleCommandMap"].get("10010")
+                self.assertIsNotNone(command)
+                actions.append(copy.deepcopy(command))
+                worker = run_payload["teamOur"]["roles"][0]
+                action = command["action"]
+                if action == "move":
+                    worker["pos"] = copy.deepcopy(command["targetPos"][0])
+                elif action == "collect":
+                    worker["backpack"].append("copper")
+                elif action == "sell":
+                    quantity = command.get("num", 1)
+                    for _ in range(quantity):
+                        worker["backpack"].remove(command["name"])
+                    run_payload["teamOur"]["goldNum"] += 10 * quantity
+                elif action == "buy":
+                    worker["backpack"].append(command["name"])
+                    run_payload["teamOur"]["goldNum"] -= 10
+                elif action == "use":
+                    worker["backpack"].remove(command["name"])
+                    target_pos = command["targetPos"][0]
+                    target = next(
+                        entry for entry in run_payload["teamOur"]["roles"]
+                        if entry["pos"] == target_pos
+                    )
+                    target["health"] = 1000
+                    if sum(
+                        entry["action"] == "use" for entry in actions
+                    ) == 2:
+                        return engine, actions, run_payload
+                run_payload["roundNo"] += 1
+                run_payload["lastRoundRoleActionResults"] = {"10010": True}
+            self.fail("two WallFixer uses did not complete")
+
+        with patch.object(
+            economy, "_new_procurement_batch_action", return_value=None,
+        ):
+            _, baseline_actions, baseline_payload = run_chain(
+                copy.deepcopy(payload),
+            )
+        engine, actions, payload = run_chain(payload)
+
+        self.assertEqual(actions[0], {
+            "action": "collect", "targetPos": [{"x": 2, "y": 2}],
+        })
+        self.assertTrue(
+            engine.state.state.action_history[0].pending.action == "collect"
+        )
+        sales = [entry for entry in actions if entry["action"] == "sell"]
+        self.assertEqual(sales, [{
+            "action": "sell", "name": "copper", "num": 2,
+        }])
+        self.assertEqual(sum(entry["action"] == "use" for entry in actions), 2)
+        self.assertEqual(
+            sum(entry["action"] == "collect" for entry in actions), 1,
+        )
+        self.assertEqual(
+            sum(entry["action"] == "sell" for entry in baseline_actions), 2,
+        )
+        self.assertLess(len(actions), len(baseline_actions))
+        self.assertEqual(len(baseline_actions), 21)
+        self.assertEqual(len(actions), 13)
+        self.assertEqual(
+            sum(entry["action"] == "move" for entry in baseline_actions), 14,
+        )
+        self.assertEqual(
+            sum(entry["action"] == "move" for entry in actions), 7,
+        )
+        self.assertEqual(
+            [
+                index for index, entry in enumerate(baseline_actions, start=10)
+                if entry["action"] == "use"
+            ],
+            [17, 30],
+        )
+        self.assertEqual(
+            [
+                index for index, entry in enumerate(actions, start=10)
+                if entry["action"] == "use"
+            ],
+            [18, 22],
+        )
+        self.assertEqual(payload["teamOur"]["goldNum"], 0)
+        self.assertEqual(baseline_payload["teamOur"]["goldNum"], 0)
+
+    def test_wall_fixer_batch_does_not_delay_when_full_chain_misses_dusk(self):
+        payload = economy_payload(
+            round_no=65,
+            worker_pos=(2, 1),
+            items=("copper",),
+            gold=0,
+        )
+        payload["teamOur"]["teamId"] = "economy-procurement-dusk"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        payload["teamOur"]["roles"].extend([
+            role(10100, "wall", 7, 4, health=900),
+            role(10101, "wall", 7, 6, health=900),
+        ])
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+
+    def _procurement_payload(self, *, capacity=100, items=("copper",)):
+        payload = economy_payload(
+            round_no=10, worker_pos=(2, 1), items=items, gold=0,
+        )
+        payload["teamOur"]["teamId"] = f"procurement-{capacity}-{len(items)}"
+        payload["teamOur"]["roles"][0]["backPackCapability"] = capacity
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        payload["teamOur"]["roles"].extend([
+            role(10100, "wall", 7, 4, health=900),
+            role(10101, "wall", 7, 6, health=900),
+        ])
+        return payload
+
+    def test_procurement_batch_requires_spare_capacity(self):
+        payload = self._procurement_payload(capacity=1)
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+
+    def test_procurement_batch_declines_mixed_mineral_inventory(self):
+        payload = self._procurement_payload(items=("copper", "stone"))
+        payload["vendorShopList"].append({"name": "stone", "price": 10})
+        payload["teamOur"]["roles"].append(
+            role(10102, "wall", 7, 8, health=900),
+        )
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+
+    def test_procurement_batch_declines_unknown_capacity(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"][0]["backPackCapability"] = None
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+
+    def test_held_wall_fixer_is_used_without_starting_batch(self):
+        payload = self._procurement_payload(items=("WallFixer",))
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        command = response["roleCommandMap"]["10010"]
+        self.assertIn(command["action"], ("move", "use"))
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("batch:"))
+
+    def test_procurement_batch_keeps_emergency_wall_repair_immediate(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"][-2]["health"] = 5
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 7, "y": 3},
+            "roleType": "smallRobot",
+            "health": 40,
+            "attackPower": 10,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+    def test_procurement_batch_ignores_unworthy_future_wall_demand(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"][-1]["health"] = 999
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+    def test_procurement_batch_checks_all_urgent_walls_before_creation(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"][-1]["health"] = 20
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 7, "y": 8},
+            "roleType": "largeRobot",
+            "health": 500,
+            "attackPower": 20,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+
+    def test_procurement_batch_stops_when_emergency_appears(self):
+        payload = self._procurement_payload()
+        engine = DecisionEngine()
+        engine.decide(payload)
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["teamOur"]["roles"][-2]["health"] = 5
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 7, "y": 3},
+            "roleType": "smallRobot",
+            "health": 40,
+            "attackPower": 10,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        response = engine.decide(payload)
+
+        self.assertNotEqual(response["roleCommandMap"]["10010"]["action"], "collect")
+        self.assertFalse(
+            engine.state.state.plans[10010].reason.startswith("batch:"),
+        )
+
+    def test_procurement_batch_stops_for_emergency_medicine(self):
+        payload = self._procurement_payload()
+        payload["weaponShopList"].insert(
+            0, {"name": "Medicine", "price": 10},
+        )
+        engine = DecisionEngine()
+        engine.decide(payload)
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["teamOur"]["roles"][0]["health"] = 40
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        response = engine.decide(payload)
+
+        self.assertNotEqual(response["roleCommandMap"]["10010"]["action"], "collect")
+        self.assertIn(
+            "Medicine", engine.state.state.plans[10010].reason,
+        )
+
+    def test_procurement_batch_does_not_delay_missing_tower_funding(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["id"] != 10040
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+
+    def test_active_procurement_batch_stops_when_tower_disappears(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"].append(
+            role(10102, "wall", 7, 8, health=900),
+        )
+        engine = DecisionEngine()
+        engine.decide(payload)
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10010"]["action"],
+            "collect",
+        )
+        payload["roundNo"] = 12
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["id"] != 10040
+        ]
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        response = engine.decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        self.assertFalse(
+            engine.state.state.plans[10010].reason.startswith("batch:"),
+        )
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith("fund:build:"),
+        )
+
+    def test_active_procurement_batch_stops_for_new_key_upgrade(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"].append(
+            role(10102, "wall", 7, 8, health=900),
+        )
+        engine = DecisionEngine()
+        engine.decide(payload)
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["weaponShopList"].append({
+            "name": "WeaponUpgradeVoucher1", "price": 10,
+        })
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        response = engine.decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        self.assertFalse(
+            engine.state.state.plans[10010].reason.startswith("batch:"),
+        )
+
+    def test_procurement_batch_shrinks_to_remaining_complete_route_window(self):
+        payload = self._procurement_payload()
+        payload["roundNo"] = 55
+        payload["teamOur"]["teamId"] = "procurement-window-shrink"
+        positions = (
+            (8, 4), (8, 5), (8, 6),
+            (9, 4), (9, 5), (9, 6),
+            (10, 4), (10, 5), (10, 6),
+        )
+        payload["teamOur"]["roles"].extend(
+            role(10200 + offset, "wall", *pos, health=900)
+            for offset, pos in enumerate(positions)
+        )
+        engine = DecisionEngine()
+
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        batch = economy._procurement_batch(
+            engine.state.state.plans[10010].reason,
+        )
+        self.assertEqual(batch.goal_count, 8)
+
+    def test_procurement_batch_keeps_weapon_upgrade_immediate(self):
+        payload = economy_payload(
+            round_no=10, worker_pos=(2, 1), items=("copper",), gold=0,
+        )
+        payload["teamOur"]["teamId"] = "procurement-key-upgrade"
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher1", "price": 10,
+        }]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+    def test_procurement_batch_goal_is_fixed_and_price_change_cancels_it(self):
+        payload = self._procurement_payload()
+        engine = DecisionEngine()
+        first = engine.decide(payload)
+        first_reason = engine.state.state.plans[10010].reason
+        first_batch = economy._procurement_batch(first_reason)
+        self.assertEqual(first["roleCommandMap"]["10010"]["action"], "collect")
+        self.assertEqual(first_batch.goal_count, 2)
+
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        payload["vendorShopList"] = [{"name": "copper", "price": 4}]
+        response = engine.decide(payload)
+
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("batch:"))
+
+    def test_active_batch_shrinks_when_future_repair_is_no_longer_worthwhile(self):
+        payload = self._procurement_payload(items=("copper", "copper"))
+        payload["teamOur"]["teamId"] = "procurement-demand-shrink"
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        engine = DecisionEngine()
+        first = engine.decide(payload)
+        self.assertEqual(first["roleCommandMap"]["10010"]["action"], "collect")
+        self.assertEqual(
+            economy._procurement_batch(
+                engine.state.state.plans[10010].reason,
+            ).goal_count,
+            4,
+        )
+
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["teamOur"]["roles"][-1]["health"] = 999
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        response = engine.decide(payload)
+
+        self.assertIn(
+            response["roleCommandMap"]["10010"]["action"], ("move", "sell"),
+        )
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        actions = []
+        for _ in range(16):
+            command = response["roleCommandMap"]["10010"]
+            actions.append(copy.deepcopy(command))
+            worker = payload["teamOur"]["roles"][0]
+            action = command["action"]
+            self.assertNotEqual(action, "collect")
+            if action == "move":
+                worker["pos"] = copy.deepcopy(command["targetPos"][0])
+            elif action == "sell":
+                quantity = command.get("num", 1)
+                for _ in range(quantity):
+                    worker["backpack"].remove(command["name"])
+                payload["teamOur"]["goldNum"] += 5 * quantity
+            elif action == "buy":
+                worker["backpack"].append(command["name"])
+                payload["teamOur"]["goldNum"] -= 10
+            elif action == "use":
+                worker["backpack"].remove(command["name"])
+                target_pos = command["targetPos"][0]
+                next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["pos"] == target_pos
+                )["health"] = 1000
+                break
+            payload["roundNo"] += 1
+            payload["lastRoundRoleActionResults"] = {"10010": True}
+            response = engine.decide(payload)
+        self.assertEqual(actions[-1]["action"], "use")
+        self.assertEqual(
+            [action for action in actions if action["action"] == "sell"],
+            [{"action": "sell", "name": "copper", "num": 3}],
+        )
+        self.assertFalse(
+            engine.state.state.plans[10010].reason.startswith("batch:"),
+        )
+
+    def test_existing_funding_commitment_is_not_rebatched(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        engine = DecisionEngine()
+        first = engine.decide(payload)
+        self.assertNotEqual(first["roleCommandMap"]["10010"]["action"], "collect")
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"].append(
+            role(10101, "wall", 7, 6, health=900),
+        )
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        response = engine.decide(payload)
+
+        self.assertNotEqual(response["roleCommandMap"]["10010"]["action"], "collect")
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+    def test_procurement_batch_primary_target_loss_falls_back_without_rebatch(self):
+        payload = self._procurement_payload()
+        engine = DecisionEngine()
+        engine.decide(payload)
+        batch = economy._procurement_batch(engine.state.state.plans[10010].reason)
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["id"] != batch.primary_target_id
+        ]
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        response = engine.decide(payload)
+
+        self.assertNotEqual(response["roleCommandMap"]["10010"]["action"], "collect")
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("batch:"))
+
+    def test_procurement_batch_shrinks_when_mine_disappears(self):
+        payload = self._procurement_payload()
+        engine = DecisionEngine()
+        engine.decide(payload)
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["backpack"].append("copper")
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        payload["mapInfo"]["zones"] = [
+            zone for zone in payload["mapInfo"]["zones"]
+            if zone["neutralType"] != "copper"
+        ]
+
+        response = engine.decide(payload)
+
+        self.assertIn(
+            response["roleCommandMap"]["10010"]["action"], ("move", "sell"),
+        )
+        self.assertNotEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+
+    def test_failed_batch_collection_does_not_recreate_commitment(self):
+        payload = self._procurement_payload()
+        engine = DecisionEngine()
+        engine.decide(payload)
+        payload["roundNo"] = 11
+        payload["lastRoundRoleActionResults"] = {"10010": False}
+
+        response = engine.decide(payload)
+
+        self.assertNotEqual(response["roleCommandMap"]["10010"]["action"], "collect")
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("batch:"))
+
+    def test_replayed_batch_request_is_cached_without_duplicate_state(self):
+        payload = self._procurement_payload()
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)
+        observations = engine.state.state.observation_count
+        second = engine.decide(copy.deepcopy(payload))
+
+        self.assertEqual(first, second)
+        self.assertEqual(engine.state.state.observation_count, observations)
+        self.assertEqual(
+            sum(
+                plan.reason.startswith("batch:")
+                for plan in engine.state.state.plans.values()
+            ),
+            1,
+        )
+
+    def test_procurement_batch_is_stable_under_role_reordering(self):
+        payload = self._procurement_payload()
+        reordered = copy.deepcopy(payload)
+        reordered["teamOur"]["teamId"] = "procurement-reordered"
+        reordered["teamOur"]["roles"] = list(reversed(
+            reordered["teamOur"]["roles"],
+        ))
+
+        first = DecisionEngine()
+        second = DecisionEngine()
+        first_response = first.decide(payload)
+        second_response = second.decide(reordered)
+
+        self.assertEqual(
+            first_response["roleCommandMap"]["10010"],
+            second_response["roleCommandMap"]["10010"],
+        )
+        self.assertEqual(
+            economy._procurement_batch(
+                first.state.state.plans[10010].reason,
+            ).reserved_target_ids,
+            economy._procurement_batch(
+                second.state.state.plans[10010].reason,
+            ).reserved_target_ids,
+        )
+
+    def test_two_workers_cannot_persist_duplicate_batch_targets(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["teamId"] = "procurement-two-workers"
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 1, 2, items=("copper",)),
+        )
+        engine = DecisionEngine()
+
+        engine.decide(payload)
+
+        batches = [
+            economy._procurement_batch(plan.reason)
+            for plan in engine.state.state.plans.values()
+            if plan.reason.startswith("batch:")
+        ]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(set(batches[0].reserved_target_ids), {10100, 10101})
+
+    def test_procurement_batch_stays_within_large_map_search_budget(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["teamId"] = "procurement-large-map"
+        payload["mapInfo"].update({"width": 41, "height": 32})
+        payload["teamOur"]["roles"].extend(
+            role(10200 + offset, "wall", 12 + offset, 12, health=900)
+            for offset in range(8)
+        )
+        traces = []
+
+        response = DecisionEngine(max_search_expansions=64).decide(
+            payload, trace_sink=traces.append,
+        )
+
+        self.assertEqual(
+            response["roleCommandMap"]["10010"]["action"], "collect",
+        )
+        self.assertLessEqual(
+            traces[0]["economyPlanning"]["pathSearches"], 1600,
+        )
+
+    def test_batch_plan_releases_on_day_boundary_and_death(self):
+        payload = self._procurement_payload()
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        night = copy.deepcopy(payload)
+        night["roundNo"] = 71
+        night["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(night)
+        self.assertFalse(
+            engine.state.state.plans.get(10010)
+            and engine.state.state.plans[10010].reason.startswith("batch:")
+        )
+
+        payload["teamOur"]["teamId"] = "procurement-death"
+        engine = DecisionEngine()
+        engine.decide(payload)
+        payload["roundNo"] = 11
+        payload["teamOur"]["roles"][0]["health"] = 0
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(payload)
+        self.assertNotIn(10010, engine.state.state.plans)
 
     def test_funding_executes_vendor_from_the_verified_complete_route(self):
         payload = economy_payload(

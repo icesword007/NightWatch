@@ -15,6 +15,7 @@ from .grid import next_step
 from .layout import ensure_defense_layout
 from .protocol import (
     PIONEER,
+    ROUNDS_PER_DAY,
     STATION,
     TOWER_TYPES,
     WALL,
@@ -56,6 +57,19 @@ class FundingRoute:
     use_stand: Pos
     post_weapon_id: int
     post_stand: Pos
+
+
+@dataclass(frozen=True, slots=True)
+class ProcurementBatch:
+    item: str
+    post_weapon_id: int
+    primary_target_id: int
+    mineral: str
+    mine: Pos
+    goal_count: int
+    quote: int
+    item_price: int
+    reserved_target_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +122,7 @@ class RouteSearchContext:
     investment_targets: set[int] = field(default_factory=set)
     investment_owners: dict[int, int] = field(default_factory=dict)
     wall_upgrade_targets: tuple[Pos, ...] = ()
+    procurement_blocked_role_ids: set[int] = field(default_factory=set)
 
 
 _ROUTE_SEARCH_CONTEXT: ContextVar[RouteSearchContext | None] = ContextVar(
@@ -158,7 +173,7 @@ def propose_economy(
             investment = next((
                 candidate for candidate in result
                 if candidate.plan_reason is not None
-                and candidate.plan_reason.startswith(("fund:", "use:"))
+                and candidate.plan_reason.startswith(("fund:", "use:", "batch:"))
                 and _is_investment_item(
                     candidate.plan_reason.split(":", 2)[1]
                 )
@@ -207,6 +222,22 @@ def _propose_economy(
     night_cleared: bool = False,
 ) -> tuple[PlannedAction, ...]:
     context = _ROUTE_SEARCH_CONTEXT.get()
+    current_day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+    state.procurement_blocked_days = {
+        role_id: day for role_id, day in state.procurement_blocked_days.items()
+        if day == current_day
+    }
+    if context is not None:
+        context.procurement_blocked_role_ids.update(
+            state.procurement_blocked_days,
+        )
+    for role_id in reserved_role_ids:
+        plan = state.plans.get(role_id)
+        if plan is not None and plan.reason.startswith("batch:"):
+            state.plans.pop(role_id, None)
+            state.procurement_blocked_days[role_id] = current_day
+            if context is not None:
+                context.procurement_blocked_role_ids.add(role_id)
     if context is not None:
         contenders: dict[int, list[tuple[bool, int]]] = {}
         live = {role.unit_id: role for role in turn.controllable()}
@@ -218,24 +249,25 @@ def _propose_economy(
                 and turn.round_no > plan.deadline_round
             ):
                 continue
-            target_id = _plan_use_target_id(plan)
             parts = plan.reason.split(":")
             joint = _joint_plan(plan.reason)
             owner_id = joint[3] if joint is not None else role_id
             if joint is not None and role_id != owner_id:
                 continue
             role = live.get(owner_id)
-            if target_id is None or role is None or len(parts) < 2:
+            target_ids = _plan_use_target_ids(plan)
+            if not target_ids or role is None or len(parts) < 2:
                 continue
             item = parts[1]
             if plan.reason.startswith("use:") and item not in role.backpack:
                 continue
-            target = turn.unit(target_id)
-            if target is None or not _item_matches_target(item, target):
-                continue
-            contenders.setdefault(target_id, []).append(
-                (item not in role.backpack, owner_id)
-            )
+            for target_id in target_ids:
+                target = turn.unit(target_id)
+                if target is None or not _item_matches_target(item, target):
+                    continue
+                contenders.setdefault(target_id, []).append(
+                    (item not in role.backpack, owner_id)
+                )
         context.investment_owners = {
             target_id: min(options)[1]
             for target_id, options in contenders.items()
@@ -273,6 +305,14 @@ def _propose_economy(
         and completed.pending.target is not None
         and completed.pending.source_session == state.session_index
     }
+    if context is not None:
+        context.procurement_blocked_role_ids.update(
+            completed.pending.actor_id
+            for completed in state.action_history
+            if completed.pending.action == "collect"
+            and completed.success is False
+            and completed.pending.source_session == state.session_index
+        )
     direct_wall_request = (
         need_wall
         and not state.fortification_targets
@@ -300,7 +340,7 @@ def _propose_economy(
             turn, role, clock, deadline, max_expansions,
             preferred_use_target_id=_plan_use_target_id(plan),
         )
-        if plan is not None and plan.reason.startswith("fund:"):
+        if plan is not None and plan.reason.startswith(("fund:", "batch:")):
             self_care = (
                 candidate is not None
                 and candidate.proposal.command.get("action") == "use"
@@ -404,6 +444,7 @@ def _propose_economy(
                 clock, deadline, max_expansions,
             )
         current_plan = state.plans.get(worker.unit_id)
+        batch_invalidated = False
         funding_rechecked = False
         if (
             candidate is None
@@ -432,6 +473,16 @@ def _propose_economy(
                 turn, state, worker, failed_builds, failed_mines,
                 clock, deadline, max_expansions,
             )
+            if (
+                candidate is None
+                and current_plan is not None
+                and current_plan.reason.startswith("batch:")
+            ):
+                state.plans.pop(worker.unit_id, None)
+                state.procurement_blocked_days[worker.unit_id] = current_day
+                if context is not None:
+                    context.procurement_blocked_role_ids.add(worker.unit_id)
+                batch_invalidated = True
         if candidate is None:
             candidate = _tower_action(
                 turn,
@@ -450,6 +501,7 @@ def _propose_economy(
                 clock, deadline, max_expansions, failed_mines,
                 check_funding=not funding_rechecked,
                 night_cleared=night_cleared,
+                allow_procurement_batch=not batch_invalidated,
             )
         if candidate is not None and worker.unit_id in joint_cancellations:
             diagnostic = dict(candidate.diagnostic or {})
@@ -670,9 +722,60 @@ def _plan_use_target_id(plan) -> int | None:
             return int(parts[2])
         if len(parts) >= 4 and parts[0] == "fund":
             return int(parts[3]) or None
+        batch = _procurement_batch(reason)
+        if batch is not None:
+            return batch.primary_target_id
     except ValueError:
         return None
     return None
+
+
+def _procurement_reason(batch: ProcurementBatch) -> str:
+    reserved = ",".join(str(target_id) for target_id in batch.reserved_target_ids)
+    return ":".join((
+        "batch", batch.item, str(batch.post_weapon_id),
+        str(batch.primary_target_id), batch.mineral,
+        str(batch.mine.x), str(batch.mine.y), str(batch.goal_count),
+        str(batch.quote), str(batch.item_price), reserved,
+    ))
+
+
+def _procurement_batch(reason: str | None) -> ProcurementBatch | None:
+    if not isinstance(reason, str) or not reason.startswith("batch:"):
+        return None
+    parts = reason.split(":")
+    if len(parts) != 11 or parts[4] not in MINERALS:
+        return None
+    try:
+        reserved = tuple(
+            int(target_id) for target_id in parts[10].split(",") if target_id
+        )
+        batch = ProcurementBatch(
+            parts[1], int(parts[2]), int(parts[3]), parts[4],
+            Pos(int(parts[5]), int(parts[6])), int(parts[7]),
+            int(parts[8]), int(parts[9]), reserved,
+        )
+    except ValueError:
+        return None
+    if (
+        batch.post_weapon_id <= 0
+        or batch.primary_target_id <= 0
+        or batch.goal_count <= 0
+        or batch.quote <= 0
+        or batch.item_price <= 0
+        or batch.primary_target_id not in batch.reserved_target_ids
+    ):
+        return None
+    return batch
+
+
+def _plan_use_target_ids(plan) -> tuple[int, ...]:
+    reason = getattr(plan, "reason", None) or getattr(plan, "plan_reason", None)
+    batch = _procurement_batch(reason)
+    if batch is not None:
+        return batch.reserved_target_ids
+    target_id = _plan_use_target_id(plan)
+    return (target_id,) if target_id is not None else ()
 
 
 def _reserve_investment_target(
@@ -681,8 +784,7 @@ def _reserve_investment_target(
 ) -> None:
     if context is None:
         return
-    target_id = _plan_use_target_id(candidate)
-    if target_id is not None:
+    for target_id in _plan_use_target_ids(candidate):
         joint = _joint_plan(candidate.plan_reason or "")
         owner_id = joint[3] if joint is not None else candidate.proposal.actor_id
         context.investment_targets.add(target_id)
@@ -706,6 +808,11 @@ def _continue_plan(
         return None
     if plan.deadline_round is not None and turn.round_no > plan.deadline_round:
         return None
+    if plan.reason.startswith("batch:"):
+        return _continue_procurement_batch(
+            turn, worker, plan.reason, plan.deadline_round,
+            clock, deadline, max_expansions,
+        )
     if plan.reason.startswith("build:"):
         kind = plan.reason.split(":", 1)[1]
         if (
@@ -821,6 +928,251 @@ def _continue_plan(
             turn, worker, plan.target, item, clock, deadline, max_expansions,
         )
     return None
+
+
+def _continue_procurement_batch(
+    turn: Turn,
+    worker: Unit,
+    reason: str,
+    hard_deadline: int | None,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    batch = _procurement_batch(reason)
+    if (
+        batch is None
+        or not turn.is_day
+        or hard_deadline is None
+        or turn.round_no > hard_deadline
+        or turn.vendor_prices.get(batch.mineral) != batch.quote
+        or turn.weapon_prices.get(batch.item) != batch.item_price
+    ):
+        return None
+    primary = turn.unit(batch.primary_target_id)
+    if primary is None or not _item_matches_target(batch.item, primary):
+        return None
+    if turn.station() is None or len(turn.weapons()) < MAX_WEAPONS:
+        return None
+    if _critical_purchase_available(
+        turn, worker, clock, deadline, max_expansions,
+    ):
+        return None
+    if (
+        worker.health <= EMERGENCY_MEDICINE_HEALTH
+        and worker.health < _max_role_health(worker)
+        and "Medicine" in turn.weapon_prices
+    ):
+        return None
+    if batch.item == "WallFixer" and any(
+        _wall_repair_urgent(turn, target)
+        for target in _item_targets(turn, batch.item)
+    ):
+        return None
+    remaining_targets = _continuing_procurement_target_ids(
+        turn,
+        worker,
+        batch,
+        clock,
+        deadline,
+        max_expansions,
+    )
+    if batch.primary_target_id not in remaining_targets:
+        return None
+    current_value = sum(
+        turn.vendor_prices.get(entry, 0)
+        for entry in worker.backpack if entry in MINERALS
+    )
+    current_count = worker.backpack.count(batch.mineral)
+    other_value = sum(
+        turn.vendor_prices.get(entry, 0)
+        for entry in worker.backpack
+        if entry in MINERALS and entry != batch.mineral
+    )
+    required_mineral_value = max(
+        0,
+        batch.item_price * len(remaining_targets) - turn.gold - other_value,
+    )
+    demand_goal = (
+        required_mineral_value + batch.quote - 1
+    ) // batch.quote
+    effective_goal = min(batch.goal_count, demand_goal)
+    can_finish_primary = turn.gold + current_value >= batch.item_price
+    keep_collecting = (
+        len(remaining_targets) >= 2
+        and turn.gold + current_value
+        < batch.item_price * len(remaining_targets)
+        and current_count < effective_goal
+        and not worker.backpack_full
+        and turn.zones.get(batch.mine) == batch.mineral
+        and distance(worker.pos, batch.mine) == 1
+    )
+    if keep_collecting:
+        remaining = effective_goal - current_count
+        projected = replace(
+            worker, backpack=worker.backpack + (batch.mineral,) * remaining,
+        )
+        route = _batch_funding_chain(
+            turn,
+            projected,
+            batch.item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=batch.post_weapon_id,
+            preferred_use_target_id=batch.primary_target_id,
+        )
+        if route is None or remaining + route.rounds > turn.rounds_until_night:
+            return None
+        return PlannedAction(
+            ActionProposal(
+                worker.unit_id,
+                worker.unit_id,
+                collect_command(batch.mine),
+                destination=batch.mine,
+            ),
+            batch.mine,
+            reason,
+            hard_deadline,
+            remaining + route.rounds,
+            diagnostic={"kind": "procurementBatch", "committed": True},
+        )
+    if not can_finish_primary:
+        return None
+    minerals = Counter(entry for entry in worker.backpack if entry in MINERALS)
+    if minerals:
+        route = _batch_funding_chain(
+            turn,
+            worker,
+            batch.item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=batch.post_weapon_id,
+            preferred_use_target_id=batch.primary_target_id,
+        )
+        if route is None or route.rounds > turn.rounds_until_night:
+            return None
+        sale = next((
+            (name, count) for name, count in sorted(
+                minerals.items(),
+                key=lambda entry: (
+                    -turn.vendor_prices.get(entry[0], 0), entry[0],
+                ),
+            )
+            if count > 0 and turn.vendor_prices.get(name, 0) > 0
+        ), None)
+        if sale is None or route.vendor is None or route.vendor_stand is None:
+            return None
+        if worker.pos == route.vendor_stand:
+            proposal = ActionProposal(
+                worker.unit_id,
+                worker.unit_id,
+                sell_command(sale[0], sale[1]),
+            )
+        else:
+            proposal = _move_to_stand(
+                turn, worker, route.vendor_stand,
+                clock, deadline, max_expansions,
+            )
+        if proposal is None:
+            return None
+        return PlannedAction(
+            proposal,
+            route.vendor,
+            reason,
+            hard_deadline,
+            route.rounds,
+            diagnostic={"kind": "procurementBatch", "committed": True},
+        )
+    return _funding_action(
+        turn,
+        worker,
+        batch.item,
+        hard_deadline,
+        clock,
+        deadline,
+        max_expansions,
+        preferred_post_id=batch.post_weapon_id,
+        preferred_use_target_id=batch.primary_target_id,
+        gate_new_maintenance=False,
+    )
+
+
+def _continuing_procurement_target_ids(
+    turn: Turn,
+    worker: Unit,
+    batch: ProcurementBatch,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[int, ...]:
+    result = []
+    for target_id in batch.reserved_target_ids:
+        if clock() >= deadline:
+            break
+        target = turn.unit(target_id)
+        if target is None or not _item_matches_target(batch.item, target):
+            continue
+        route = _batch_funding_chain(
+            turn,
+            worker,
+            batch.item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=batch.post_weapon_id,
+            preferred_use_target_id=target_id,
+        )
+        if (
+            route is None
+            or route.rounds > turn.rounds_until_night
+            or not _maintenance_purchase_worthwhile(
+                turn, worker, batch.item, route,
+            )
+        ):
+            continue
+        result.append(target_id)
+    return tuple(result)
+
+
+def _critical_purchase_available(
+    turn: Turn,
+    worker: Unit,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> bool:
+    inventory_value = sum(
+        turn.vendor_prices.get(entry, 0)
+        for entry in worker.backpack if entry in MINERALS
+    )
+    for item in _purchase_candidates(turn, worker):
+        if not item.startswith((
+            "WeaponUpgradeVoucher", "StationUpgradeVoucher",
+        )):
+            continue
+        price = turn.weapon_prices.get(item)
+        if price is None or price > turn.gold + inventory_value:
+            continue
+        route = (
+            _purchase_route(
+                turn, worker, item, clock, deadline, max_expansions,
+            )
+            if price <= turn.gold
+            else _funding_chain(
+                turn,
+                worker,
+                item,
+                price - turn.gold,
+                clock,
+                deadline,
+                max_expansions,
+            )
+        )
+        if route is not None and route.rounds <= turn.rounds_until_night:
+            return True
+    return False
 
 
 def _wall_action(
@@ -1702,12 +2054,14 @@ def _trade_or_mine(
     *,
     check_funding: bool = True,
     night_cleared: bool = False,
+    allow_procurement_batch: bool = True,
 ) -> PlannedAction | None:
     minerals = Counter(item for item in worker.backpack if item in MINERALS)
     vendors = turn.zones_of("vendor")
     if check_funding:
         candidate = _single_funding_action(
             turn, worker, available_gold, clock, deadline, max_expansions,
+            allow_procurement_batch=allow_procurement_batch,
         )
         if candidate is not None:
             return candidate
@@ -1820,6 +2174,8 @@ def _single_funding_action(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
+    *,
+    allow_procurement_batch: bool = True,
 ) -> PlannedAction | None:
     funded = _fundable_purchase(
         turn, worker, available_gold, clock, deadline, max_expansions,
@@ -1827,6 +2183,19 @@ def _single_funding_action(
     if funded is None:
         return None
     item, hard_deadline, route = funded
+    batch = _new_procurement_batch_action(
+        turn,
+        worker,
+        available_gold,
+        item,
+        hard_deadline,
+        route,
+        clock,
+        deadline,
+        max_expansions,
+    ) if allow_procurement_batch else None
+    if batch is not None:
+        return batch
     return _funding_action(
         turn,
         worker,
@@ -1837,6 +2206,302 @@ def _single_funding_action(
         max_expansions,
         verified_route=route,
     )
+
+
+def _new_procurement_batch_action(
+    turn: Turn,
+    worker: Unit,
+    available_gold: int,
+    item: str,
+    hard_deadline: int,
+    immediate_route: FundingRoute,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    if (
+        context is not None
+        and worker.unit_id in context.procurement_blocked_role_ids
+    ):
+        return None
+    if (
+        item != "WallFixer"
+        and not item.startswith("WallUpgradeVoucher")
+    ) or immediate_route.use_target_id is None:
+        return None
+    if turn.station() is None or len(turn.weapons()) < MAX_WEAPONS:
+        return None
+    if _critical_purchase_available(
+        turn, worker, clock, deadline, max_expansions,
+    ):
+        return None
+    primary = turn.unit(immediate_route.use_target_id)
+    if primary is None or (
+        item == "WallFixer" and _wall_repair_urgent(turn, primary)
+    ):
+        return None
+    if item == "WallFixer" and any(
+        _wall_repair_urgent(turn, target)
+        for target in _item_targets(turn, item)
+    ):
+        return None
+    adjacent_mines = tuple(sorted(
+        (
+            pos for pos, kind in turn.zones.items()
+            if kind in MINERALS
+            and distance(worker.pos, pos) == 1
+            and turn.vendor_prices.get(kind, 0) > 0
+        ),
+        key=lambda pos: (
+            -turn.vendor_prices.get(turn.zones[pos], 0), pos.x, pos.y,
+        ),
+    ))
+    if not adjacent_mines or worker.capacity is None:
+        return None
+    targets = _viable_procurement_targets(
+        turn,
+        worker,
+        item,
+        available_gold,
+        immediate_route,
+        clock,
+        deadline,
+        max_expansions,
+    )
+    if len(targets) < 2:
+        return None
+    price = turn.weapon_prices.get(item)
+    if price is None or price <= 0:
+        return None
+    inventory_value = sum(
+        turn.vendor_prices.get(entry, 0)
+        for entry in worker.backpack if entry in MINERALS
+    )
+    free_slots = worker.capacity - len(worker.backpack)
+    if free_slots <= 0:
+        return None
+    for mine in adjacent_mines:
+        mineral = turn.zones[mine]
+        if any(
+            entry in MINERALS and entry != mineral
+            for entry in worker.backpack
+        ):
+            continue
+        quote = turn.vendor_prices[mineral]
+        observed_need = price * len(targets)
+        needed_units = max(
+            0,
+            (observed_need - available_gold - inventory_value + quote - 1)
+            // quote,
+        )
+        extra = min(free_slots, needed_units)
+        if extra <= 0:
+            continue
+        projected = replace(
+            worker, backpack=worker.backpack + (mineral,) * extra,
+        )
+        projected_route = _batch_funding_chain(
+            turn,
+            projected,
+            item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=immediate_route.post_weapon_id,
+            preferred_use_target_id=primary.unit_id,
+        )
+        if projected_route is None:
+            continue
+        feasible_extra = min(
+            extra,
+            max(0, turn.rounds_until_night - projected_route.rounds),
+        )
+        if feasible_extra != extra:
+            extra = feasible_extra
+            if extra <= 0:
+                continue
+            projected = replace(
+                worker, backpack=worker.backpack + (mineral,) * extra,
+            )
+            projected_route = _batch_funding_chain(
+                turn,
+                projected,
+                item,
+                clock,
+                deadline,
+                max_expansions,
+                preferred_post_id=immediate_route.post_weapon_id,
+                preferred_use_target_id=primary.unit_id,
+            )
+            if projected_route is None:
+                continue
+        committed_rounds = extra + projected_route.rounds
+        if committed_rounds > turn.rounds_until_night:
+            continue
+        sale = _sale_for_deficit(
+            turn,
+            Counter(entry for entry in worker.backpack if entry in MINERALS),
+            price - available_gold,
+        )
+        if sale is None:
+            continue
+        immediate_value = turn.vendor_prices.get(sale[0], 0) * sale[1]
+        projected_value = inventory_value + extra * quote
+        if (
+            immediate_value <= 0
+            or projected_value * immediate_route.rounds
+            <= immediate_value * committed_rounds
+        ):
+            continue
+        affordable = min(
+            len(targets), (available_gold + projected_value) // price,
+        )
+        if affordable < 2:
+            continue
+        ordered_targets = (
+            primary,
+            *(target for target in targets if target.unit_id != primary.unit_id),
+        )
+        reserved_ids = tuple(
+            target.unit_id for target in ordered_targets[:affordable]
+        )
+        batch = ProcurementBatch(
+            item,
+            immediate_route.post_weapon_id,
+            primary.unit_id,
+            mineral,
+            mine,
+            worker.backpack.count(mineral) + extra,
+            quote,
+            price,
+            reserved_ids,
+        )
+        return PlannedAction(
+            ActionProposal(
+                worker.unit_id,
+                worker.unit_id,
+                collect_command(mine),
+                destination=mine,
+            ),
+            mine,
+            _procurement_reason(batch),
+            hard_deadline,
+            committed_rounds,
+            diagnostic={
+                "kind": "procurementBatch",
+                "extraCollections": extra,
+                "reservedTargets": len(reserved_ids),
+                "immediateRealizedValue": immediate_value,
+                "immediateRounds": immediate_route.rounds,
+                "batchRealizedValue": projected_value,
+                "batchRounds": committed_rounds,
+            },
+        )
+    return None
+
+
+def _viable_procurement_targets(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    available_gold: int,
+    immediate_route: FundingRoute,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> tuple[Unit, ...]:
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    price = turn.weapon_prices.get(item)
+    if price is None:
+        return ()
+    result = []
+    for target in _item_targets(turn, item):
+        if clock() >= deadline:
+            break
+        if (
+            target.unit_id != immediate_route.use_target_id
+            and context is not None
+            and target.unit_id in context.investment_targets
+        ):
+            continue
+        route = (
+            immediate_route
+            if target.unit_id == immediate_route.use_target_id
+            else _funding_chain(
+                turn,
+                worker,
+                item,
+                price - available_gold,
+                clock,
+                deadline,
+                max_expansions,
+                preferred_post_id=immediate_route.post_weapon_id,
+                preferred_use_target_id=target.unit_id,
+                gate_new_maintenance=True,
+            )
+        )
+        if route is not None and route.rounds <= turn.rounds_until_night:
+            result.append(target)
+    return tuple(result)
+
+
+def _batch_funding_chain(
+    turn: Turn,
+    worker: Unit,
+    item: str,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+    *,
+    preferred_post_id: int,
+    preferred_use_target_id: int,
+) -> FundingRoute | None:
+    minerals = Counter(entry for entry in worker.backpack if entry in MINERALS)
+    if not minerals:
+        return None
+    sale_actions = sum(
+        count > 0 and turn.vendor_prices.get(name, 0) > 0
+        for name, count in minerals.items()
+    )
+    if not sale_actions:
+        return None
+    best = None
+    for vendor in turn.zones_of("vendor"):
+        vendor_route = _best_adjacent_route(
+            turn, worker, vendor, clock, deadline, max_expansions,
+        )
+        if vendor_route is None:
+            continue
+        vendor_stand, vendor_cost = vendor_route
+        purchase = _purchase_route(
+            turn,
+            replace(worker, pos=vendor_stand),
+            item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_post_id=preferred_post_id,
+            preferred_use_target_id=preferred_use_target_id,
+            gate_new_maintenance=False,
+            maintenance_round_prefix=vendor_cost + sale_actions,
+        )
+        if purchase is None:
+            continue
+        candidate = FundingRoute(
+            vendor_cost + sale_actions + purchase.rounds,
+            vendor,
+            vendor_stand,
+            purchase.shop,
+            purchase.shop_stand,
+            purchase.use_target_id,
+            purchase.use_stand,
+            purchase.post_weapon_id,
+            purchase.post_stand,
+        )
+        if best is None or _funding_route_key(candidate) < _funding_route_key(best):
+            best = candidate
+    return best
 
 
 def _mine_action(
@@ -2622,15 +3287,19 @@ def _maintenance_purchase_worthwhile(
         if target is None or target.kind != WALL:
             return False
         recovery = _max_building_health(target) - target.health
-        urgent = any(
-            robot.target_team == turn.team_type
-            and distance(robot.pos, target.pos) <= ROBOT_ATTACK_RANGE
-            and robot.attack_power >= target.health
-            for robot in turn.robots
-        )
+        urgent = _wall_repair_urgent(turn, target)
     else:
         return True
     return recovery > 0 and (urgent or recovery >= max(route.rounds, 1))
+
+
+def _wall_repair_urgent(turn: Turn, target: Unit) -> bool:
+    return any(
+        robot.target_team == turn.team_type
+        and distance(robot.pos, target.pos) <= ROBOT_ATTACK_RANGE
+        and robot.attack_power >= target.health
+        for robot in turn.robots
+    )
 
 
 def _medicine_purchase_worthwhile(worker: Unit, rounds: int) -> bool:

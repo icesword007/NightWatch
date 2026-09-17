@@ -373,3 +373,19 @@ Sol最终回合completed/idle，主会话独立482/482含16HTTP通过19.596秒�
 用户明确授权将已验收adf5d33与5f600f3合入main、验证并推送，覆盖此前隔离不合并/推送限制。main已快进两批；构建nightwatch-s2-integrated-r4，执行入口固定issue #12，以最新完整SHA和批次为准。主会话仅统一标识/手册，无额外策略修订。R195原局约3秒规划与检查通过未提交尚待根因证据，不列为本批已修。旧树/缓存保留，不关闭issue、不重启开发任务。
 
 R203主干验证：482/482含16HTTP通过19.843秒，diff/cached diff/bash-n通过；与5f600f3相比策略源码无差异，仅server/test_server统一构建。两批均为main祖先，无冲突。实际平台效果待内网，旧R195问题继续补证。
+
+
+## R204 普通采购批量筹资开发授权
+
+本批继续使用`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-day-work`与`codex/s2-day-work`，基准`7a1a88740f055c5d1653f9113866186d9f6c1d00`；按外层`design/【codex】s2-procurement-batching-plan.md`实施T56，构建标识`nightwatch-s2-procurement-r1`。`main`正在r4内网验证，全部其他工作树只读。
+
+仅对尚未出发的新非紧急资金链比较立即兑现与当前矿点有限追加采集；完整计入出售、采购、使用、真实回岗与延迟成本，追加收益不改善则沿原行为。批次目标固定且受矿量、容量、真实需求、路线与P1回防约束；紧急维护、关键建设/升级、已有fund/joint/持券及时兑现，不改采购相对优先级、CPU/寻路预算或其他策略。
+
+开发不commit/merge/push/reset/切分支/删除/新依赖目录/派生Agent，不修改issue #12或启动对战；交付R205后停止，等待主会话R206独立验收。
+
+
+## R206 T56本地独立验收
+
+原开发任务临时Astra完成续行修订，回合01a0b0bc-cd0b-7c21-bc61-beb70ad20693已completed/idle，cursor137。主会话独立509/509含16HTTP通过20.865秒，diff/cached diff/bash-n通过，续行需求缩减专项只读审查无阻断。真实连续反例确认副墙999HP后不再追加采矿，3铜整批出售并完成buy/use，副目标预留随兑现链释放。固定初始批量上限不滚动扩张，紧急与关键需求维持原链。
+
+T56本批本地验收通过，可隔离提交；构建nightwatch-s2-procurement-r1。连续用例21工人动作降至13、14次移动降至7；首次兑现晚1轮、第二次提前8轮，实战收益待验。main7a1a887、issue #12保持r4，不合并推送、不启动对战，不自动继续开发。按用户要求原任务恢复Sol+medium。

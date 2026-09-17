@@ -134,6 +134,7 @@ class SessionState:
     observation_count: int = 0
     task_sequence: int = 0
     plans: dict[int, PlanState] = field(default_factory=dict)
+    procurement_blocked_days: dict[int, int] = field(default_factory=dict)
     pending_actions: dict[int, PendingAction] = field(default_factory=dict)
     action_history: list[CompletedAction] = field(default_factory=list)
     active_task: TaskMemory | None = None
@@ -481,9 +482,17 @@ class StateStore:
                 else:
                     state.fortification_failed.add(pending.target)
             plan = state.plans.get(pending.actor_id)
+            if (
+                plan is not None
+                and plan.reason.startswith("batch:")
+                and success is False
+            ):
+                state.procurement_blocked_days[pending.actor_id] = self._day(
+                    turn.round_no,
+                )
             keep_funding = (
                 plan is not None
-                and plan.reason.startswith("fund:")
+                and plan.reason.startswith(("fund:", "batch:"))
                 and success is not False
             )
             if not keep_funding and (
@@ -558,6 +567,12 @@ class StateStore:
             ):
                 state.plans.pop(role_id)
             elif reason.startswith("fund:") and (
+                role is None
+                or plan.deadline_round is None
+                or turn.round_no > plan.deadline_round
+            ):
+                state.plans.pop(role_id)
+            elif reason.startswith("batch:") and (
                 role is None
                 or plan.deadline_round is None
                 or turn.round_no > plan.deadline_round

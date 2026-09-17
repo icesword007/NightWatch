@@ -460,7 +460,7 @@ class DecisionEngine:
                         and not (
                             turn.is_day
                             and candidate.plan_reason is not None
-                            and candidate.plan_reason.startswith("fund:")
+                            and candidate.plan_reason.startswith(("fund:", "batch:"))
                             and candidate.estimated_rounds is not None
                             and candidate.estimated_rounds
                             <= turn.rounds_until_night
@@ -570,7 +570,7 @@ class DecisionEngine:
         reason = candidate.plan_reason or ""
         return action in ("collect", "sell", "build") or (
             action == "move"
-            and reason.startswith(("mine:", "vendor", "build:"))
+            and reason.startswith(("mine:", "vendor", "build:", "batch:"))
         )
 
     @staticmethod
@@ -578,6 +578,11 @@ class DecisionEngine:
         return (
             bool(candidate.plan_reason)
             and candidate.plan_reason.startswith("fund:")
+        ) or (
+            bool(candidate.plan_reason)
+            and candidate.plan_reason.startswith("batch:")
+            and isinstance(candidate.diagnostic, dict)
+            and candidate.diagnostic.get("committed") is True
         ) or DecisionEngine._is_immediate_held_investment(candidate)
 
     @staticmethod
@@ -638,7 +643,7 @@ class DecisionEngine:
             weapons.add(weapon_id)
         for role_id, plan in state.plans.items() if include_existing else ():
             if (
-                not plan.reason.startswith("fund:")
+                not plan.reason.startswith(("fund:", "batch:"))
                 or plan.reason.startswith("fund:build:")
             ):
                 continue
