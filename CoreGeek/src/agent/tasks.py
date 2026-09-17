@@ -114,6 +114,18 @@ def command_result_complete(result: str) -> bool:
     return first_line == "[exitCode:0]"
 
 
+def command_result_nonzero(result: str) -> bool:
+    if not result:
+        return False
+    first_line = result.splitlines()[0] if result.splitlines() else ""
+    if not (first_line.startswith("[exitCode:") and first_line.endswith("]")):
+        return False
+    try:
+        return int(first_line[len("[exitCode:"):-1]) != 0
+    except ValueError:
+        return False
+
+
 def propose_tasks(
     turn: Turn,
     state: SessionState,
@@ -232,6 +244,32 @@ def _continue_active_task(
                         ))
                     task.solver_stopped_reason = "command_after_final_request"
                     return _leave_task(turn, task, owner)
+                if (
+                    envelope.content == task.consecutive_nonzero_command
+                    and task.consecutive_nonzero_count >= 2
+                ):
+                    if not task.repeated_command_correction_requested:
+                        task.repeated_command_correction_requested = True
+                        _remember(
+                            task,
+                            "Rejected third identical failed command",
+                            envelope.content,
+                        )
+                        return TaskTurnProposal(prompt=_solver_prompt(
+                            turn,
+                            task,
+                            "This is the one repeated-command correction. The "
+                            "same command has already returned an explicit nonzero "
+                            "exit twice consecutively. Change the method using the "
+                            "retained terminal error, return a reliable complete or "
+                            "partial answer, or abandon the task.",
+                        ))
+                    task.solver_stopped_reason = "repeated_failed_command"
+                    return _leave_task(turn, task, owner)
+                if envelope.content != task.consecutive_nonzero_command:
+                    task.consecutive_nonzero_command = None
+                    task.consecutive_nonzero_count = 0
+                    task.repeated_command_correction_requested = False
                 _remember(task, "Platform command requested", envelope.content)
                 task.last_command = envelope.content
                 task.command_count += 1
@@ -256,16 +294,34 @@ def _continue_active_task(
                 submit_answer_command(envelope.content),
             )),))
         status = (
-            "The platform sandbox command completed successfully."
+            "The platform tool process completed with exit code 0; this does "
+            "not by itself establish task or business success."
             if command_result_complete(result)
             else "The platform sandbox result was empty, failed, timed out, or truncated."
         )
-        _remember(task, "Platform command result", result)
+        _remember_tool_result(task, "Platform command result", result)
         if command_result_complete(result):
-            _remember_evidence(task, "Verified sandbox result", result)
+            evidence_label = "Complete tool output or observation"
+            if (
+                len(evidence_label) + 2 + len(result)
+                > MAX_SOLVER_EVENT_CHARS
+            ):
+                evidence_label = "Bounded tool output or observation"
+            _remember_evidence(task, evidence_label, result)
             _remember_environment_paths(state, task, result)
         else:
             _remember_failed_observation(task, task.last_command or "", result)
+        if command_result_nonzero(result) and task.last_command:
+            if task.last_command == task.consecutive_nonzero_command:
+                task.consecutive_nonzero_count += 1
+            else:
+                task.consecutive_nonzero_command = task.last_command
+                task.consecutive_nonzero_count = 1
+                task.repeated_command_correction_requested = False
+        else:
+            task.consecutive_nonzero_command = None
+            task.consecutive_nonzero_count = 0
+            task.repeated_command_correction_requested = False
         if remaining == 0:
             task.solver_stopped_reason = "command_result_at_deadline"
             return _leave_task(turn, task, owner)
@@ -301,7 +357,7 @@ def _continue_active_task(
             ))
         return TaskTurnProposal(prompt=_solver_prompt(
             turn, task,
-            f"{status}\nPlatform result:\n{_bounded(result, MAX_TOOL_CONTEXT_CHARS)}",
+            _tool_result_context(status, result),
         ))
 
     previous_submit = next((
@@ -428,7 +484,7 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         "observed evidence rather than repeating the documented request.\n"
         f"{context_text}\nObserved environment path clues from successful "
         "sandbox output; re-check for this task:\n"
-        f"{environment_text}\nCritical verified evidence:\n{evidence_text}\n"
+        f"{environment_text}\nCritical tool evidence:\n{evidence_text}\n"
         "Recent failed or incomplete command observations (not verified facts):\n"
         f"{failed_observations_text}\n"
         f"Solver history:\n{history_text}\nTask:\n{task_text}"
@@ -505,8 +561,17 @@ def _remember(task: TaskMemory, label: str, content: str) -> None:
         task.solver_history_truncated = True
 
 
+def _remember_tool_result(task: TaskMemory, label: str, content: str) -> None:
+    task.solver_history.append(_bounded_middle(
+        f"{label}:\n{content}", MAX_SOLVER_EVENT_CHARS,
+    ))
+    if len(task.solver_history) > MAX_SOLVER_EVENTS:
+        del task.solver_history[:-MAX_SOLVER_EVENTS]
+        task.solver_history_truncated = True
+
+
 def _remember_evidence(task: TaskMemory, label: str, content: str) -> None:
-    event = _bounded(f"{label}:\n{content}", MAX_SOLVER_EVENT_CHARS)
+    event = _bounded_middle(f"{label}:\n{content}", MAX_SOLVER_EVENT_CHARS)
     if len(task.solver_evidence) < MAX_SOLVER_EVIDENCE_EVENTS:
         task.solver_evidence.append(event)
     else:
@@ -522,7 +587,7 @@ def _remember_failed_observation(
 ) -> None:
     observation = (
         _bounded(command or "(unknown command)", MAX_FAILED_COMMAND_CHARS),
-        _bounded(result or "(empty result)", MAX_FAILED_RESULT_CHARS),
+        _bounded_middle(result or "(empty result)", MAX_FAILED_RESULT_CHARS),
     )
     if observation in task.failed_tool_observations:
         task.failed_tool_observations.remove(observation)
@@ -723,3 +788,22 @@ def _bounded(value: str, limit: int) -> str:
     if limit <= len(marker):
         return marker[-limit:]
     return f"{value[:limit - len(marker)]}{marker}"
+
+
+def _tool_result_context(status: str, result: str) -> str:
+    return _bounded_middle(
+        f"{status}\nPlatform result:\n{result}",
+        MAX_TOOL_CONTEXT_CHARS,
+    )
+
+
+def _bounded_middle(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    marker = "\n[TRUNCATED MIDDLE]\n"
+    if limit <= len(marker):
+        return marker[:limit]
+    content_budget = limit - len(marker)
+    head_budget = (content_budget * 3) // 5
+    tail_budget = content_budget - head_budget
+    return f"{value[:head_budget]}{marker}{value[-tail_budget:]}"

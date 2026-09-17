@@ -88,6 +88,9 @@ class TaskMemory:
     last_accepted_cmd_result_round: int | None = None
     repeated_tool_result_count: int = 0
     last_command: str | None = None
+    consecutive_nonzero_command: str | None = None
+    consecutive_nonzero_count: int = 0
+    repeated_command_correction_requested: bool = False
     last_cycle_fingerprint: str | None = None
     repeated_cycle_count: int = 0
     command_count: int = 0

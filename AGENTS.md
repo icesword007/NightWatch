@@ -352,3 +352,17 @@ R195集成验证：主干464/464含16 HTTP通过15.942秒。task_input与fortifi
 ## R198 P1本地独立验收
 
 原Sol修订交付后已completed/idle。主会话独立473/473含16HTTP通过19.597秒；未知路径最终经济域与basic_probe兜底均关闭放行，旧batch须本轮规划成功，完整采矿/出售/返岗及其他精确岗位投影回归通过。静态检查通过。T54本批本地验收通过，可隔离提交；main仍3e0f123内网送测，不合main/推送/更新#12。实际收益待内网，P2按既有授权由主会话另行派发。
+
+
+## R199 P2任务失败证据与无效重复收敛开发授权
+
+本批继续使用`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-day-work`与`codex/s2-day-work`，基准`adf5d33ab01cd450ea419d93522d0b01a9f547bc`；按外层`design/【codex】s2-task-feedback-plan.md`实施T55/P2，构建标识`nightwatch-s2-task-feedback-r1`。`main`及全部旧工作树只读，P1已验收语义保持不变。
+
+失败工具结果仅在现有证据预算内保留头尾；当前任务同一命令连续两次明确非零退出后，第三次执行前最多提供一次有界纠正机会。命令按原文逐字符比较，不改写、不正规化；不同命令重置连续失败链。截止与final-only优先，不增加回合、额度或LLM调用；`exitCode:0`只表示工具进程完成，不声明业务成功。
+
+不得新增答案/API/凭据、跨任务失败证据、通用解析器或关键词判错，不改P1动态回防、reader、任务deadline或模型shell执行协议。开发不commit/merge/push/reset/切分支/删除/新依赖目录/派生Agent，不修改issue #12或启动对战；交付R200后停止，等待主会话R201独立验收。
+
+
+## R201 P2本地独立验收
+
+Sol最终回合completed/idle，主会话独立482/482含16HTTP通过19.596秒，静态检查通过。独立连续反例确认第三次明确失败原命令不执行、重放不重复纠正、改命令与exit0不误拦；长输出当前context/history/失败观察均保留尾错误，原8192预算及短文本保持。只读审查无剩余确定阻断。T55本批本地验收通过，可隔离提交；P1行为保留。main3e0f123与#12不变，未合并推送，不声称任务实战成功率已提升。原Sol停止，不自动续开发。

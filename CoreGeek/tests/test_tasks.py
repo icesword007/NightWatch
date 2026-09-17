@@ -1468,7 +1468,8 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(len(memory.failed_tool_observations), 1)
         command, result = memory.failed_tool_observations[0]
         self.assertTrue(command.endswith("[TRUNCATED]"))
-        self.assertTrue(result.endswith("[TRUNCATED]"))
+        self.assertIn("[TRUNCATED MIDDLE]", result)
+        self.assertTrue(result.endswith("r" * 100))
         rendered = tasks._failed_observations_text(memory)
         self.assertLessEqual(len(rendered), tasks.MAX_FAILED_OBSERVATION_CHARS)
         self.assertIn("c" * 100, rendered)
@@ -1488,6 +1489,256 @@ class TaskTests(unittest.TestCase):
         self.assertNotIn(long_command[:100], tasks._failed_observations_text(memory))
         self.assertIn("empty-output", tasks._failed_observations_text(memory))
         self.assertIn("truncated-output", tasks._failed_observations_text(memory))
+
+    def test_long_failed_result_preserves_head_and_terminal_error(self):
+        # A progress-heavy command must retain both its exit status and the
+        # actionable terminal error within the existing bounded prompt budget.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="repair the script",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"python3 solve.py"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = (
+            "[exitCode:1]\nstarting solver\n"
+            + "progress\n" * 2_000
+            + "IndentationError: unexpected indent at solve.py:19"
+        )
+
+        prompt = engine.decide(result)["prompt"]
+        task = engine.state.state.active_task
+        tasks = importlib.import_module("agent.tasks")
+        context = prompt.split(
+            "The platform sandbox result was empty, failed, timed out, or truncated.",
+            1,
+        )[1].split("\nObserved environment path clues", 1)[0]
+        history = tasks._solver_history_text(task)
+        failed_observations = tasks._failed_observations_text(task)
+        rendered_context = tasks._tool_result_context(
+            "The platform sandbox result was empty, failed, timed out, or truncated.",
+            result["lastCmdResult"],
+        )
+
+        self.assertIn("[exitCode:1]", prompt)
+        self.assertIn("starting solver", prompt)
+        self.assertIn("[TRUNCATED MIDDLE]", prompt)
+        terminal_error = "IndentationError: unexpected indent at solve.py:19"
+        self.assertIn(terminal_error, context)
+        self.assertIn(terminal_error, history)
+        self.assertIn(terminal_error, failed_observations)
+        self.assertLessEqual(len(rendered_context), tasks.MAX_TOOL_CONTEXT_CHARS)
+        self.assertLessEqual(
+            len(task.failed_tool_observations[-1][1]),
+            tasks.MAX_FAILED_RESULT_CHARS,
+        )
+
+    def test_short_tool_result_context_is_unchanged(self):
+        tasks = importlib.import_module("agent.tasks")
+        status = "tool status"
+        result = "[exitCode:1]\nshort error"
+
+        self.assertEqual(
+            tasks._tool_result_context(status, result),
+            f"{status}\nPlatform result:\n{result}",
+        )
+
+    def test_two_nonzero_failures_block_third_identical_command_for_one_correction(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="repair then answer",
+        )
+        engine.decide(active)
+
+        for index, detail in enumerate(("first failure", "changed second failure")):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 2 + index * 2
+            command["llmResp"] = (
+                '{"kind":"command","content":"python3 solve.py"}'
+            )
+            self.assertEqual(engine.decide(command)["executeCmd"], "python3 solve.py")
+            result = copy.deepcopy(active)
+            result["roundNo"] = 3 + index * 2
+            result["lastCmdResult"] = f"[exitCode:1]\n{detail}"
+            engine.decide(result)
+
+        third = copy.deepcopy(active)
+        third["roundNo"] = 6
+        third["llmResp"] = '{"kind":"command","content":"python3 solve.py"}'
+        correction = engine.decide(third)
+        task = engine.state.state.active_task
+
+        self.assertEqual(correction["executeCmd"], "")
+        self.assertIn("one repeated-command correction", correction["prompt"])
+        self.assertTrue(task.repeated_command_correction_requested)
+        self.assertEqual(task.command_count, 2)
+
+        repeated = copy.deepcopy(active)
+        repeated["roundNo"] = 7
+        repeated["llmResp"] = '{"kind":"command","content":"python3 solve.py"}'
+        stopped = engine.decide(repeated)
+        self.assertEqual(stopped["executeCmd"], "")
+        self.assertEqual(task.solver_stopped_reason, "repeated_failed_command")
+
+    def test_different_executed_command_resets_nonzero_failure_chain(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="repair then answer",
+        )
+        engine.decide(active)
+
+        round_no = 2
+        for detail in ("failure one", "failure two"):
+            command = copy.deepcopy(active)
+            command["roundNo"] = round_no
+            command["llmResp"] = '{"kind":"command","content":"python3 solve.py"}'
+            engine.decide(command)
+            result = copy.deepcopy(active)
+            result["roundNo"] = round_no + 1
+            result["lastCmdResult"] = f"[exitCode:2]\n{detail}"
+            engine.decide(result)
+            round_no += 2
+
+        changed = copy.deepcopy(active)
+        changed["roundNo"] = 6
+        changed["llmResp"] = '{"kind":"command","content":"sed -n 1,80p solve.py"}'
+        self.assertEqual(
+            engine.decide(changed)["executeCmd"], "sed -n 1,80p solve.py",
+        )
+        fixed = copy.deepcopy(active)
+        fixed["roundNo"] = 7
+        fixed["lastCmdResult"] = "[exitCode:1]\ninspection command failed too"
+        engine.decide(fixed)
+        retried = copy.deepcopy(active)
+        retried["roundNo"] = 8
+        retried["llmResp"] = '{"kind":"command","content":"python3 solve.py"}'
+        self.assertEqual(engine.decide(retried)["executeCmd"], "python3 solve.py")
+
+    def test_repeated_command_correction_can_submit_reliable_partial_answer(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="bounded task",
+        )
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.consecutive_nonzero_command = "same"
+        task.consecutive_nonzero_count = 2
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"same"}'
+        correction = engine.decide(command)
+        self.assertIn("one repeated-command correction", correction["prompt"])
+
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 3
+        answer["llmResp"] = (
+            '{"kind":"answer","content":"supported partial",'
+            '"complete":false}'
+        )
+        response = engine.decide(answer)
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "supported partial",
+        })
+
+    def test_unknown_result_does_not_count_as_second_nonzero_failure(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="bounded task",
+        )
+        engine.decide(active)
+        first = copy.deepcopy(active)
+        first["roundNo"] = 2
+        first["llmResp"] = '{"kind":"command","content":"same"}'
+        engine.decide(first)
+        failed = copy.deepcopy(active)
+        failed["roundNo"] = 3
+        failed["lastCmdResult"] = "[exitCode:1]\nfailed"
+        engine.decide(failed)
+        second = copy.deepcopy(active)
+        second["roundNo"] = 4
+        second["llmResp"] = '{"kind":"command","content":"same"}'
+        engine.decide(second)
+        unknown = copy.deepcopy(active)
+        unknown["roundNo"] = 5
+        unknown["lastCmdResult"] = "runner status unavailable"
+        engine.decide(unknown)
+        third = copy.deepcopy(active)
+        third["roundNo"] = 6
+        third["llmResp"] = '{"kind":"command","content":"same"}'
+
+        self.assertEqual(engine.decide(third)["executeCmd"], "same")
+        self.assertFalse(
+            engine.state.state.active_task.repeated_command_correction_requested,
+        )
+
+    def test_exit_zero_is_tool_completion_not_verified_business_success(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="call the API",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"curl endpoint"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:0]\nHTTP 401 Authorization failed"
+
+        prompt = engine.decide(result)["prompt"]
+
+        self.assertIn("tool process completed with exit code 0", prompt)
+        self.assertIn("Complete tool output or observation", prompt)
+        self.assertNotIn("Verified sandbox result", prompt)
+        self.assertNotIn("completed successfully", prompt)
+
+    def test_bounded_exit_zero_output_is_not_labeled_complete_evidence(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="inspect long output",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"inspect"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = (
+            "[exitCode:0]\nhead\n" + "middle\n" * 1_000 + "tail"
+        )
+
+        prompt = engine.decide(result)["prompt"]
+
+        self.assertIn("Bounded tool output or observation", prompt)
+        self.assertIn("[TRUNCATED MIDDLE]", prompt)
+        self.assertNotIn("Complete tool output or observation", prompt)
+
+    def test_deadline_final_only_precedes_repeated_command_correction(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="deadline task",
+        )
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 4
+        task.consecutive_nonzero_command = "same"
+        task.consecutive_nonzero_count = 2
+        task.final_answer_requested = True
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"same"}'
+        response = engine.decide(command)
+
+        self.assertEqual(response["executeCmd"], "")
+        self.assertIn("final-answer-only correction", response["prompt"])
+        self.assertFalse(task.repeated_command_correction_requested)
 
     def test_failed_observations_do_not_cross_session_and_exit_zero_is_not_reclassified(self):
         # Break caught: failure-only memory survives a team/session boundary, or
@@ -1767,14 +2018,15 @@ class TaskTests(unittest.TestCase):
         })
 
     def test_repeated_command_result_cycle_converges_then_leaves(self):
-        # Break caught: alternating LLM and command result kinds reset repetition.
+        # Break caught: alternating LLM and command result kinds reset repetition,
+        # or a third identical explicitly failing command reaches the sandbox.
         engine = DecisionEngine()
         active = task_payload(
             round_no=1, pioneer_pos=(3, 3), phase_task="active task",
         )
         self.assertIn("remaining task rounds: unknown", engine.decide(active)["prompt"])
 
-        for command_round, result_round in ((2, 3), (4, 5), (6, 7)):
+        for command_round, result_round in ((2, 3), (4, 5)):
             command = copy.deepcopy(active)
             command["roundNo"] = command_round
             command["llmResp"] = '{"kind":"command","content":"pwd"}'
@@ -1783,12 +2035,17 @@ class TaskTests(unittest.TestCase):
             result = copy.deepcopy(active)
             result["roundNo"] = result_round
             result["lastCmdResult"] = "[exitCode:1]\nsame failure"
-            response = engine.decide(result)
+            engine.decide(result)
 
-        self.assertIn("No more command exploration", response["prompt"])
+        third = copy.deepcopy(active)
+        third["roundNo"] = 6
+        third["llmResp"] = '{"kind":"command","content":"pwd"}'
+        response = engine.decide(third)
+        self.assertEqual(response["executeCmd"], "")
+        self.assertIn("one repeated-command correction", response["prompt"])
 
         ignored = copy.deepcopy(active)
-        ignored["roundNo"] = 8
+        ignored["roundNo"] = 7
         ignored["llmResp"] = '{"kind":"command","content":"pwd"}'
         response = engine.decide(ignored)
         self.assertEqual(response["executeCmd"], "")

@@ -11,7 +11,7 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s2-day-work-r1"
+BUILD_ID = "nightwatch-s2-task-feedback-r1"
 MAX_TASK_DETAIL_CHARS = 131_072
 MAX_NEWS_DETAIL_CHARS = 4_096
 MAX_LOG_ITEMS = 16
@@ -540,13 +540,13 @@ def _command_result_class(result: str) -> str:
     if first_line == "[JUDGER_ERROR]":
         return "judger_error"
     if first_line == "[exitCode:0]":
-        return "success"
+        return "completed"
     if first_line.startswith("[exitCode:") and first_line.endswith("]"):
         try:
             exit_code = int(first_line[len("[exitCode:"):-1])
         except ValueError:
             return "unknown"
-        return "success" if exit_code == 0 else "failed"
+        return "completed" if exit_code == 0 else "failed"
     return "unknown"
 
 

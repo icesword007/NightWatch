@@ -685,6 +685,8 @@ class DecisionEngine:
         cycle_fingerprint = None
         entry_read_attempted = False
         final_only_correction_requested = False
+        repeated_command_correction_requested = False
+        consecutive_nonzero_failures = 0
         if task is not None:
             task_instance_id = task.instance_id
             solver_state = task.phase
@@ -724,6 +726,10 @@ class DecisionEngine:
             final_only_correction_requested = (
                 task.final_only_correction_requested
             )
+            repeated_command_correction_requested = (
+                task.repeated_command_correction_requested
+            )
+            consecutive_nonzero_failures = task.consecutive_nonzero_count
         actions = []
         for domain, candidate in accepted:
             action = {
@@ -760,6 +766,10 @@ class DecisionEngine:
             "taskFinalOnlyCorrectionRequested": (
                 final_only_correction_requested
             ),
+            "taskRepeatedCommandCorrectionRequested": (
+                repeated_command_correction_requested
+            ),
+            "taskConsecutiveNonzeroFailures": consecutive_nonzero_failures,
             "coordinationReason": coordination_reason,
             "taskStartSkipReason": task_start_skip_reason,
             "nightClearance": {
