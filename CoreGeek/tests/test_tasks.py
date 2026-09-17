@@ -442,8 +442,9 @@ class TaskTests(unittest.TestCase):
         ])
         return payload
 
-    def test_required_third_gunner_stays_at_post_without_targets_across_dusk(self):
-        # Break caught: idle defense releases the pioneer to a distant task every round.
+    def test_required_third_gunner_releases_only_after_safe_night_observation(self):
+        # Daytime and the spawn frame keep the post; a complete later empty
+        # observation releases the pioneer into the existing task route.
         engine = DecisionEngine()
         payload = self._idle_third_gunner_payload()
         traces = []
@@ -451,8 +452,16 @@ class TaskTests(unittest.TestCase):
         for round_no in range(65, 75):
             payload["roundNo"] = round_no
             response = engine.decide(payload, trace_sink=traces.append)
-            self.assertNotIn("10011", response["roleCommandMap"])
-            self.assertEqual(traces[-1]["coordinationReason"], "gunner_hold")
+            if round_no <= 71:
+                self.assertNotIn("10011", response["roleCommandMap"])
+                self.assertEqual(
+                    traces[-1]["coordinationReason"], "gunner_hold",
+                )
+            else:
+                self.assertEqual(
+                    response["roleCommandMap"]["10011"]["action"], "move",
+                )
+                self.assertTrue(traces[-1]["nightClearance"]["released"])
             for role_id, command in response["roleCommandMap"].items():
                 if command["action"] != "move":
                     continue
@@ -469,7 +478,7 @@ class TaskTests(unittest.TestCase):
             role for role in payload["teamOur"]["roles"]
             if role["id"] == 10011
         )
-        self.assertEqual(pioneer["pos"], {"x": 12, "y": 5})
+        self.assertEqual(pioneer["pos"], {"x": 9, "y": 2})
 
     def test_required_third_gunner_attacks_when_target_appears(self):
         payload = self._idle_third_gunner_payload(round_no=71)

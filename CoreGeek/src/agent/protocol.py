@@ -192,6 +192,7 @@ class Turn:
     ours: tuple[Unit, ...]
     enemies: tuple[Unit, ...]
     robots: tuple[Robot, ...]
+    robot_roles_observed: bool
     vendor_prices: dict[str, int]
     weapon_prices: dict[str, int]
     total_score: int
@@ -216,6 +217,8 @@ class Turn:
                 for value in (info, team, enemy, robots)
             ):
                 raise ValueError("request sections must be objects")
+            raw_robot_roles = robots.get("roles")
+            robot_roles_observed = isinstance(raw_robot_roles, list)
             return cls(
                 round_no,
                 (round_no - 1) % ROUNDS_PER_DAY < DAY_ROUNDS,
@@ -231,8 +234,10 @@ class Turn:
                 tuple(Unit.load(role) for role in team.get("roles") or ()),
                 tuple(Unit.load(role) for role in enemy.get("roles") or ()),
                 tuple(
-                    Robot.load(robot) for robot in robots.get("roles") or ()
-                ),
+                    Robot.load(robot)
+                    for robot in raw_robot_roles
+                ) if robot_roles_observed else (),
+                robot_roles_observed,
                 _price_map(payload.get("vendorShopList")),
                 _price_map(payload.get("weaponShopList")),
                 int(team.get("totalScore") or 0),

@@ -7,6 +7,7 @@ from typing import Any, Callable
 from .actions import ActionAllocator, ActionProposal
 from .defense import (
     DUSK_POSITIONING_ROUNDS,
+    night_clearance_status,
     propose_defense,
     protected_gunners,
     task_start_skip_reason,
@@ -93,6 +94,12 @@ class DecisionEngine:
 
             allocator = ActionAllocator(turn)
             state = self.state.state
+            clearance_status = night_clearance_status(turn)
+            night_cleared = clearance_status == "cleared"
+            if night_cleared:
+                for role_id, plan in tuple(state.plans.items()):
+                    if plan.reason.startswith("gunner:"):
+                        state.plans.pop(role_id)
             ensure_defense_layout(turn, state)
             task_role_ids = self._active_task_role_ids(turn, state)
             task_pioneer = next((
@@ -127,6 +134,7 @@ class DecisionEngine:
                 need_wall=self._needs_fortification(turn, state),
                 fortification_builder_id=fortification_builder_id,
                 reserved_role_ids=task_role_ids,
+                night_cleared=night_cleared,
                 diagnostic_sink=economy_diagnostics.append,
             )
             if economy_diagnostics:
@@ -197,6 +205,7 @@ class DecisionEngine:
                     else unavailable_for_defense | funding_roles
                 ),
                 reserved_weapon_ids=funding_posts,
+                night_cleared=night_cleared,
             )
             emergency = propose_held_emergency(
                 turn,
@@ -271,7 +280,10 @@ class DecisionEngine:
                     ("economy", economy_candidates),
                     ("defense", defense_candidates),
                 )
-            protected = protected_gunners(turn) if defense_first else frozenset()
+            protected = (
+                protected_gunners(turn, night_cleared=night_cleared)
+                if defense_first else frozenset()
+            )
             accepted = []
             rejected_economy: set[int] = set()
             blocked_new_task_by_gunner = False
@@ -372,6 +384,7 @@ class DecisionEngine:
                 economy_planning,
                 task_start_skip_reason=task_turn.start_skip_reason,
                 session_boundary=observation.boundary,
+                night_clearance_status=clearance_status,
             )
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for _, candidate in accepted:
@@ -502,6 +515,7 @@ class DecisionEngine:
         economy_planning: dict[str, Any] | None = None,
         task_start_skip_reason: str | None = None,
         session_boundary: str | None = None,
+        night_clearance_status: str | None = None,
     ) -> dict[str, Any]:
         task = state.active_task if state is not None else None
         remaining = None
@@ -589,6 +603,10 @@ class DecisionEngine:
             ),
             "coordinationReason": coordination_reason,
             "taskStartSkipReason": task_start_skip_reason,
+            "nightClearance": {
+                "status": night_clearance_status or "not_evaluated",
+                "released": night_clearance_status == "cleared",
+            },
             "actions": actions,
             "newsEvidence": {
                 "currentSession": state.session_index if state is not None else None,

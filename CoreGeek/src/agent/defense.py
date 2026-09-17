@@ -25,7 +25,31 @@ MIN_TASK_INTERACTION_ROUNDS = 5
 MAX_ROCKET_TARGET_CANDIDATES = 128
 
 
-def protected_gunners(turn: Turn) -> frozenset[int]:
+def night_clearance_status(turn: Turn) -> str:
+    if turn.is_day:
+        return "day"
+    if not turn.robot_roles_observed:
+        return "robot_observation_missing"
+    if turn.round_in_day <= 71:
+        return "first_night_frame"
+    known_teams = {"challenger", "defender"}
+    for robot in turn.robots:
+        if robot.health <= 0:
+            continue
+        if robot.target_team == turn.team_type:
+            return "our_threat_alive"
+        if robot.target_team not in known_teams:
+            return "robot_target_unknown"
+    return "cleared"
+
+
+def protected_gunners(
+    turn: Turn,
+    *,
+    night_cleared: bool = False,
+) -> frozenset[int]:
+    if night_cleared:
+        return frozenset()
     assignments = _adjacent_assignments(
         turn, set(), include_emergency_medicine=True,
     )
@@ -359,7 +383,10 @@ def propose_defense(
     max_expansions: int,
     unavailable_role_ids: frozenset[int] = frozenset(),
     reserved_weapon_ids: frozenset[int] = frozenset(),
+    night_cleared: bool = False,
 ) -> tuple[PlannedAction, ...]:
+    if night_cleared:
+        return ()
     candidates: list[PlannedAction] = []
     used_roles: set[int] = set()
     staffed_weapons: set[int] = set(reserved_weapon_ids)
