@@ -7,6 +7,7 @@ from unittest import mock
 from agent import server as server_module
 from agent import fortification as fortification_module
 from agent.brain import DecisionEngine
+from agent.defense import night_clearance_status
 from agent.layout import plan_defense_layout
 from agent.protocol import Pos, Turn, distance
 from agent.state import PendingAction, PlanState, request_fingerprint
@@ -45,6 +46,205 @@ def base_payload(*, round_no, team_id):
 
 
 class TeamTurnTests(unittest.TestCase):
+    def test_night_clearance_releases_worker_for_continuous_mining(self):
+        # Break caught: an empty complete post-first-frame robot observation
+        # leaves the worker protected at its gunner post; after release the
+        # daytime dusk cutoff also makes one collected stone trigger a sale.
+        payload = base_payload(
+            round_no=71, team_id="s2-night-clear-worker-mining",
+        )
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 5, "y": 5}, "neutralType": "stone"},
+            {"pos": {"x": 1, "y": 1}, "neutralType": "vendor"},
+        ]
+        payload["vendorShopList"] = [{"name": "stone", "price": 5}]
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 6, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 6, "y": 8},
+            "roleType": "smallRobot",
+            "health": 10,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+        engine = DecisionEngine()
+
+        threatened = engine.decide(payload)
+        self.assertEqual(threatened["roleCommandMap"]["10020"]["action"], "attack")
+
+        cleared = json.loads(json.dumps(payload))
+        cleared["roundNo"] = 72
+        cleared["lastRoundRoleActionResults"] = {"10020": True}
+        cleared["robot"]["roles"] = []
+        traces = []
+        first_work = engine.decide(cleared, trace_sink=traces.append)
+        self.assertEqual(first_work["roleCommandMap"].get("10010"), {
+            "action": "collect", "targetPos": [{"x": 5, "y": 5}],
+        })
+        self.assertEqual(traces[0]["nightClearance"], {
+            "status": "cleared", "released": True,
+        })
+
+        continued = json.loads(json.dumps(cleared))
+        continued["roundNo"] = 73
+        continued["lastRoundRoleActionResults"] = {"10010": True}
+        continued["teamOur"]["roles"][0]["backpack"] = ["stone"]
+        second_work = engine.decide(continued)
+
+        self.assertEqual(second_work["roleCommandMap"].get("10010"), {
+            "action": "collect", "targetPos": [{"x": 5, "y": 5}],
+        })
+
+        threatened_again = json.loads(json.dumps(continued))
+        threatened_again["roundNo"] = 74
+        threatened_again["lastRoundRoleActionResults"] = {"10010": True}
+        threatened_again["robot"]["roles"] = json.loads(json.dumps(
+            payload["robot"]["roles"]
+        ))
+        restored = engine.decide(threatened_again)
+        self.assertEqual(
+            restored["roleCommandMap"]["10020"]["action"], "attack",
+        )
+
+    def test_night_clearance_requires_complete_safe_post_spawn_observation(self):
+        base = base_payload(round_no=72, team_id="s2-night-clearance-facts")
+
+        cases = []
+        first_frame = json.loads(json.dumps(base))
+        first_frame["roundNo"] = 71
+        cases.append(("first-frame", first_frame, "first_night_frame"))
+        missing = json.loads(json.dumps(base))
+        missing["robot"].pop("roles")
+        cases.append(("missing", missing, "robot_observation_missing"))
+        non_list = json.loads(json.dumps(base))
+        non_list["robot"]["roles"] = {}
+        cases.append(("non-list", non_list, "robot_observation_missing"))
+        unknown = json.loads(json.dumps(base))
+        unknown["robot"]["roles"] = [{
+            "id": 30001, "pos": {"x": 19, "y": 19},
+            "roleType": "smallRobot", "health": 10,
+        }]
+        cases.append(("unknown-target", unknown, "robot_target_unknown"))
+        distant = json.loads(json.dumps(base))
+        distant["robot"]["roles"] = [{
+            "id": 30001, "pos": {"x": 19, "y": 19},
+            "roleType": "smallRobot", "health": 10,
+            "targetTeam": "challenger",
+        }]
+        cases.append(("distant-threat", distant, "our_threat_alive"))
+        enemy_only = json.loads(json.dumps(base))
+        enemy_only["robot"]["roles"] = [{
+            "id": 30001, "pos": {"x": 19, "y": 19},
+            "roleType": "smallRobot", "health": 10,
+            "targetTeam": "defender",
+        }, {
+            "id": 30002, "pos": {"x": 18, "y": 19},
+            "roleType": "smallRobot", "health": 0,
+            "targetTeam": "challenger",
+        }]
+        enemy_only["teamOur"]["roles"] = [unit(10010, "worker", 1, 1)]
+        cases.append(("enemy-and-dead", enemy_only, "cleared"))
+        next_day = json.loads(json.dumps(base))
+        next_day["roundNo"] = 131
+        cases.append(("next-day", next_day, "day"))
+        next_night = json.loads(json.dumps(base))
+        next_night["roundNo"] = 201
+        cases.append(("next-night-spawn", next_night, "first_night_frame"))
+
+        for label, payload, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    night_clearance_status(Turn.load(payload)), expected,
+                )
+        enemy_turn = Turn.load(enemy_only)
+        self.assertIn(Pos(19, 19), enemy_turn.blocked(enemy_turn.unit(10010)))
+
+    def test_night_clearance_releases_pioneer_into_existing_task_chain(self):
+        payload = base_payload(
+            round_no=71, team_id="s2-night-clear-pioneer-task",
+        )
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 4, "y": 4},
+            "neutralType": "challengerTaskPoint1",
+        }]
+        payload["teamOur"]["roles"] = [
+            unit(10011, "pioneer", 4, 3),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 5, 3, health=1000),
+        ]
+        payload["teamOur"]["playerTasks"] = [{
+            "taskType": "自进化类1",
+            "taskPosition": {"x": 4, "y": 4},
+            "coldDownRounds": 0,
+            "scoreReward": 50,
+            "goldReward": 30,
+            "isValid": True,
+            "timeoutRounds": 20,
+        }]
+        payload["robot"]["roles"] = [{
+            "id": 30001, "pos": {"x": 5, "y": 6},
+            "roleType": "smallRobot", "health": 10,
+            "targetTeam": "challenger",
+        }]
+        engine = DecisionEngine()
+        defended = engine.decide(payload)
+        self.assertEqual(defended["roleCommandMap"]["10020"]["action"], "attack")
+
+        cleared = json.loads(json.dumps(payload))
+        cleared["roundNo"] = 72
+        cleared["lastRoundRoleActionResults"] = {"10020": True}
+        cleared["robot"]["roles"] = []
+        accepted = engine.decide(cleared)
+        self.assertEqual(
+            accepted["roleCommandMap"]["10011"]["action"], "acceptTask",
+        )
+
+        active = json.loads(json.dumps(cleared))
+        active["roundNo"] = 73
+        active["lastRoundRoleActionResults"] = {"10011": True}
+        active["phaseTask"] = "solve the bounded task"
+        continued = engine.decide(active)
+        self.assertTrue(continued["prompt"] or continued["executeCmd"])
+
+    def test_night_clearance_does_not_enable_builds(self):
+        payload = base_payload(round_no=72, team_id="s2-night-clear-no-build")
+        worker = unit(10010, "worker", 7, 8)
+        worker["backpack"] = ["stone"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 9, 9, health=1500),
+            unit(10020, "gatling", 8, 8, health=1000),
+            unit(10030, "railgun", 9, 7, health=1000),
+            unit(10040, "rocket", 10, 7, health=1000),
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertFalse(any(
+            command.get("action") == "build"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_night_clearance_keeps_existing_held_item_behavior(self):
+        payload = base_payload(round_no=72, team_id="s2-night-clear-held-item")
+        worker = unit(10010, "worker", 6, 5, health=100)
+        worker["backpack"] = ["Medicine"]
+        payload["teamOur"]["roles"] = [
+            worker,
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use", "name": "Medicine",
+        })
+
     def test_destroyed_confirmed_wall_is_rebuilt_on_the_next_day(self):
         # Break caught: historical completion permanently hides a destroyed wall.
         payload = base_payload(round_no=5, team_id="s2-wall-next-day-recovery")

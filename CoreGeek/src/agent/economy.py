@@ -126,6 +126,7 @@ def propose_economy(
     need_wall: bool = False,
     fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
+    night_cleared: bool = False,
     diagnostic_sink: Callable[[dict], None] | None = None,
 ) -> tuple[PlannedAction, ...]:
     context = RouteSearchContext({})
@@ -140,6 +141,7 @@ def propose_economy(
             need_wall=need_wall,
             fortification_builder_id=fortification_builder_id,
             reserved_role_ids=reserved_role_ids,
+            night_cleared=night_cleared,
         )
         if diagnostic_sink is not None:
             held = next((
@@ -202,6 +204,7 @@ def _propose_economy(
     need_wall: bool = False,
     fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
+    night_cleared: bool = False,
 ) -> tuple[PlannedAction, ...]:
     context = _ROUTE_SEARCH_CONTEXT.get()
     if context is not None:
@@ -446,6 +449,7 @@ def _propose_economy(
                 turn, worker, turn.gold - claimed_gold,
                 clock, deadline, max_expansions, failed_mines,
                 check_funding=not funding_rechecked,
+                night_cleared=night_cleared,
             )
         if candidate is not None and worker.unit_id in joint_cancellations:
             diagnostic = dict(candidate.diagnostic or {})
@@ -1697,6 +1701,7 @@ def _trade_or_mine(
     failed_mines: set[Pos],
     *,
     check_funding: bool = True,
+    night_cleared: bool = False,
 ) -> PlannedAction | None:
     minerals = Counter(item for item in worker.backpack if item in MINERALS)
     vendors = turn.zones_of("vendor")
@@ -1712,7 +1717,11 @@ def _trade_or_mine(
             return _sell_or_move(
                 turn, worker, adjacent, clock, deadline, max_expansions,
             )
-        if worker.backpack_full or turn.rounds_until_night <= 12:
+        if (
+            worker.backpack_full
+            or turn.is_day and turn.rounds_until_night <= 12
+            or not turn.is_day and not night_cleared
+        ):
             target = _nearest(worker.pos, vendors)
             return _sell_or_move(
                 turn, worker, target, clock, deadline, max_expansions,
