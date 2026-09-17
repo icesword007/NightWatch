@@ -288,3 +288,17 @@ main f721702、投资分支776e8ac（墙升级）及其他旧树只读；本批�
 ## R183 本批统一送测与固定内网入口
 
 用户授权36beb9f合入main、完整验证并推送；此前R180不合并推送为历史批次限制，现覆盖。构建nightwatch-s2-efficiency-r1。内网每次执行前读取固定https://github.com/icesword007/NightWatch/issues/12最新正文，按批次去重，完整SHA/场次/停止条件以该正文为准；旧版本提示仅历史。反馈写对应#9/#10/#11，不编辑或关闭#12。本轮不自动开发第3/4项，不以推送代替实战验收。
+
+
+## R187 PK627784规划退化修复授权
+
+本批唯一源码入口切回`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch`的`main`，基准`d594671fa7f89841c3fe68749bee0293e6ea8935`；按外层`design/【codex】s2-planning-regression-repair-plan.md`实施T52，构建标识`nightwatch-s2-efficiency-r2`。原`code/NightWatch-s2-round-efficiency` / `77c2176`夜间释放树及其他工作树只读，不合入本批。
+
+只修围墙安全前缀重复全图遍历、实际耗时循环无截止控制及其造成的后续动作饥饿；保持批量备料、安全通道、固定12轮窗口、全局4秒与经济75%预算，不以加时、取消安全检查或固定2批回退。预算耗尽不得记永久unsafe/failed、不得把空初始化视为布局完成或消耗临时重试；reader、LLM答案、攻击、夜间释放和普通采购批量均不在本批。
+
+按TDD提供真实DecisionEngine红例、结构性遍历上限、可控clock严格截止、连续动作与现有批量回归。开发不commit/merge/push/reset/切分支/删除/新依赖目录/派生Agent，不修改issue #12或启动对战；交付R188后停止，等待主会话R189独立验收。
+
+
+## R189 T52本地独立验收
+
+主会话独立451/451（含16 HTTP）通过15.953秒，diff与bash检查通过；只读安全审查及3项预算事务性测试通过。41x32同图d594为119次检查/1.271秒，修复28次/0.311秒，batch仍10；旧42be为17次/0.187秒/batch2。保留通道、不同炮位与可重试状态，未扩大总预算。仅本地提交nightwatch-s2-efficiency-r2，不推送，不混入77c2176夜间释放，不关闭issue；PK627784完整实战因果与收益待原局补证及后续送测。

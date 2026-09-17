@@ -43,6 +43,7 @@ _NEIGHBOUR_STEPS = (
     (1, 1),
 )
 ECONOMY_BUDGET_FRACTION = 0.75
+FORTIFICATION_BUDGET_FRACTION = 0.5
 
 
 class DecisionEngine:
@@ -103,6 +104,13 @@ class DecisionEngine:
                 deadline,
                 started + self.budget_seconds * ECONOMY_BUDGET_FRACTION,
             )
+            fortification_deadline = min(
+                economy_deadline,
+                started
+                + self.budget_seconds
+                * ECONOMY_BUDGET_FRACTION
+                * FORTIFICATION_BUDGET_FRACTION,
+            )
             if turn.is_day and turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS:
                 fortification_builder_id = None
                 state.fortification_phase = "waiting"
@@ -114,7 +122,7 @@ class DecisionEngine:
                     wall_build_positions(turn),
                     reserved_role_ids=task_role_ids,
                     clock=self.clock,
-                    deadline=economy_deadline,
+                    deadline=fortification_deadline,
                     max_expansions=self.max_search_expansions,
                     reserved_rounds=DUSK_POSITIONING_ROUNDS,
                 )

@@ -50,6 +50,280 @@ def layout_turn(*, our_x, enemy_x):
 
 
 class FortificationTests(unittest.TestCase):
+    def _planning_regression_payload(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 11
+        payload["mapInfo"].update({
+            "width": 41,
+            "height": 32,
+            "zones": [
+                {"pos": {"x": 18, "y": 17}, "neutralType": "stone"},
+                {
+                    "pos": {"x": 25, "y": 18},
+                    "neutralType": "challengerTaskPoint1",
+                },
+            ],
+        })
+        payload["teamOur"].update({
+            "teamId": "fortification-planning-regression",
+            "roles": [
+                unit(10010, "worker", 19, 17),
+                unit(10011, "worker", 22, 17),
+                unit(10012, "pioneer", 25, 17),
+                unit(10013, "station", 20, 16),
+                unit(10020, "rocket", 19, 15),
+                unit(10030, "rocket", 20, 14),
+                unit(10040, "rocket", 21, 14),
+            ],
+            "playerTasks": [{
+                "taskType": "自进化类1",
+                "taskPosition": {"x": 25, "y": 18},
+                "coldDownRounds": 0,
+                "scoreReward": 50,
+                "goldReward": 30,
+                "isValid": True,
+                "timeoutRounds": 20,
+            }],
+        })
+        payload["teamEnemy"]["roles"] = [
+            unit(20013, "station", 35, 16),
+        ]
+        payload["robot"]["roles"] = []
+        return payload
+
+    def test_large_map_safety_validation_has_linear_structural_bound(self):
+        payload = self._planning_regression_payload()
+        turn = Turn.load(payload)
+        state = SessionState(
+            "fortification-planning-regression", "challenger",
+        )
+        real_safety = fortification_module._has_distinct_weapon_stands
+
+        with patch.object(
+            fortification_module,
+            "_has_distinct_weapon_stands",
+            wraps=real_safety,
+        ) as safety:
+            builder_id = prepare_fortification(
+                turn,
+                state,
+                wall_build_positions(turn),
+                clock=lambda: 0.0,
+                deadline=1.0,
+                max_expansions=256,
+                reserved_rounds=12,
+            )
+
+        self.assertIn(builder_id, (10010, 10011))
+        self.assertLessEqual(
+            safety.call_count, 2 * len(state.fortification_targets),
+        )
+        self.assertGreater(len(state.fortification_batch_targets), 2)
+
+    def test_safety_scan_deadline_does_not_commit_partial_initialization(self):
+        payload = self._planning_regression_payload()
+        turn = Turn.load(payload)
+        state = SessionState(
+            "fortification-planning-deadline", "challenger",
+        )
+
+        class StepClock:
+            calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                return self.calls * 0.01
+
+        clock = StepClock()
+        builder_id = prepare_fortification(
+            turn,
+            state,
+            wall_build_positions(turn),
+            clock=clock,
+            deadline=0.05,
+            max_expansions=256,
+            reserved_rounds=12,
+        )
+
+        self.assertIsNone(builder_id)
+        self.assertFalse(state.fortification_initialized)
+        self.assertEqual(state.fortification_targets, ())
+        self.assertEqual(state.fortification_failed, set())
+        self.assertEqual(state.fortification_deferred, {})
+        self.assertEqual(
+            state.fortification_skip_reason, "planning_budget_exhausted",
+        )
+        self.assertLessEqual(clock.calls, 7)
+
+        retried = prepare_fortification(
+            turn,
+            state,
+            wall_build_positions(turn),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=256,
+            reserved_rounds=12,
+        )
+        self.assertIn(retried, (10010, 10011))
+        self.assertTrue(state.fortification_initialized)
+        self.assertGreater(len(state.fortification_batch_targets), 2)
+        self.assertEqual(state.fortification_failed, set())
+
+    def test_active_batch_recheck_timeout_preserves_retryable_state(self):
+        payload = self._planning_regression_payload()
+        turn = Turn.load(payload)
+        state = SessionState(
+            "fortification-active-batch-timeout", "challenger",
+        )
+        prepare_fortification(
+            turn,
+            state,
+            wall_build_positions(turn),
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=256,
+            reserved_rounds=12,
+        )
+        original_batch = state.fortification_batch_targets
+        payload["roundNo"] = 12
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 18, "y": 16}
+        changed = Turn.load(payload)
+
+        class StepClock:
+            calls = 0
+
+            def __call__(self):
+                self.calls += 1
+                return self.calls * 0.01
+
+        builder_id = prepare_fortification(
+            changed,
+            state,
+            wall_build_positions(changed),
+            clock=StepClock(),
+            deadline=0.05,
+            max_expansions=256,
+            reserved_rounds=12,
+        )
+
+        self.assertIsNone(builder_id)
+        self.assertEqual(state.fortification_batch_targets, original_batch)
+        self.assertEqual(state.fortification_failed, set())
+        self.assertEqual(state.fortification_deferred, {})
+        self.assertEqual(
+            state.fortification_skip_reason, "planning_budget_exhausted",
+        )
+
+    def test_planning_budget_exhaustion_preserves_economy_and_task_actions(self):
+        payload = self._planning_regression_payload()
+
+        class ControlledClock:
+            now = 10.0
+
+            def __call__(self):
+                return self.now
+
+        clock = ControlledClock()
+        real_safety = fortification_module._has_distinct_weapon_stands
+
+        def slow_safety(*args, **kwargs):
+            clock.now += 0.6
+            return real_safety(*args, **kwargs)
+
+        traces = []
+        engine = DecisionEngine(clock=clock, budget_seconds=4.0)
+        with patch.object(
+            fortification_module,
+            "_has_distinct_weapon_stands",
+            side_effect=slow_safety,
+        ):
+            response = engine.decide(payload, trace_sink=traces.append)
+
+        commands = response["roleCommandMap"]
+        self.assertTrue(any(
+            command.get("action") == "collect"
+            for command in commands.values()
+        ))
+        self.assertEqual(commands["10012"]["action"], "acceptTask")
+        self.assertEqual(
+            traces[0]["economyPlanning"]["fortification"]["skipReason"],
+            "planning_budget_exhausted",
+        )
+        self.assertLess(clock.now, 13.0)
+
+        active = json.loads(json.dumps(payload))
+        active["roundNo"] = 12
+        active["lastRoundRoleActionResults"] = {
+            role_id: True for role_id in commands
+        }
+        active["phaseTask"] = "solve the bounded task"
+        task_prompt = engine.decide(active)
+        self.assertTrue(task_prompt["prompt"] or task_prompt["executeCmd"])
+
+        answered = json.loads(json.dumps(active))
+        answered["roundNo"] = 13
+        answered["lastRoundRoleActionResults"] = {}
+        answered["llmResp"] = (
+            '{"kind":"answer","content":"42","complete":true}'
+        )
+        submitted = engine.decide(answered)
+        self.assertEqual(
+            submitted["roleCommandMap"]["10012"]["action"],
+            "submitAnswer",
+        )
+
+    def test_large_map_continuous_feedback_reaches_wall_build(self):
+        payload = self._planning_regression_payload()
+        payload["teamOur"]["playerTasks"] = []
+        engine = DecisionEngine()
+        actions = []
+
+        for index in range(24):
+            response = engine.decide(payload)
+            feedback = {}
+            for role_id, command in response["roleCommandMap"].items():
+                role = next(
+                    entry for entry in payload["teamOur"]["roles"]
+                    if entry["id"] == int(role_id)
+                )
+                action = command["action"]
+                actions.append((int(role_id), action))
+                if action == "move":
+                    role["pos"] = json.loads(json.dumps(
+                        command["targetPos"][0]
+                    ))
+                elif action == "collect":
+                    role["backpack"].append("stone")
+                elif action == "build" and command.get("name") == "wall":
+                    role["backpack"].remove("stone")
+                    target = command["targetPos"][0]
+                    payload["teamOur"]["roles"].append(unit(
+                        11000 + index,
+                        "wall",
+                        target["x"],
+                        target["y"],
+                    ))
+                feedback[role_id] = True
+            payload["lastRoundRoleActionResults"] = feedback
+            payload["roundNo"] += 1
+            if any(action == "build" for _, action in actions):
+                break
+
+        builder_id = engine.state.state.fortification_builder_id
+        self.assertIn("collect", [
+            action for role_id, action in actions if role_id == builder_id
+        ])
+        self.assertIn("move", [
+            action for role_id, action in actions if role_id == builder_id
+        ])
+        self.assertIn("build", [
+            action for role_id, action in actions if role_id == builder_id
+        ])
+        self.assertTrue(any(
+            role_id != builder_id and action == "collect"
+            for role_id, action in actions
+        ))
+
     def test_left_base_uses_continuous_front_and_two_side_targets(self):
         # Break caught: a six-wall prefix omits the required continuous side wings.
         turn = layout_turn(our_x=9, enemy_x=17)
@@ -481,18 +755,18 @@ class FortificationTests(unittest.TestCase):
         state.fortification_initialized = True
         state.fortification_builder_id = 10010
         state.fortification_targets = (Pos(12, 8),)
-        real_safe_wall_targets = fortification_module.safe_wall_targets
+        real_safety = fortification_module._has_distinct_weapon_stands
         calls = 0
 
-        def counted_safe_wall_targets(*args, **kwargs):
+        def counted_safety(*args, **kwargs):
             nonlocal calls
             calls += 1
-            return real_safe_wall_targets(*args, **kwargs)
+            return real_safety(*args, **kwargs)
 
         with patch.object(
             fortification_module,
-            "safe_wall_targets",
-            counted_safe_wall_targets,
+            "_has_distinct_weapon_stands",
+            counted_safety,
         ):
             for round_no in range(5, 10):
                 payload["roundNo"] = round_no

@@ -789,7 +789,8 @@ class TeamTurnTests(unittest.TestCase):
         following["lastRoundRoleActionResults"] = {"10010": True}
         following["teamOur"]["roles"][0]["pos"] = {"x": 11, "y": 8}
         with mock.patch(
-            "agent.fortification.safe_wall_targets", return_value=(),
+            "agent.fortification._has_distinct_weapon_stands",
+            return_value=False,
         ), mock.patch(
             "agent.fortification._batch_progress_confirmed",
             return_value=False,

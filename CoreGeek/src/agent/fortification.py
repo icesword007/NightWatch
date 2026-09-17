@@ -22,6 +22,18 @@ UNKNOWN_CAPACITY_WALL_BATCH = 2
 MAX_TEMPORARY_RECHECKS = 2
 
 
+class _PlanningBudgetExhausted(Exception):
+    pass
+
+
+def _check_planning_budget(
+    clock: Callable[[], float],
+    deadline: float,
+) -> None:
+    if clock() >= deadline:
+        raise _PlanningBudgetExhausted
+
+
 @dataclass(frozen=True, slots=True)
 class DirectionPrior:
     dx: int
@@ -47,6 +59,9 @@ def ordered_wall_targets(
 def safe_wall_targets(
     turn: Turn,
     candidates: tuple[Pos, ...],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
 ) -> tuple[Pos, ...]:
     accepted = []
     projected_zones = dict(turn.zones)
@@ -58,9 +73,12 @@ def safe_wall_targets(
         else planned
     )
     for target in targets:
+        _check_planning_budget(clock, deadline)
         trial_zones = dict(projected_zones)
         trial_zones[target] = "wall"
-        if not _has_distinct_weapon_stands(turn, trial_zones):
+        if not _has_distinct_weapon_stands(
+            turn, trial_zones, clock=clock, deadline=deadline,
+        ):
             continue
         accepted.append(target)
         projected_zones = trial_zones
@@ -70,26 +88,30 @@ def safe_wall_targets(
 def _has_distinct_weapon_stands(
     turn: Turn,
     zones: dict[Pos, str],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
 ) -> bool:
+    _check_planning_budget(clock, deadline)
     controllable_ids = {role.unit_id for role in turn.controllable()}
-    static_occupied = {
-        cell
-        for unit in (*turn.ours, *turn.enemies)
+    static_occupied = set()
+    for unit in (*turn.ours, *turn.enemies):
+        _check_planning_budget(clock, deadline)
         if (
             unit.health > 0
             and (
                 unit in turn.enemies
                 or unit.unit_id not in controllable_ids
             )
-        )
-        for cell in turn.footprint(unit)
-    }
+        ):
+            static_occupied.update(turn.footprint(unit))
     choices = []
     weapon_positions = list(dict.fromkeys(
         [weapon.pos for weapon in turn.weapons()]
         + list(plan_defense_layout(turn).tower_targets)
     ))[:3]
     for weapon_pos in weapon_positions:
+        _check_planning_budget(clock, deadline)
         legal = tuple(
             pos
             for dx in (-1, 0, 1)
@@ -108,10 +130,13 @@ def _has_distinct_weapon_stands(
         choices.append(legal)
 
     roles = turn.controllable()
-    reachable = {
-        role.unit_id: _reachable_cells(turn, role.pos, zones, static_occupied)
-        for role in roles
-    }
+    reachable = {}
+    for role in roles:
+        _check_planning_budget(clock, deadline)
+        reachable[role.unit_id] = _reachable_cells(
+            turn, role.pos, zones, static_occupied,
+            clock=clock, deadline=deadline,
+        )
     station = turn.station()
     footprint = (
         frozenset(turn.footprint(station))
@@ -122,21 +147,23 @@ def _has_distinct_weapon_stands(
     if footprint:
         center_x2 = station.pos.x * 2 + 1
         center_y2 = station.pos.y * 2 - 1
-        back_passages = {
-            pos
-            for x in range(turn.width)
-            for y in range(turn.height)
-            for pos in (Pos(x, y),)
-            if (
-                min(distance(pos, cell) for cell in footprint) == 2
-                and zones.get(pos, "land") == "land"
-                and pos not in static_occupied
-                and (
-                    (pos.x * 2 - center_x2) * direction.dx
-                    + (pos.y * 2 - center_y2) * direction.dy
-                ) < 0
-            )
-        }
+        back_passages = set()
+        for x in range(turn.width):
+            _check_planning_budget(clock, deadline)
+            for y in range(turn.height):
+                if y % 16 == 0:
+                    _check_planning_budget(clock, deadline)
+                pos = Pos(x, y)
+                if (
+                    min(distance(pos, cell) for cell in footprint) == 2
+                    and zones.get(pos, "land") == "land"
+                    and pos not in static_occupied
+                    and (
+                        (pos.x * 2 - center_x2) * direction.dx
+                        + (pos.y * 2 - center_y2) * direction.dy
+                    ) < 0
+                ):
+                    back_passages.add(pos)
         if not back_passages or any(
             not cells.intersection(back_passages)
             for cells in reachable.values()
@@ -151,6 +178,7 @@ def _has_distinct_weapon_stands(
         used_stands: set[Pos],
         count: int,
     ) -> bool:
+        _check_planning_budget(clock, deadline)
         if count >= target_count:
             return True
         if index == len(choices) or count + len(choices) - index < target_count:
@@ -184,14 +212,23 @@ def _reachable_cells(
     start: Pos,
     zones: dict[Pos, str],
     static_occupied: set[Pos],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
 ) -> set[Pos]:
-    blocked = {
-        pos for pos, kind in zones.items() if kind != "land"
-    } | static_occupied | {robot.pos for robot in turn.robots}
+    blocked = set(static_occupied)
+    for pos, kind in zones.items():
+        _check_planning_budget(clock, deadline)
+        if kind != "land":
+            blocked.add(pos)
+    for robot in turn.robots:
+        _check_planning_budget(clock, deadline)
+        blocked.add(robot.pos)
     blocked.discard(start)
     reached = {start}
     frontier = [start]
     while frontier and len(reached) <= turn.width * turn.height:
+        _check_planning_budget(clock, deadline)
         current = frontier.pop()
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
@@ -238,12 +275,18 @@ def prepare_fortification(
         state.fortification_skip_reason = "third_tower_priority"
         return None
     if not state.fortification_initialized:
+        try:
+            safe_targets = safe_wall_targets(
+                turn, candidates, clock=clock, deadline=deadline,
+            )[:MAX_WALL_TARGETS]
+        except _PlanningBudgetExhausted:
+            state.fortification_phase = "waiting"
+            state.fortification_skip_reason = "planning_budget_exhausted"
+            return None
         state.fortification_planning_day = (
             turn.round_no - 1
         ) // ROUNDS_PER_DAY + 1
-        state.fortification_targets = safe_wall_targets(
-            turn, candidates,
-        )[:MAX_WALL_TARGETS]
+        state.fortification_targets = safe_targets
         if len(state.fortification_targets) < len(state.layout_wall_targets):
             state.layout_complete = False
             if state.layout_degraded_reason is None:
@@ -332,9 +375,14 @@ def prepare_fortification(
         continuing_batch
         and _batch_progress_confirmed(turn, state, builder.unit_id)
     )
-    current_batch_signature = _batch_environment_signature(
-        turn, state, builder.unit_id,
-    )
+    try:
+        current_batch_signature = _batch_environment_signature(
+            turn, state, builder.unit_id, clock=clock, deadline=deadline,
+        )
+    except _PlanningBudgetExhausted:
+        state.fortification_phase = "waiting"
+        state.fortification_skip_reason = "planning_budget_exhausted"
+        return None
     cache_environment_valid = (
         continuing_batch
         and progress_confirmed
@@ -342,16 +390,28 @@ def prepare_fortification(
     )
     if not batch_targets:
         state.fortification_batch_targets = ()
-        batch_targets = _current_safe_prefix(
-            turn, state, remaining_targets, candidates,
-        )
+        try:
+            batch_targets = _current_safe_prefix(
+                turn, state, remaining_targets, candidates,
+                clock=clock, deadline=deadline,
+            )
+        except _PlanningBudgetExhausted:
+            state.fortification_phase = "waiting"
+            state.fortification_skip_reason = "planning_budget_exhausted"
+            return None
     elif not (
         cache_environment_valid
         and all(target in candidates for target in batch_targets)
     ):
-        batch_targets = _current_safe_prefix(
-            turn, state, batch_targets, candidates,
-        )
+        try:
+            batch_targets = _current_safe_prefix(
+                turn, state, batch_targets, candidates,
+                clock=clock, deadline=deadline,
+            )
+        except _PlanningBudgetExhausted:
+            state.fortification_phase = "waiting"
+            state.fortification_skip_reason = "planning_budget_exhausted"
+            return None
     if not batch_targets:
         temporarily_blocked = any(
             target in state.fortification_deferred
@@ -419,7 +479,10 @@ def prepare_fortification(
     )
     if not feasible_targets:
         state.fortification_phase = "waiting"
-        state.fortification_skip_reason = "return_deadline"
+        state.fortification_skip_reason = (
+            "planning_budget_exhausted"
+            if clock() >= deadline else "return_deadline"
+        )
         return None
     state.fortification_batch_targets = feasible_targets
     state.fortification_batch_signature = current_batch_signature
@@ -496,25 +559,34 @@ def _batch_environment_signature(
     turn: Turn,
     state: Any,
     builder_id: int,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
 ) -> str:
     planned = set(state.fortification_targets)
-    parts = [
-        f"zone:{pos.x}:{pos.y}:{kind}"
-        for pos, kind in sorted(
-            turn.zones.items(), key=lambda entry: (entry[0].x, entry[0].y)
+    parts = []
+    for pos, kind in sorted(
+        turn.zones.items(), key=lambda entry: (entry[0].x, entry[0].y)
+    ):
+        _check_planning_budget(clock, deadline)
+        parts.append(f"zone:{pos.x}:{pos.y}:{kind}")
+    for side, units in (("our", turn.ours), ("enemy", turn.enemies)):
+        for unit in sorted(units, key=lambda entry: entry.unit_id):
+            _check_planning_budget(clock, deadline)
+            if unit.unit_id == builder_id or (
+                unit.kind == "wall" and unit.pos in planned
+            ):
+                continue
+            parts.append(
+                f"unit:{side}:{unit.unit_id}:{unit.kind}:"
+                f"{unit.pos.x}:{unit.pos.y}"
+            )
+    for robot in sorted(turn.robots, key=lambda entry: entry.robot_id):
+        _check_planning_budget(clock, deadline)
+        parts.append(
+            f"robot:{robot.robot_id}:{robot.pos.x}:{robot.pos.y}:"
+            f"{robot.health}"
         )
-    ]
-    parts.extend(
-        f"unit:{side}:{unit.unit_id}:{unit.kind}:{unit.pos.x}:{unit.pos.y}"
-        for side, units in (("our", turn.ours), ("enemy", turn.enemies))
-        for unit in sorted(units, key=lambda entry: entry.unit_id)
-        if unit.unit_id != builder_id
-        and not (unit.kind == "wall" and unit.pos in planned)
-    )
-    parts.extend(
-        f"robot:{robot.robot_id}:{robot.pos.x}:{robot.pos.y}:{robot.health}"
-        for robot in sorted(turn.robots, key=lambda entry: entry.robot_id)
-    )
     return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -523,22 +595,36 @@ def _current_safe_prefix(
     state: Any,
     targets: tuple[Pos, ...],
     candidates: tuple[Pos, ...],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
 ) -> tuple[Pos, ...]:
     accepted = []
+    projected_zones = dict(turn.zones)
+    deferred_updates = dict(state.fortification_deferred)
+    failed_updates = set(state.fortification_failed)
     for target in targets:
+        _check_planning_budget(clock, deadline)
         trial = tuple((*accepted, target))
         validation_signature = _wall_condition_signature(
             turn, trial, target in candidates,
+            clock=clock, deadline=deadline,
         )
-        deferred = state.fortification_deferred.get(target)
+        deferred = deferred_updates.get(target)
         if deferred is not None and deferred[0] == validation_signature:
             continue
-        if target in candidates and safe_wall_targets(turn, trial) == trial:
-            state.fortification_deferred.pop(target, None)
-            accepted.append(target)
-            continue
+        if target in candidates:
+            trial_zones = dict(projected_zones)
+            trial_zones[target] = "wall"
+            if _has_distinct_weapon_stands(
+                turn, trial_zones, clock=clock, deadline=deadline,
+            ):
+                deferred_updates.pop(target, None)
+                accepted.append(target)
+                projected_zones = trial_zones
+                continue
         blocker_signature = _temporary_blocker_signature(
-            turn, target, candidates,
+            turn, target, candidates, clock=clock, deadline=deadline,
         )
         if blocker_signature is not None:
             if deferred is None:
@@ -547,13 +633,15 @@ def _current_safe_prefix(
                 attempts = deferred[2]
             else:
                 attempts = deferred[2] + 1
-            state.fortification_deferred[target] = (
+            deferred_updates[target] = (
                 validation_signature, blocker_signature, attempts,
             )
             if attempts <= MAX_TEMPORARY_RECHECKS:
                 continue
-        state.fortification_deferred.pop(target, None)
-        state.fortification_failed.add(target)
+        deferred_updates.pop(target, None)
+        failed_updates.add(target)
+    state.fortification_deferred = deferred_updates
+    state.fortification_failed = failed_updates
     return tuple(accepted)
 
 
@@ -561,28 +649,33 @@ def _wall_condition_signature(
     turn: Turn,
     trial: tuple[Pos, ...],
     target_available: bool,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
 ) -> str:
     parts = [
         f"map:{turn.width}:{turn.height}",
         f"available:{int(target_available)}",
         "trial:" + ",".join(f"{pos.x}:{pos.y}" for pos in trial),
     ]
-    parts.extend(
-        f"zone:{pos.x}:{pos.y}:{kind}"
-        for pos, kind in sorted(
-            turn.zones.items(), key=lambda entry: (entry[0].x, entry[0].y)
+    for pos, kind in sorted(
+        turn.zones.items(), key=lambda entry: (entry[0].x, entry[0].y)
+    ):
+        _check_planning_budget(clock, deadline)
+        parts.append(f"zone:{pos.x}:{pos.y}:{kind}")
+    for side, units in (("our", turn.ours), ("enemy", turn.enemies)):
+        for unit in sorted(units, key=lambda entry: entry.unit_id):
+            _check_planning_budget(clock, deadline)
+            parts.append(
+                f"unit:{side}:{unit.unit_id}:{unit.kind}:"
+                f"{unit.pos.x}:{unit.pos.y}:{unit.health}"
+            )
+    for robot in sorted(turn.robots, key=lambda entry: entry.robot_id):
+        _check_planning_budget(clock, deadline)
+        parts.append(
+            f"robot:{robot.robot_id}:{robot.pos.x}:{robot.pos.y}:"
+            f"{robot.health}"
         )
-    )
-    parts.extend(
-        f"unit:{side}:{unit.unit_id}:{unit.kind}:"
-        f"{unit.pos.x}:{unit.pos.y}:{unit.health}"
-        for side, units in (("our", turn.ours), ("enemy", turn.enemies))
-        for unit in sorted(units, key=lambda entry: entry.unit_id)
-    )
-    parts.extend(
-        f"robot:{robot.robot_id}:{robot.pos.x}:{robot.pos.y}:{robot.health}"
-        for robot in sorted(turn.robots, key=lambda entry: entry.robot_id)
-    )
     return hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
 
 
@@ -590,6 +683,9 @@ def _temporary_blocker_signature(
     turn: Turn,
     target: Pos,
     candidates: tuple[Pos, ...],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float = float("inf"),
 ) -> str | None:
     if turn.zones.get(target, "land") != "land":
         return None
@@ -621,7 +717,9 @@ def _temporary_blocker_signature(
         enemies=tuple(unit for unit in turn.enemies if unit.kind == STATION),
         robots=(),
     )
-    if safe_wall_targets(relaxed, (target,)) != (target,):
+    if safe_wall_targets(
+        relaxed, (target,), clock=clock, deadline=deadline,
+    ) != (target,):
         return None
     blockers = [
         f"unit:{unit.unit_id}:{unit.kind}:{unit.pos.x}:{unit.pos.y}"
