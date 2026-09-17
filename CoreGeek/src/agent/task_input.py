@@ -51,52 +51,61 @@ def safe_regular(path):
 if mode=="path":
  path=safe_regular(target)
 else:
- roots=[os.path.abspath(os.getcwd())]
  def contains(parent,child):
   try: return os.path.commonpath((parent,child))==parent
   except ValueError: return False
+ start=time.monotonic(); seen=[0]
+ def expired(): return time.monotonic()-start>scan_seconds
+ roots=[]
  for candidate in task_roots:
+  if expired(): fail("scan_incomplete","time_limit")
   try: info=os.stat(candidate,follow_symlinks=False)
   except FileNotFoundError: continue
   except OSError as exc: fail("scan_incomplete",type(exc).__name__)
-  if not stat.S_ISDIR(info.st_mode): continue
+  if not stat.S_ISDIR(info.st_mode): fail("scan_incomplete","not_directory")
   candidate=os.path.abspath(candidate)
   if any(contains(root,candidate) for root in roots): continue
   roots=[root for root in roots if not contains(candidate,root)]
   roots.append(candidate)
- start=time.monotonic(); stack=[(root,0) for root in reversed(roots)]; matches=[]; rejected=0; seen=0
- def expired(): return time.monotonic()-start>scan_seconds
- while stack:
-  if expired(): fail("scan_incomplete","time_limit")
-  directory,depth=stack.pop()
-  try:
-   entries=[]
-   with os.scandir(directory) as iterator:
-    for entry in iterator:
-     if expired(): fail("scan_incomplete","time_limit")
-     seen+=1
-     if seen>max_entries: fail("scan_incomplete","entry_limit")
-     entries.append(entry)
-  except OSError as exc: fail("scan_incomplete",type(exc).__name__)
-  if expired(): fail("scan_incomplete","time_limit")
-  entries.sort(key=lambda item:item.name)
-  for entry in entries:
+ def scan(domain,skip=()):
+  stack=[(root,0) for root in reversed(domain)]; matches=[]; rejected=0
+  while stack:
    if expired(): fail("scan_incomplete","time_limit")
-   if entry.name==target:
-    try: regular=entry.is_file(follow_symlinks=False)
-    except OSError as exc: fail("scan_incomplete",type(exc).__name__)
-    if regular and not any(ord(ch)<32 or ord(ch)==127 for ch in entry.path): matches.append(entry.path)
-    else: rejected+=1
-   try: is_dir=entry.is_dir(follow_symlinks=False)
+   directory,depth=stack.pop()
+   try:
+    entries=[]
+    with os.scandir(directory) as iterator:
+     for entry in iterator:
+      if expired(): fail("scan_incomplete","time_limit")
+      seen[0]+=1
+      if seen[0]>max_entries: fail("scan_incomplete","entry_limit")
+      entries.append(entry)
    except OSError as exc: fail("scan_incomplete",type(exc).__name__)
-   if is_dir:
-    if depth>=max_depth: fail("scan_incomplete","depth_limit")
-    stack.append((entry.path,depth+1))
- if expired(): fail("scan_incomplete","time_limit")
- if rejected: fail("not_regular" if not matches else "ambiguous")
- if not matches: fail("not_found")
- if len(matches)!=1: fail("ambiguous",str(len(matches)))
- path=safe_regular(matches[0])
+   if expired(): fail("scan_incomplete","time_limit")
+   entries.sort(key=lambda item:item.name)
+   for entry in entries:
+    if expired(): fail("scan_incomplete","time_limit")
+    if entry.name==target:
+     try: regular=entry.is_file(follow_symlinks=False)
+     except OSError as exc: fail("scan_incomplete",type(exc).__name__)
+     if regular and not any(ord(ch)<32 or ord(ch)==127 for ch in entry.path): matches.append(entry.path)
+     else: rejected+=1
+    try: is_dir=entry.is_dir(follow_symlinks=False)
+    except OSError as exc: fail("scan_incomplete",type(exc).__name__)
+    if is_dir and entry.path not in skip:
+     if depth>=max_depth: fail("scan_incomplete","depth_limit")
+     stack.append((entry.path,depth+1))
+  if expired(): fail("scan_incomplete","time_limit")
+  if rejected: fail("not_regular" if not matches else "ambiguous")
+  if len(matches)>1: fail("ambiguous",str(len(matches)))
+  return matches[0] if matches else None
+ path=scan(roots) if roots else None
+ if path is None:
+  cwd=os.path.abspath(os.getcwd())
+  if any(contains(root,cwd) for root in roots): fail("not_found")
+  path=scan([cwd],tuple(roots))
+  if path is None: fail("not_found")
+ path=safe_regular(path)
 try:
  with open(path,"r",encoding="utf-8",errors="strict") as handle: content=handle.read(max_chars+1)
 except (OSError,UnicodeError) as exc: fail("read_error",type(exc).__name__)

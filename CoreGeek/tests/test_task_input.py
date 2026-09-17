@@ -63,7 +63,7 @@ class TaskInputTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(extract_task_input(text))
 
-    def test_filename_search_uses_only_cwd_and_the_evidenced_task_root(self):
+    def test_filename_search_prioritizes_the_evidenced_task_root(self):
         with (
             tempfile.TemporaryDirectory() as cwd_directory,
             tempfile.TemporaryDirectory() as task_directory,
@@ -88,14 +88,225 @@ class TaskInputTests(unittest.TestCase):
 
             local = cwd / target.name
             local.write_text("local duplicate", encoding="utf-8")
+            deep = cwd
+            for index in range(7):
+                deep = deep / f"unrelated-{index}"
+                deep.mkdir()
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+            ):
+                prioritized = self._run(
+                    build_task_input_command("filename", target.name), cwd,
+                )
+            self.assertEqual(
+                prioritized.returncode, 0,
+                prioritized.stdout + prioritized.stderr,
+            )
+            self.assertIn("bounded external task", prioritized.stdout)
+            self.assertNotIn("local duplicate", prioritized.stdout)
+
+    def test_task_root_priority_does_not_expand_to_related_cwd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            outer = Path(directory)
+            task_root = outer / "selfEvolutionTask"
+            nested = task_root / "tasks" / "one"
+            nested.mkdir(parents=True)
+            target = nested / "probe.md"
+            target.write_text("TASK_ROOT_MARKER", encoding="utf-8")
+            outside = outer / "unrelated"
+            outside.mkdir()
+            deep = outside
+            for index in range(7):
+                deep = deep / str(index)
+                deep.mkdir()
+
+            cases = (
+                ("ancestor", outer),
+                ("equal", task_root),
+                ("nested", task_root / "tasks"),
+            )
+            for label, cwd in cases:
+                with self.subTest(cwd_relation=label), patch.object(
+                    task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+                ):
+                    result = self._run(
+                        build_task_input_command("filename", target.name), cwd,
+                    )
+                self.assertEqual(
+                    result.returncode, 0, result.stdout + result.stderr,
+                )
+                self.assertIn("TASK_ROOT_MARKER", result.stdout)
+
+    def test_complete_empty_task_root_falls_back_to_cwd(self):
+        with (
+            tempfile.TemporaryDirectory() as cwd_directory,
+            tempfile.TemporaryDirectory() as task_directory,
+        ):
+            cwd = Path(cwd_directory)
+            task_root = Path(task_directory)
+            (task_root / "unrelated").mkdir()
+            target = cwd / "task.md"
+            target.write_text("cwd fallback", encoding="utf-8")
+
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+            ):
+                result = self._run(
+                    build_task_input_command("filename", target.name), cwd,
+                )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("cwd fallback", result.stdout)
+
+    def test_incomplete_or_ambiguous_task_root_never_falls_back(self):
+        with (
+            tempfile.TemporaryDirectory() as cwd_directory,
+            tempfile.TemporaryDirectory() as task_directory,
+        ):
+            cwd = Path(cwd_directory)
+            task_root = Path(task_directory)
+            (cwd / "task.md").write_text("must not fall back", encoding="utf-8")
+
+            deep = task_root
+            for index in range(7):
+                deep = deep / str(index)
+                deep.mkdir()
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+            ):
+                incomplete = self._run(
+                    build_task_input_command("filename", "task.md"), cwd,
+                )
+            self.assertNotEqual(incomplete.returncode, 0)
+            self.assertIn("scan_incomplete: depth_limit", incomplete.stdout)
+            self.assertNotIn("must not fall back", incomplete.stdout)
+
+            for child in ("one", "two"):
+                path = task_root / child
+                path.mkdir()
+                (path / "task.md").write_text(child, encoding="utf-8")
             with patch.object(
                 task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
             ):
                 ambiguous = self._run(
-                    build_task_input_command("filename", target.name), cwd,
+                    build_task_input_command(
+                        "filename", "task.md", max_depth=12,
+                    ),
+                    cwd,
                 )
             self.assertNotEqual(ambiguous.returncode, 0)
             self.assertIn("ambiguous", ambiguous.stdout)
+            self.assertNotIn("must not fall back", ambiguous.stdout)
+
+    def test_overlapping_task_roots_do_not_duplicate_a_match(self):
+        with (
+            tempfile.TemporaryDirectory() as cwd_directory,
+            tempfile.TemporaryDirectory() as task_directory,
+        ):
+            cwd = Path(cwd_directory)
+            task_root = Path(task_directory)
+            child = task_root / "tasks"
+            child.mkdir()
+            target = child / "task.md"
+            target.write_text("one task", encoding="utf-8")
+
+            with patch.object(
+                task_input_module,
+                "DEFAULT_TASK_ROOTS",
+                (str(child), str(task_root), str(child)),
+            ):
+                result = self._run(
+                    build_task_input_command("filename", target.name), cwd,
+                )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("one task", result.stdout)
+
+    def test_task_and_cwd_domains_share_entry_budget(self):
+        with (
+            tempfile.TemporaryDirectory() as cwd_directory,
+            tempfile.TemporaryDirectory() as task_directory,
+        ):
+            cwd = Path(cwd_directory)
+            task_root = Path(task_directory)
+            (task_root / "unrelated.md").write_text("x", encoding="utf-8")
+            (cwd / "task.md").write_text("must not be read", encoding="utf-8")
+
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+            ):
+                result = self._run(
+                    build_task_input_command(
+                        "filename", "task.md", max_entries=1,
+                    ),
+                    cwd,
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("scan_incomplete: entry_limit", result.stdout)
+            self.assertNotIn("must not be read", result.stdout)
+
+    def test_task_and_cwd_domains_share_time_budget(self):
+        with (
+            tempfile.TemporaryDirectory() as cwd_directory,
+            tempfile.TemporaryDirectory() as task_directory,
+        ):
+            cwd = Path(cwd_directory)
+            task_root = Path(task_directory)
+            (task_root / "unrelated.md").write_text("x", encoding="utf-8")
+            (cwd / "task.md").write_text("must not be read", encoding="utf-8")
+            output = io.StringIO()
+            ticks = iter(index * 0.11 for index in range(30))
+            previous = Path.cwd()
+            try:
+                os.chdir(cwd)
+                with (
+                    patch.object(sys, "argv", [
+                        "reader", "filename", "task.md", "6", "4096",
+                        "1.0", "32768", str(task_root),
+                    ]),
+                    patch("time.monotonic", side_effect=lambda: next(ticks)),
+                    redirect_stdout(output),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    exec(_READER, {})
+            finally:
+                os.chdir(previous)
+
+            self.assertNotEqual(raised.exception.code, 0)
+            self.assertIn("scan_incomplete: time_limit", output.getvalue())
+            self.assertNotIn("must not be read", output.getvalue())
+
+    def test_nonregular_task_root_match_never_falls_back(self):
+        with (
+            tempfile.TemporaryDirectory() as cwd_directory,
+            tempfile.TemporaryDirectory() as task_directory,
+        ):
+            cwd = Path(cwd_directory)
+            task_root = Path(task_directory)
+            (cwd / "task.md").write_text("must not fall back", encoding="utf-8")
+            regular = task_root / "regular.md"
+            regular.write_text("not the requested entry", encoding="utf-8")
+            os.symlink(regular, task_root / "task.md")
+
+            with patch.object(
+                task_input_module, "DEFAULT_TASK_ROOTS", (str(task_root),),
+            ):
+                result = self._run(
+                    build_task_input_command("filename", "task.md"), cwd,
+                )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("not_regular", result.stdout)
+            self.assertNotIn("must not fall back", result.stdout)
+
+    def test_maximum_filename_keeps_command_within_platform_limit(self):
+        target = "a" * 509 + ".md"
+
+        command = build_task_input_command("filename", target)
+
+        self.assertEqual(len(target), 512)
+        self.assertLessEqual(len(command), 4_096)
 
     def test_missing_evidenced_task_root_does_not_break_cwd_search(self):
         with tempfile.TemporaryDirectory() as directory:
