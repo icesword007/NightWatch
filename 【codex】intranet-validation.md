@@ -1,8 +1,8 @@
 # NightWatch 内网验证手册
 
-仓库当前构建`nightwatch-s2-integrated-r8`：在r7上追加T48缺品采购路线、逐字段推导证据审计、本轮资金与角色占用评估；保留T60、T46及原有能力，宝藏动作仍关闭。唯一执行入口始终为 https://github.com/icesword007/NightWatch/issues/12 ，必须重新读取最新正文/updatedAt；完整SHA、允许部署版本、批次、场次与停止条件以该正文为准。仓库存在r8不等于当前内网已获准切换；先按#12完成r7在途验证。
+仓库当前构建`nightwatch-s2-integrated-r9`：在r8三项T48只读增量上增加双方压力旁路观察、入夜前预测及夜后核验；不参与决策。唯一执行入口为 https://github.com/icesword007/NightWatch/issues/12 ，必须刷新正文/updatedAt；完整SHA、场次和停止条件以该正文为准。
 
-r8验收参考【codex】s2-integrated-r8-intranet-prompt.md；r7参考保留。#13经济性能、#14任务、#15防守；#9/#10/#11仅迁移历史，关闭不表示修复。原始题面/答案/凭据/日志留内网，反馈只写脱敏增量。S1已验收，S2仍未通过。
+r9统一验收参考[送测说明](【codex】s2-integrated-r9-intranet-prompt.md)。r7/r8参考仅保留历史与字段解释；#13经济性能、#14任务、#15防守及压力旁路；旧单迁移关闭不表示修复。
 
 以下旧条目保留协议和历史证据；其中旧版本、候选状态、旧issue号、已覆盖的阶段状态仅反映记录当时，不能替代#12当前指令，也不能重启旧批次。不按旧“S1未通过/未合入/r5”等措辞判断当前状态。
 

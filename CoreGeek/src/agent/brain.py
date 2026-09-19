@@ -37,6 +37,7 @@ from .protocol import (
     distance,
     move_command,
 )
+from .pressure_shadow import observe_shadow, shadow_diagnostic
 from .state import MAX_HISTORY_FACTS, StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
 from .treasure import MAX_TREASURE_CANDIDATES, evaluate_treasure_candidates
@@ -589,6 +590,15 @@ class DecisionEngine:
                 treasure_deadline=deadline,
                 treasure_allocation_context=allocation_context,
             )
+            shadow_started = time.perf_counter()
+            observe_shadow(turn, state.pressure_shadow)
+            shadow_trace = shadow_diagnostic(state.pressure_shadow)
+            shadow_trace["session"] = state.session_index
+            shadow_trace["team"] = turn.team_type
+            shadow_trace["elapsedMs"] = round(
+                (time.perf_counter() - shadow_started) * 1000, 3,
+            )
+            trace["pressureShadow"] = shadow_trace
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for domain, candidate in accepted:
                 if domain == "emergency":

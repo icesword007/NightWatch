@@ -15,6 +15,7 @@ from .intelligence import (
     source_id,
 )
 from .protocol import ROUNDS_PER_DAY, Pos, Turn, distance
+from .pressure_shadow import ShadowState
 
 MAX_ACTION_HISTORY = 64
 MAX_ENDED_TASKS = 16
@@ -132,6 +133,7 @@ class SessionState:
     team_id: str
     team_type: str
     session_index: int = 1
+    pressure_shadow: ShadowState = field(default_factory=ShadowState)
     last_round_no: int | None = None
     last_fingerprint: str | None = None
     last_response: dict[str, Any] | None = None
