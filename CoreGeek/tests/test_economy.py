@@ -1293,6 +1293,195 @@ class EconomyTests(unittest.TestCase):
             "WallFixer",
         )
 
+    def test_three_towers_fourteen_walls_reuse_exact_request_paths(self):
+        from agent.layout import plan_defense_layout
+
+        payload = economy_payload(round_no=30, worker_pos=(0, 0), gold=10)
+        payload["teamOur"]["teamId"] = "investment-path-reuse"
+        payload["mapInfo"].update({"width": 41, "height": 32})
+        blueprint = plan_defense_layout(Turn.load(payload))
+        payload["teamOur"]["roles"].extend(
+            role(20000 + index, "wall", target.x, target.y, health=100)
+            for index, target in enumerate(blueprint.wall_targets)
+        )
+        real_next_step = economy.next_step
+        path_calls = []
+
+        def counted_next_step(turn, moving, goal, **kwargs):
+            result = real_next_step(turn, moving, goal, **kwargs)
+            path_calls.append(result)
+            return result
+
+        diagnostics = []
+        with patch.object(economy, "next_step", counted_next_step):
+            candidates = economy.propose_economy(
+                Turn.load(payload), state_for(payload), clock=lambda: 0.0,
+                deadline=1.0, max_expansions=64,
+                diagnostic_sink=diagnostics.append,
+            )
+
+        worker = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+        self.assertEqual(worker.proposal.command, {
+            "action": "move", "targetPos": [{"x": 1, "y": 0}],
+        })
+        self.assertEqual(worker.plan_reason, "fund:WallFixer:10020:20010")
+        self.assertEqual(worker.estimated_rounds, 13)
+        self.assertLessEqual(len(path_calls), 520)
+        self.assertLessEqual(sum(path.expansions for path in path_calls), 9500)
+        self.assertEqual(diagnostics[0]["pathComputations"], len(path_calls))
+        self.assertGreaterEqual(diagnostics[0]["pathCacheHits"], 119)
+
+    def test_incomplete_path_reuse_keeps_status_and_honors_deadline(self):
+        turn = Turn.load(economy_payload(worker_pos=(0, 0)))
+        worker = turn.workers()[0]
+        target = Pos(11, 11)
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        real_next_step = economy.next_step
+        calls = []
+
+        def counted_next_step(*args, **kwargs):
+            result = real_next_step(*args, **kwargs)
+            calls.append(result)
+            return result
+
+        try:
+            with patch.object(economy, "next_step", counted_next_step):
+                first = economy._best_adjacent_route(
+                    turn, worker, target, lambda: 0.0, 1.0, 0,
+                )
+                second = economy._best_adjacent_route(
+                    turn, worker, target, lambda: 0.0, 1.0, 0,
+                )
+                calls_before_deadline = len(calls)
+                third = economy._best_adjacent_route(
+                    turn, worker, target, lambda: 1.0, 1.0, 0,
+                )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertIsNone(third)
+        self.assertEqual(
+            calls_before_deadline,
+            len(economy._adjacent_stands(turn, worker, target)),
+        )
+        self.assertEqual(context.truncated_reason, "deadline")
+
+    def test_path_reuse_distinguishes_role_projection_and_expansion_budget(self):
+        from dataclasses import replace
+
+        turn = Turn.load(economy_payload(worker_pos=(0, 0)))
+        worker = turn.workers()[0]
+        other = replace(worker, unit_id=10011)
+        projected = replace(worker, pos=Pos(1, 0))
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        real_next_step = economy.next_step
+        calls = []
+
+        def counted_next_step(*args, **kwargs):
+            result = real_next_step(*args, **kwargs)
+            calls.append(result)
+            return result
+
+        try:
+            with patch.object(economy, "next_step", counted_next_step):
+                for moving, budget in (
+                    (worker, 0), (worker, 0), (other, 0),
+                    (projected, 0), (worker, 64),
+                ):
+                    economy._search_path(
+                        turn, moving, Pos(3, 1), clock=lambda: 0.0,
+                        deadline=1.0, max_expansions=budget,
+                    )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(context.path_cache_hits, 1)
+        self.assertEqual(calls[0].status, "expansion_limit")
+        self.assertEqual(calls[-1].status, "found")
+
+    def test_cached_found_path_does_not_bypass_elapsed_deadline(self):
+        turn = Turn.load(economy_payload(worker_pos=(0, 0)))
+        worker = turn.workers()[0]
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            first = economy._search_path(
+                turn, worker, Pos(3, 1), clock=lambda: 0.0,
+                deadline=1.0, max_expansions=256,
+            )
+            second = economy._search_path(
+                turn, worker, Pos(3, 1), clock=lambda: 1.0,
+                deadline=1.0, max_expansions=256,
+            )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertEqual(first.status, "found")
+        self.assertEqual(second.status, "deadline")
+        self.assertIsNone(second.step)
+        self.assertEqual(context.path_cache_hits, 0)
+
+    def test_complete_adjacent_route_cache_does_not_bypass_deadline(self):
+        turn = Turn.load(economy_payload(worker_pos=(0, 0)))
+        worker = turn.workers()[0]
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            first = economy._routes_to_adjacent(
+                turn, worker, Pos(4, 2), lambda: 0.0, 1.0, 256,
+            )
+            second = economy._routes_to_adjacent(
+                turn, worker, Pos(4, 2), lambda: 1.0, 1.0, 256,
+            )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertTrue(first)
+        self.assertEqual(second, ())
+        self.assertEqual(context.truncated_reason, "deadline")
+
+    def test_request_path_reuse_does_not_survive_new_obstacles(self):
+        payload = economy_payload(worker_pos=(0, 0))
+        worker = Turn.load(payload).workers()[0]
+        target = Pos(3, 1)
+        first_turn = Turn.load(payload)
+        blocked = copy.deepcopy(payload)
+        blocked["mapInfo"]["zones"].append({
+            "pos": target.dump(), "neutralType": "stone",
+        })
+        second_turn = Turn.load(blocked)
+        real_next_step = economy.next_step
+        calls = []
+
+        def counted_next_step(*args, **kwargs):
+            result = real_next_step(*args, **kwargs)
+            calls.append(result)
+            return result
+
+        with patch.object(economy, "next_step", counted_next_step):
+            for turn in (first_turn, second_turn):
+                context = economy.RouteSearchContext({})
+                token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+                try:
+                    economy._search_path(
+                        turn, worker, target, clock=lambda: 0.0,
+                        deadline=1.0, max_expansions=256,
+                    )
+                finally:
+                    economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].status, "found")
+        self.assertEqual(calls[1].status, "unreachable")
+
     def test_economy_uses_only_its_reserved_share_of_request_budget(self):
         payload = economy_payload(round_no=30)
         payload["worldNews"] = {}
@@ -1983,6 +2172,65 @@ class EconomyTests(unittest.TestCase):
         self.assertLessEqual(
             traces[0]["economyPlanning"]["pathSearches"], 1600,
         )
+
+    def test_procurement_new_and_continuing_routes_match_uncached_search(self):
+        payload = self._procurement_payload()
+        payload["teamOur"]["teamId"] = "procurement-path-reuse"
+        payload["mapInfo"].update({"width": 41, "height": 32})
+        payload["teamOur"]["roles"].extend(
+            role(10200 + offset, "wall", 12 + offset, 12, health=900)
+            for offset in range(8)
+        )
+        raw_next_step = economy.next_step
+
+        def uncached(turn, worker, stand, *, clock, deadline, max_expansions):
+            return economy.next_step(
+                turn, worker, stand, clock=clock, deadline=deadline,
+                max_expansions=max_expansions,
+            )
+
+        def run(use_cache):
+            engine = DecisionEngine(
+                max_search_expansions=64, clock=lambda: 0.0,
+            )
+            current = copy.deepcopy(payload)
+            observed = []
+            for round_no in (10, 11):
+                if round_no == 11:
+                    current["roundNo"] = 11
+                    current["teamOur"]["roles"][0]["backpack"].append("copper")
+                    current["lastRoundRoleActionResults"] = {"10010": True}
+                calls = []
+
+                def counted(*args, **kwargs):
+                    path = raw_next_step(*args, **kwargs)
+                    calls.append(path)
+                    return path
+
+                with patch.object(economy, "next_step", counted):
+                    if use_cache:
+                        response = engine.decide(current)
+                    else:
+                        with patch.object(economy, "_search_path", uncached):
+                            response = engine.decide(current)
+                plan = engine.state.state.plans[10010]
+                observed.append((
+                    response["roleCommandMap"]["10010"],
+                    plan.reason, plan.deadline_round,
+                    len(calls), sum(path.expansions for path in calls),
+                ))
+            return observed
+
+        baseline, optimized = run(False), run(True)
+        for before, after in zip(baseline, optimized):
+            self.assertEqual(before[:3], after[:3])
+            self.assertLess(after[3], before[3])
+            self.assertLess(after[4], before[4])
+        self.assertEqual([entry[0]["action"] for entry in optimized], [
+            "collect", "collect",
+        ])
+        self.assertEqual([entry[3] for entry in baseline], [713, 314])
+        self.assertEqual([entry[3] for entry in optimized], [631, 283])
 
     def test_batch_plan_releases_on_day_boundary_and_death(self):
         payload = self._procurement_payload()

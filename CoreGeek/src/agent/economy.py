@@ -11,7 +11,7 @@ from .fortification import (
     ordered_wall_targets,
     remaining_wall_targets,
 )
-from .grid import next_step
+from .grid import PathResult, next_step
 from .layout import ensure_defense_layout
 from .protocol import (
     PIONEER,
@@ -114,8 +114,14 @@ class RouteSearchContext:
         tuple[int, Pos, Pos, int],
         tuple[tuple[Pos, int], ...],
     ]
+    paths: dict[tuple[int, Pos, Pos, int], PathResult] = field(
+        default_factory=dict,
+    )
     path_searches: int = 0
     cache_hits: int = 0
+    path_computations: int = 0
+    path_cache_hits: int = 0
+    path_expansions: int = 0
     truncated_reason: str | None = None
     joint_status: str | None = None
     joint_blocker: str | None = None
@@ -195,6 +201,9 @@ def propose_economy(
             diagnostic_sink({
                 "pathSearches": context.path_searches,
                 "cacheHits": context.cache_hits,
+                "pathComputations": context.path_computations,
+                "pathCacheHits": context.path_cache_hits,
+                "pathExpansions": context.path_expansions,
                 "truncatedReason": context.truncated_reason,
                 "jointStatus": context.joint_status,
                 "heldInvestment": (
@@ -3448,7 +3457,7 @@ def _post_action(
     )
     if route_cost > turn.rounds_until_night or worker.pos == stand:
         return None
-    path = next_step(
+    path = _search_path(
         turn,
         worker,
         stand,
@@ -3640,7 +3649,7 @@ def _purchase_is_timely(
 
     best_rounds: int | None = None
     for shop_stand in _adjacent_stands(turn, worker, shop):
-        path = next_step(
+        path = _search_path(
             turn,
             worker,
             shop_stand,
@@ -3694,6 +3703,36 @@ def _route_cost_to_adjacent(
     return min((cost for _, cost in routes), default=None)
 
 
+def _search_path(
+    turn: Turn,
+    worker: Unit,
+    stand: Pos,
+    *,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PathResult:
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    key = (worker.unit_id, worker.pos, stand, max_expansions)
+    if context is not None:
+        cached = context.paths.get(key)
+        if cached is not None:
+            if clock() >= deadline:
+                return PathResult("deadline", None, 0, None)
+            context.path_cache_hits += 1
+            return cached
+    result = next_step(
+        turn, worker, stand, clock=clock, deadline=deadline,
+        max_expansions=max_expansions,
+    )
+    if context is not None:
+        context.path_computations += 1
+        context.path_expansions += result.expansions
+        if result.status != "deadline":
+            context.paths[key] = result
+    return result
+
+
 def _routes_to_adjacent(
     turn: Turn,
     worker: Unit,
@@ -3705,6 +3744,9 @@ def _routes_to_adjacent(
     context = _ROUTE_SEARCH_CONTEXT.get()
     cache_key = (worker.unit_id, worker.pos, target, max_expansions)
     if context is not None and cache_key in context.routes:
+        if clock() >= deadline:
+            context.truncated_reason = "deadline"
+            return ()
         context.cache_hits += 1
         return context.routes[cache_key]
     routes = []
@@ -3718,7 +3760,7 @@ def _routes_to_adjacent(
             return ()
         if context is not None:
             context.path_searches += 1
-        path = next_step(
+        path = _search_path(
             turn,
             worker,
             stand,
@@ -3773,7 +3815,7 @@ def _move_to_stand(
 ) -> ActionProposal | None:
     if stand is None or worker.pos == stand:
         return None
-    path = next_step(
+    path = _search_path(
         turn,
         worker,
         stand,
@@ -3841,7 +3883,7 @@ def _move_adjacent(
     max_expansions: int,
 ) -> PlannedAction | None:
     for stand in _adjacent_stands(turn, worker, target):
-        path = next_step(
+        path = _search_path(
             turn,
             worker,
             stand,

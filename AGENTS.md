@@ -412,3 +412,19 @@ R207主干验证：509/509含16HTTP通过21.297秒，diff/cached diff/bash-n通�
 原Sol+medium交付回合01a0b753-5f51-7cc3-b6e9-00108871aab9已completed/idle，cursor143。主会话独立516/516含16HTTP通过21.094秒，diff/cached diff/bash-n通过。首次516项全绿后独立审查发现format-only与允许command的提示矛盾，已交原Sol关闭；再次独立核对纠正提示周期0/无command示例，普通prompt与365c8cc逐字一致，剩1回合纠正后截止当轮原样提交、重放一致。其他边界只读复验未发现确定阻断。
 
 T57本批本地验收通过，可隔离提交，构建nightwatch-s2-task-envelope-r1。只证明一次格式纠正及合法提交链可用，不保证模型遵守纠正或全部answer_error/abandoned已修。main365c8cc/r5及issue #12保持内网验证，不自动合并推送或继续新开发，旧树/缓存保留。
+
+
+## R211 经济规划性能定位与最小优化
+
+本批继续使用`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-day-work`与`codex/s2-day-work`，基准`ce7bab3c8aec9d4b8e0077202704e0bc6c25d38f`；按外层`design/【codex】s2-economy-performance-plan.md`实施T58，构建标识`nightwatch-s2-economy-perf-r1`。`main`/r5、其他工作树与固定issue #12只读保持。
+
+必须先用真实`DecisionEngine`/`propose_economy`、41×32大图和可控计数确认请求内重复开销，再只在`economy.py`现有上下文/helper内做最小消除。不改全局寻路算法，不增加跨轮缓存，不提高4秒/3秒/1600及扩展上限，不减少候选、安全校验或改变采购/施工优先级。缓存必须包含投影起点、目标、角色、占位/预留等路线输入，不得把截止或局部扩展结果当完整可达性。
+
+先红测试，再最小实现；覆盖三塔多墙、普通/拥堵大图、批量采购新建与续行、乱序/移动/障碍变化、截止/局部扩展/无路/临夜/新请求隔离。无时压可控钟下动作、计划绑定、路线代价必须等价；性能证据分开寻路调用、实际扩展、缓存命中与Python计算，合成fixture不得宣称完全复现平台原局。开发不commit/merge/push/reset/切分支/删除/新目录依赖/派生Agent，不更新#12或开局；R212交付后停止等R213。
+
+
+## R213 T58本地独立验收
+
+原Sol+medium回合01a0b764-953e-7a71-8343-1b4247ca3ee9已completed/idle，cursor145。主会话独立523/523含16HTTP通过21.348秒，diff/cached diff/bash-n通过；只读代码审查无确定阻断。独立14墙基准实测A*636→517，扩展15062→9468，move(1,0)、fund:WallFixer:10020:20010与13轮估计不变。六组旧ce7bab3源码/新源码无时压逐字段提案及原pathSearches一致，覆盖输入乱序、临夜、无资金、障碍、多vendor/shop。
+
+T58本地验收通过，可隔离提交，构建nightwatch-s2-economy-perf-r1。原pathSearches仍计候选访问，新增pathComputations/pathCacheHits/pathExpansions记录真正A*开销；不增加预算、候选剪枝或跨轮缓存。原平台约3秒问题未获完整原始帧，实际收益待验。main365c8cc/r5与#12保持，不自动合并推送/开局或继续开发，旧树及缓存保留。
