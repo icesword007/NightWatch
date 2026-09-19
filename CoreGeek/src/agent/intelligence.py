@@ -49,11 +49,21 @@ class NewsCitation:
 
 
 @dataclass(frozen=True, slots=True)
+class TreasureDerivation:
+    kind: str
+    explanation: str
+    unresolved: tuple[str, ...]
+    time_basis: str
+
+
+@dataclass(frozen=True, slots=True)
 class CitedTreasureValue:
     value: Any
     citations: tuple[NewsCitation, ...]
     source_sessions: tuple[int, ...]
     source_truncated: bool
+    derivation: TreasureDerivation | None = None
+    source_fingerprints: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,7 +189,17 @@ def _render_prompt(
         "candidate has those same keys and may additionally have "
         "treasureConditions. treasureConditions, when present, must have exactly "
         "location, window, items. Each is null when unknown, or an object with "
-        "exactly value and citations. location.value is exactly integer x/y; "
+        "value and citations, plus optional derivation. For each known field "
+        "provide derivation with exactly kind, explanation, unresolved, "
+        "timeBasis. kind is direct/derived/unknown: a model claim, not proof. "
+        "explanation is a brief basis summary, not a reasoning chain, at most "
+        "512 characters; unresolved has at most 8 non-empty strings of at most "
+        "512 characters. For window, timeBasis is absolute_rounds/relative/"
+        "first_observed/unknown; for location/items it is not_applicable. "
+        "First observation never supplies a publication anchor: leave a "
+        "relative-date window null without a real anchor. Reuse field citations "
+        "for premises, and do not treat repeated citations as independent proof. "
+        "location.value is exactly integer x/y; "
         "window.value is exactly integer startRound/endRound in the absolute "
         "current-session range 1..1300; items.value is an array of at most 8 "
         "non-empty item names, preserving duplicates. Every top-level and field "
@@ -308,11 +328,18 @@ def _parse_treasure_field(
 ) -> CitedTreasureValue | None:
     if raw is None:
         return None
-    if not isinstance(raw, dict) or set(raw) != {"value", "citations"}:
+    if not isinstance(raw, dict) or set(raw) not in (
+        {"value", "citations"}, {"value", "citations", "derivation"},
+    ):
         return None
     citations = _parse_citations(raw.get("citations"), sources)
     if citations is None:
         return None
+    derivation = None
+    if "derivation" in raw:
+        derivation = _parse_derivation(raw["derivation"], kind)
+        if derivation is None:
+            return None
     value = raw.get("value")
     if kind == "location":
         if not _strict_int_object(value, ("x", "y")):
@@ -341,7 +368,31 @@ def _parse_treasure_field(
         citations=citations,
         source_sessions=tuple(sorted({source.first_session for source in cited_sources})),
         source_truncated=any(source.truncated for source in cited_sources),
+        derivation=derivation,
+        source_fingerprints=tuple(source.fingerprint for source in cited_sources),
     )
+
+
+def _parse_derivation(raw: Any, field_kind: str) -> TreasureDerivation | None:
+    if not isinstance(raw, dict) or set(raw) != {
+        "kind", "explanation", "unresolved", "timeBasis",
+    }:
+        return None
+    if raw["kind"] not in ("direct", "derived", "unknown") or not _bounded_text(
+        raw["explanation"], MAX_CONDITION_CHARS,
+    ):
+        return None
+    unresolved = _bounded_text_list(raw["unresolved"])
+    if unresolved is None:
+        return None
+    basis = raw["timeBasis"]
+    allowed = (
+        ("absolute_rounds", "relative", "first_observed", "unknown")
+        if field_kind == "window" else ("not_applicable",)
+    )
+    if basis not in allowed:
+        return None
+    return TreasureDerivation(raw["kind"], raw["explanation"], unresolved, basis)
 
 
 def _parse_citations(

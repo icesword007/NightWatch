@@ -515,6 +515,8 @@ class DecisionEngine:
                 execute_cmd=task_turn.execute_cmd,
                 task_active=bool(turn.phase_task),
             )
+            allocated_commands = last_valid["roleCommandMap"]
+            used_fallback = False
             if (
                 not accepted
                 and not turn.phase_task
@@ -522,6 +524,7 @@ class DecisionEngine:
                 and not unsafe_day_work_ids
             ):
                 last_valid = fallback
+                used_fallback = True
 
             has_task_accept = any(
                 isinstance(command, dict)
@@ -553,6 +556,23 @@ class DecisionEngine:
             )
             if economy_planning is not None:
                 economy_planning["rejectedActions"] = len(rejected_economy)
+            allocation_context = None
+            if (
+                not used_fallback
+                and last_valid["roleCommandMap"] == allocated_commands
+            ):
+                allocation_context = {
+                    "teamId": turn.team_id,
+                    "roundNo": turn.round_no,
+                    "sessionIndex": state.session_index,
+                    "currentGold": turn.gold,
+                    "goldRemaining": allocator.gold_remaining,
+                    "acceptedActors": frozenset(
+                        candidate.proposal.actor_id for _, candidate in accepted
+                    ),
+                    "taskReservedActors": frozenset(task_role_ids),
+                    "fundingReservedActors": frozenset(funding_roles),
+                }
             trace = self._decision_trace(
                 turn,
                 payload,
@@ -567,6 +587,7 @@ class DecisionEngine:
                 treasure_assignments=copy.deepcopy(daytime_assignments),
                 treasure_clock=self.clock,
                 treasure_deadline=deadline,
+                treasure_allocation_context=allocation_context,
             )
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for domain, candidate in accepted:
@@ -728,6 +749,7 @@ class DecisionEngine:
         treasure_assignments: dict | None = None,
         treasure_clock: Callable[[], float] | None = None,
         treasure_deadline: float | None = None,
+        treasure_allocation_context: dict | None = None,
     ) -> dict[str, Any]:
         task = state.active_task if state is not None else None
         remaining = None
@@ -926,6 +948,7 @@ class DecisionEngine:
                 daytime_assignments=treasure_assignments,
                 clock=treasure_clock,
                 deadline=treasure_deadline,
+                allocation_context=treasure_allocation_context,
             )
             if state is not None else ()
         )
