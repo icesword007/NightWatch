@@ -24,6 +24,7 @@ def evaluate_treasure_candidates(
     ] | None = None,
     clock: Callable[[], float] | None = None,
     deadline: float | None = None,
+    allocation_context: dict | None = None,
 ) -> tuple[dict, ...]:
     current = tuple(
         candidate for candidate in candidates
@@ -50,6 +51,7 @@ def evaluate_treasure_candidates(
             daytime_assignments=daytime_assignments,
             clock=clock,
             route_budget=route_budget,
+            allocation_context=allocation_context,
         )
         for index, candidate in enumerate(current)
     )
@@ -67,6 +69,7 @@ def _evaluate_candidate(
     ] | None,
     clock: Callable[[], float] | None,
     route_budget: dict | None,
+    allocation_context: dict | None,
 ) -> dict:
     reasons: list[str] = []
     result = {
@@ -97,14 +100,46 @@ def _evaluate_candidate(
             "backpackFitsMissing": "unknown",
             "routeScope": "missing_item_procurement",
             "spendingBudgetEvaluated": False,
+            "spendableBudgetCoversMissingCost": "unknown",
             "routeEvaluated": False,
             "returnWindowEvaluated": False,
             "semanticValidationEvaluated": False,
+            "currentAllocation": {
+                "scope": "current_response_only",
+                "evaluated": False,
+                "status": "context_unknown",
+                "committedGold": None,
+                "cashAfterCommitments": None,
+                "cashAfterCommitmentsCoversMissingCost": "unknown",
+                "pioneerHasAcceptedAction": "unknown",
+                "pioneerPriorityReserved": "unknown",
+                "reasons": [],
+            },
+            "route": {
+                "status": "not_evaluated",
+                "shopMoveRounds": None,
+                "purchaseRounds": None,
+                "altarMoveRounds": None,
+                "waitRounds": None,
+                "earliestActionRound": None,
+                "returnMoveRounds": None,
+                "returnWithMargin": "unknown",
+                "expansions": 0,
+            },
         },
     }
     conditions = candidate.treasure_conditions
+    result["evidenceAudit"] = {
+        name: _field_audit(
+            getattr(conditions, name) if conditions is not None else None,
+            session_index=session_index,
+            is_window=name == "window",
+        )
+        for name in ("location", "window", "items")
+    }
     if conditions is None:
         reasons.append("unstructured")
+        _assess_current_allocation(turn, result, session_index, allocation_context)
         return result
 
     if conditions.location is None:
@@ -203,12 +238,108 @@ def _evaluate_candidate(
             reasons.append("active_task")
 
     result["localChecksPassed"] = not reasons
+    _assess_current_allocation(turn, result, session_index, allocation_context)
     if route_budget is not None and clock is not None:
         _assess_route(
             turn, conditions, result, daytime_assignments, clock,
             route_budget,
         )
     return result
+
+
+def _assess_current_allocation(
+    turn: Turn, result: dict, session_index: int, context: dict | None,
+) -> None:
+    allocation = result["procurement"]["currentAllocation"]
+    if context is None:
+        return
+    if (
+        not isinstance(context, dict)
+        or context.get("teamId") != turn.team_id
+        or type(context.get("roundNo")) is not int
+        or context["roundNo"] != turn.round_no
+        or type(context.get("sessionIndex")) is not int
+        or context["sessionIndex"] != session_index
+        or type(context.get("currentGold")) is not int
+        or context["currentGold"] != turn.gold
+        or turn.gold < 0
+        or type(context.get("goldRemaining")) is not int
+        or not 0 <= context["goldRemaining"] <= turn.gold
+        or any(
+            not isinstance(context.get(key), frozenset)
+            or any(type(role_id) is not int for role_id in context[key])
+            for key in ("acceptedActors", "taskReservedActors", "fundingReservedActors")
+        )
+    ):
+        allocation["status"] = "context_mismatch"
+        return
+    remaining = context["goldRemaining"]
+    allocation["evaluated"] = True
+    allocation["status"] = "evaluated"
+    allocation["committedGold"] = turn.gold - remaining
+    allocation["cashAfterCommitments"] = remaining
+    cost = result["procurement"]["missingCost"]
+    if cost is not None:
+        covers = remaining >= cost
+        allocation["cashAfterCommitmentsCoversMissingCost"] = covers
+        if not covers and turn.gold >= cost:
+            allocation["reasons"].append("cash_committed_elsewhere")
+    pioneer_id = result["pioneerId"]
+    if pioneer_id is not None:
+        pioneer = int(pioneer_id)
+        acted = pioneer in context["acceptedActors"]
+        reserved = (
+            pioneer in context["taskReservedActors"]
+            or pioneer in context["fundingReservedActors"]
+        )
+        allocation["pioneerHasAcceptedAction"] = acted
+        allocation["pioneerPriorityReserved"] = reserved
+        if acted:
+            allocation["reasons"].append("actor_has_action")
+        if reserved:
+            allocation["reasons"].append("actor_priority_reserved")
+
+
+def _field_audit(field, *, session_index: int, is_window: bool) -> dict:
+    audit = {
+        "status": "missing_field",
+        "citationCount": 0,
+        "distinctSourceCount": "unknown",
+        "duplicateSourceCount": "unknown",
+        "reasons": [],
+    }
+    if is_window:
+        audit["timeAnchorStatus"] = "anchor_unknown"
+    if field is None:
+        return audit
+    audit["citationCount"] = len(field.citations)
+    fingerprints = field.source_fingerprints
+    if fingerprints is not None and len(fingerprints) == len(field.citations):
+        distinct = len(set(fingerprints))
+        audit["distinctSourceCount"] = distinct
+        audit["duplicateSourceCount"] = len(fingerprints) - distinct
+        if len(fingerprints) > distinct:
+            audit["reasons"].append("duplicate_source")
+    else:
+        audit["reasons"].append("source_metadata_unknown")
+    if field.source_truncated:
+        audit["reasons"].append("source_truncated")
+    if any(source != session_index for source in field.source_sessions):
+        audit["reasons"].append("source_session_mismatch")
+    derivation = field.derivation
+    if derivation is None:
+        audit["status"] = "audit_missing"
+    else:
+        audit["status"] = {
+            "direct": "direct_unverified",
+            "derived": "derived_unverified",
+            "unknown": "unknown",
+        }[derivation.kind]
+        if derivation.unresolved:
+            audit["reasons"].append("unresolved_present")
+        if is_window and derivation.time_basis == "absolute_rounds":
+            audit["timeAnchorStatus"] = "absolute_anchor_unverified"
+    return audit
 
 
 def _assess_route(
@@ -222,9 +353,14 @@ def _assess_route(
     route = result["route"]
     if not turn.is_day:
         route["status"] = "night"
+        if result["procurement"]["missingItemCount"] not in (None, 0):
+            result["procurement"]["route"]["status"] = "night"
         return
     if result["procurement"]["missingItemCount"] not in (None, 0):
         route["status"] = "procurement_route_not_evaluated"
+        _assess_shopping_route(
+            turn, conditions, result, assignments, clock, budget,
+        )
         return
     if any(reason != "window_future" for reason in result["reasons"]):
         route["status"] = "prerequisite_blocked"
@@ -356,6 +492,217 @@ def _assess_route(
     else:
         route["status"] = "unreachable"
         route["returnWithMargin"] = False if post is not None else "unknown"
+
+
+def _assess_shopping_route(
+    turn: Turn,
+    conditions: TreasureConditions,
+    result: dict,
+    assignments: dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]] | None,
+    clock: Callable[[], float],
+    budget: dict,
+) -> None:
+    procurement = result["procurement"]
+    route = procurement["route"]
+    if any(
+        reason not in ("missing_items", "window_future", "item_unavailable_or_unknown")
+        for reason in result["reasons"]
+    ):
+        route["status"] = "prerequisite_blocked"
+        return
+    if (
+        conditions.location is None or conditions.window is None
+        or conditions.items is None or result["pioneerId"] is None
+    ):
+        route["status"] = "prerequisite_blocked"
+        return
+    if not procurement["shopAvailable"]:
+        route["status"] = "price_missing"
+        return
+    if procurement["backpackFitsMissing"] is not True:
+        route["status"] = (
+            "capacity_insufficient"
+            if procurement["backpackFitsMissing"] is False
+            else "capacity_unknown"
+        )
+        return
+    if not procurement["currentCashCoversMissingCost"]:
+        route["status"] = "cash_insufficient"
+        return
+    shops = turn.zones_of("weaponShop")
+    if not shops:
+        route["status"] = "shop_missing"
+        return
+    if budget["evaluated"] >= MAX_TREASURE_ROUTE_CANDIDATES:
+        route["status"] = "candidate_limit"
+        return
+    budget["evaluated"] += 1
+    if clock() >= budget["deadline"]:
+        route["status"] = "deadline"
+        return
+    pioneer = turn.unit(int(result["pioneerId"]))
+    if pioneer is None:
+        route["status"] = "prerequisite_blocked"
+        return
+    procurement["routeEvaluated"] = True
+    post = _assigned_post(turn, pioneer, assignments)
+    location = Pos(**conditions.location.value)
+    window = conditions.window.value
+    day_end = turn.round_no + turn.rounds_until_night - 1
+    blocked = turn.blocked(pioneer)
+    purchase_rounds = len(result["missingItems"])
+    purchased = tuple(
+        item for item, count in result["missingItems"].items()
+        for _ in range(count)
+    )
+    first_failure = None
+    for shop in sorted(shops, key=lambda pos: (distance(pioneer.pos, pos), pos.x, pos.y)):
+        for shop_stand in _legal_stands(turn, shop, blocked, pioneer.pos):
+            shop_status, shop_moves = _shopping_path(
+                turn, pioneer, shop_stand, clock, budget, route,
+            )
+            if shop_status in ("deadline", "expansion_limit"):
+                route["status"] = shop_status
+                return
+            if shop_moves is None:
+                continue
+            buy_end = turn.round_no + shop_moves + purchase_rounds - 1
+            if buy_end > day_end:
+                attempt = {
+                    "status": "candidate_window_missed",
+                    "shopMoveRounds": shop_moves,
+                    "purchaseRounds": purchase_rounds,
+                    "altarMoveRounds": None,
+                    "waitRounds": None,
+                    "earliestActionRound": None,
+                    "returnMoveRounds": None,
+                    "returnWithMargin": False if post is not None else "unknown",
+                }
+                if first_failure is None:
+                    first_failure = attempt
+                continue
+            at_shop = replace(
+                pioneer, pos=shop_stand,
+                backpack=pioneer.backpack + purchased,
+            )
+            shop_turn = _projected_turn(turn, at_shop)
+            for altar_stand in _legal_stands(
+                shop_turn, location, shop_turn.blocked(at_shop), shop_stand,
+            ):
+                altar_status, altar_moves = _shopping_path(
+                    shop_turn, at_shop, altar_stand, clock, budget, route,
+                )
+                if altar_status in ("deadline", "expansion_limit"):
+                    route["status"] = altar_status
+                    return
+                if altar_moves is None:
+                    continue
+                action_round = max(
+                    turn.round_no + shop_moves + purchase_rounds + altar_moves,
+                    window["startRound"],
+                )
+                attempt = {
+                    "shopMoveRounds": shop_moves,
+                    "purchaseRounds": purchase_rounds,
+                    "altarMoveRounds": altar_moves,
+                    "waitRounds": action_round - turn.round_no - shop_moves
+                    - purchase_rounds - altar_moves,
+                    "earliestActionRound": action_round,
+                    "returnMoveRounds": None,
+                    "returnWithMargin": "unknown",
+                }
+                if action_round > window["endRound"] or action_round > day_end:
+                    attempt.update(
+                        status="candidate_window_missed",
+                        returnWithMargin=False if post is not None else "unknown",
+                    )
+                    if first_failure is None:
+                        first_failure = attempt
+                    continue
+                if post is None:
+                    route.update(attempt, status="return_post_unknown")
+                    return
+                at_altar = replace(at_shop, pos=altar_stand)
+                altar_turn = _projected_turn(turn, at_altar)
+                home_status, home_moves = _shopping_path(
+                    altar_turn, at_altar, post, clock, budget, route,
+                )
+                if home_status in ("deadline", "expansion_limit"):
+                    route["status"] = home_status
+                    return
+                if home_moves is None:
+                    attempt.update(
+                        status="candidate_return_unreachable",
+                        returnWithMargin=False,
+                    )
+                    if first_failure is None:
+                        first_failure = attempt
+                    continue
+                attempt["returnMoveRounds"] = home_moves
+                timely = (
+                    action_round - turn.round_no + 1 + home_moves
+                    + DAY_WORK_RETURN_MARGIN <= turn.rounds_until_night
+                )
+                attempt["returnWithMargin"] = timely
+                attempt["status"] = (
+                    "feasible" if timely else "candidate_return_too_late"
+                )
+                if timely:
+                    route.update(attempt)
+                    procurement["returnWindowEvaluated"] = True
+                    return
+                if first_failure is None:
+                    first_failure = attempt
+    if first_failure is not None:
+        route.update(first_failure)
+        procurement["returnWindowEvaluated"] = (
+            first_failure["returnMoveRounds"] is not None
+        )
+    else:
+        route["status"] = "unreachable"
+        route["returnWithMargin"] = False if post is not None else "unknown"
+
+
+def _legal_stands(
+    turn: Turn, target: Pos, blocked: frozenset[Pos], origin: Pos,
+) -> tuple[Pos, ...]:
+    stands = (
+        Pos(target.x + dx, target.y + dy)
+        for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+        if dx or dy
+    )
+    return tuple(sorted(
+        (stand for stand in stands if turn.land(stand) and stand not in blocked),
+        key=lambda stand: (distance(origin, stand), stand.x, stand.y),
+    ))
+
+
+def _projected_turn(turn: Turn, projected: Unit) -> Turn:
+    return replace(
+        turn,
+        ours=tuple(
+            projected if role.unit_id == projected.unit_id else role
+            for role in turn.ours
+        ),
+    )
+
+
+def _shopping_path(
+    turn: Turn, pioneer: Unit, goal: Pos,
+    clock: Callable[[], float], budget: dict, route: dict,
+) -> tuple[str, int | None]:
+    if clock() >= budget["deadline"]:
+        return "deadline", None
+    if budget["remaining"] <= 0:
+        return "expansion_limit", None
+    path = next_step(
+        turn, pioneer, goal, clock=clock,
+        deadline=budget["deadline"],
+        max_expansions=budget["remaining"],
+    )
+    budget["remaining"] -= path.expansions
+    route["expansions"] += path.expansions
+    return path.status, path.cost
 
 
 def _assigned_post(

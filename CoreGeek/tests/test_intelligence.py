@@ -7,6 +7,7 @@ from agent import intelligence
 from agent.brain import DecisionEngine
 from agent.protocol import Turn
 from agent.state import MAX_NEWS_DAY_RECORDS, StateStore, request_fingerprint
+from agent.treasure import evaluate_treasure_candidates
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
@@ -93,6 +94,132 @@ def task_payload(round_no=1, *, phase=""):
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_derivation_audit_deduplicates_source_text_without_verifying_claims(self):
+        store = StateStore()
+        first = payload(team_id="intelligence-audit-same-text")
+        first["worldNews"]["folkLegends"] = first["worldNews"]["officialNews"]
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        self.assertEqual(len(request.sources), 2)
+        left, right = request.sources
+        self.assertNotEqual(left.source_id, right.source_id)
+        self.assertEqual(left.fingerprint, right.fingerprint)
+        location = cited(left, {"x": 4, "y": 5})
+        location["citations"].append({
+            "sourceId": right.source_id,
+            "excerpt": "western market may close",
+        })
+        location["derivation"] = {
+            "kind": "direct", "explanation": "The model claims a direct mention.",
+            "unresolved": [], "timeBasis": "not_applicable",
+        }
+        window = cited(left, {"startRound": 2, "endRound": 20})
+        window["derivation"] = {
+            "kind": "derived", "explanation": "Tomorrow is ambiguous.",
+            "unresolved": ["Publication time is unknown."],
+            "timeBasis": "first_observed",
+        }
+        items = cited(left, ["PrivateRelic"])
+        items["derivation"] = {
+            "kind": "unknown", "explanation": "The recipe is not established.",
+            "unresolved": [], "timeBasis": "not_applicable",
+        }
+        parsed = intelligence.parse_news_response(
+            request, valid_response(request, candidates=[treasure_candidate(
+                request,
+                conditions={"location": location, "window": window, "items": items},
+            )]),
+        )
+        self.assertIsNone(parsed.rejection_reason)
+
+        result = evaluate_treasure_candidates(
+            turn, parsed.candidates, session_index=1,
+        )[0]
+        audit = result["evidenceAudit"]
+        self.assertEqual(audit["location"]["status"], "direct_unverified")
+        self.assertEqual(audit["location"]["citationCount"], 2)
+        self.assertEqual(audit["location"]["distinctSourceCount"], 1)
+        self.assertEqual(audit["location"]["duplicateSourceCount"], 1)
+        self.assertIn("duplicate_source", audit["location"]["reasons"])
+        self.assertEqual(audit["window"]["status"], "derived_unverified")
+        self.assertEqual(audit["window"]["timeAnchorStatus"], "anchor_unknown")
+        self.assertIn("unresolved_present", audit["window"]["reasons"])
+        self.assertEqual(audit["items"]["status"], "unknown")
+        self.assertFalse(result["actionEnabled"])
+        self.assertNotIn("PrivateRelic", json.dumps(audit))
+        self.assertNotIn("Tomorrow", json.dumps(audit))
+
+    def test_distinct_news_texts_count_as_sources_not_independent_proof(self):
+        store = StateStore()
+        first = payload(team_id="intelligence-audit-distinct-text")
+        first["worldNews"]["folkLegends"] = "A different market clue."
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        left, right = request.sources
+        field = {
+            "value": {"x": 4, "y": 5},
+            "citations": [{
+                "sourceId": source.source_id,
+                "excerpt": source.text,
+            } for source in (left, right)],
+        }
+        field["derivation"] = {
+            "kind": "direct", "explanation": "The model claims both clues agree.",
+            "unresolved": [], "timeBasis": "not_applicable",
+        }
+        claim = treasure_candidate(request, conditions={
+            "location": field, "window": None, "items": None,
+        })
+        claim["citations"] = [{
+            "sourceId": left.source_id,
+            "excerpt": left.text,
+        }]
+        parsed = intelligence.parse_news_response(
+            request, valid_response(request, candidates=[claim]),
+        )
+        self.assertIsNone(parsed.rejection_reason)
+        audit = evaluate_treasure_candidates(
+            turn, parsed.candidates, session_index=1,
+        )[0]["evidenceAudit"]["location"]
+        self.assertEqual(audit["citationCount"], 2)
+        self.assertEqual(audit["distinctSourceCount"], 2)
+        self.assertEqual(audit["duplicateSourceCount"], 0)
+        self.assertEqual(audit["status"], "direct_unverified")
+
+
+    def test_treasure_derivation_is_parsed_with_actual_source_fingerprints(self):
+        store = StateStore()
+        first = payload(team_id="intelligence-derivation")
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        location = cited(source, {"x": 4, "y": 5})
+        location["derivation"] = {
+            "kind": "derived",
+            "explanation": "An unverified inference from the cited clue.",
+            "unresolved": ["The clue may refer to another market."],
+            "timeBasis": "not_applicable",
+        }
+
+        parsed = intelligence.parse_news_response(
+            request,
+            valid_response(request, candidates=[treasure_candidate(
+                request,
+                conditions={"location": location, "window": None, "items": None},
+            )]),
+        )
+
+        self.assertIsNone(parsed.rejection_reason)
+        field = parsed.candidates[0].treasure_conditions.location
+        self.assertEqual(field.derivation.kind, "derived")
+        self.assertEqual(field.derivation.unresolved, (
+            "The clue may refer to another market.",
+        ))
+        self.assertEqual(field.source_fingerprints, (source.fingerprint,))
+
     def test_treasure_conditions_are_strictly_parsed_with_field_evidence(self):
         # Break caught: treasure details are accepted as prose without field citations.
         store = StateStore()
@@ -148,6 +275,11 @@ class IntelligenceTests(unittest.TestCase):
         self.assertIsNone(parsed.candidates[1].treasure_conditions.location)
         self.assertIsNone(parsed.candidates[1].treasure_conditions.window)
         self.assertEqual(parsed.candidates[1].treasure_conditions.items.value, ())
+        self.assertIsNone(parsed.candidates[1].treasure_conditions.items.derivation)
+        self.assertEqual(
+            parsed.candidates[1].treasure_conditions.items.source_fingerprints,
+            (source.fingerprint,),
+        )
 
     def test_treasure_conditions_reject_malformed_values_and_field_citations(self):
         # Break caught: bools, invented fields, fake quotes, or unsafe recipes survive.
@@ -202,6 +334,57 @@ class IntelligenceTests(unittest.TestCase):
 
         self.assertEqual(malformed, ["invalid_candidate"] * len(malformed))
 
+    def test_treasure_derivation_rejects_bad_shape_types_and_time_basis(self):
+        store = StateStore()
+        first = payload(team_id="intelligence-derivation-invalid")
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        base = {
+            "kind": "derived", "explanation": "A bounded summary.",
+            "unresolved": [], "timeBasis": "not_applicable",
+        }
+        invalid = (
+            None,
+            {**base, "kind": True},
+            {**base, "kind": "verified"},
+            {**base, "explanation": ""},
+            {**base, "explanation": "x" * 513},
+            {**base, "unresolved": "unknown"},
+            {**base, "unresolved": ["x"] * 9},
+            {**base, "unresolved": [""]},
+            {**base, "timeBasis": "first_observed"},
+            {**base, "confidence": 1},
+            {key: value for key, value in base.items() if key != "explanation"},
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                field = cited(source, {"x": 4, "y": 5})
+                field["derivation"] = value
+                response = valid_response(request, candidates=[treasure_candidate(
+                    request, conditions={
+                        "location": field, "window": None, "items": None,
+                    },
+                )])
+                self.assertEqual(
+                    intelligence.parse_news_response(request, response).rejection_reason,
+                    "invalid_candidate",
+                )
+        for basis in ("not_applicable", "verified", 2, True):
+            with self.subTest(window_basis=basis):
+                field = cited(source, {"startRound": 2, "endRound": 20})
+                field["derivation"] = {**base, "timeBasis": basis}
+                response = valid_response(request, candidates=[treasure_candidate(
+                    request, conditions={
+                        "location": None, "window": field, "items": None,
+                    },
+                )])
+                self.assertEqual(
+                    intelligence.parse_news_response(request, response).rejection_reason,
+                    "invalid_candidate",
+                )
+
     def test_treasure_detail_retains_response_bound_field_evidence(self):
         # Break caught: accepted field evidence loses its request/session snapshot.
         engine = DecisionEngine()
@@ -214,10 +397,16 @@ class IntelligenceTests(unittest.TestCase):
         source = pending.sources[0]
         returned = copy.deepcopy(first)
         returned["roundNo"] = 2
+        location_field = cited(source, {"x": 4, "y": 4})
+        location_field["derivation"] = {
+            "kind": "derived", "explanation": "A short unverified inference.",
+            "unresolved": ["The market may refer to another place."],
+            "timeBasis": "not_applicable",
+        }
         returned["llmResp"] = valid_response(
             pending,
             candidates=[treasure_candidate(pending, conditions={
-                "location": cited(source, {"x": 4, "y": 4}),
+                "location": location_field,
                 "window": cited(source, {"startRound": 2, "endRound": 20}),
                 "items": cited(source, ["StarSand"]),
             })],
@@ -234,6 +423,12 @@ class IntelligenceTests(unittest.TestCase):
             "sourceId": source.source_id,
             "excerpt": "western market may close",
         }])
+        self.assertEqual(location["derivation"], {
+            "kind": "derived",
+            "explanation": "A short unverified inference.",
+            "unresolved": ["The market may refer to another place."],
+            "timeBasis": "not_applicable",
+        })
         self.assertEqual(detail["status"], "pending_validation")
 
     def test_top_level_truncated_citation_blocks_complete_field_hypothesis(self):

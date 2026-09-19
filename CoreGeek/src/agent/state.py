@@ -861,7 +861,7 @@ class StateStore:
             value = list(value)
         elif isinstance(value, dict):
             value = dict(value)
-        return {
+        detail = {
             "value": value,
             "citations": [{
                 "sourceId": citation.source_id,
@@ -870,6 +870,14 @@ class StateStore:
             "sourceSessions": list(field.source_sessions),
             "sourceTruncated": field.source_truncated,
         }
+        if field.derivation is not None:
+            detail["derivation"] = {
+                "kind": field.derivation.kind,
+                "explanation": field.derivation.explanation,
+                "unresolved": list(field.derivation.unresolved),
+                "timeBasis": field.derivation.time_basis,
+            }
+        return detail
 
     def _apply_tool_result(
         self,
