@@ -231,7 +231,7 @@ def _continue_active_task(
             envelope = parse_llm_envelope(result)
             if envelope is None:
                 task.last_envelope_rejection = _llm_envelope_rejection(result)
-                _remember(task, "Rejected LLM response", result)
+                _remember_tool_result(task, "Rejected LLM response", result)
                 if remaining == 0:
                     task.solver_stopped_reason = "deadline_without_answer"
                     return _leave_task(turn, task, owner)
@@ -642,7 +642,7 @@ def _remember_evidence(task: TaskMemory, label: str, content: str) -> None:
     if len(task.solver_evidence) < MAX_SOLVER_EVIDENCE_EVENTS:
         task.solver_evidence.append(event)
     else:
-        # Preserve the first two verified context anchors (typically bounded
+        # Preserve the first two process-complete observations (typically
         # discovery and its read) while refreshing the current evidence slot.
         task.solver_evidence[-1] = event
 
@@ -858,6 +858,12 @@ def _bounded(value: str, limit: int) -> str:
 
 
 def _tool_result_context(status: str, result: str) -> str:
+    if len(status) + len("\nPlatform result:\n") + len(result) > MAX_TOOL_CONTEXT_CHARS:
+        status += (
+            " The bounded view omits part of the middle; absence from this "
+            "view is not evidence of absence. If another command is allowed, "
+            "inspect the relevant part with a bounded query."
+        )
     return _bounded_middle(
         f"{status}\nPlatform result:\n{result}",
         MAX_TOOL_CONTEXT_CHARS,
@@ -867,9 +873,18 @@ def _tool_result_context(status: str, result: str) -> str:
 def _bounded_middle(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
-    marker = "\n[TRUNCATED MIDDLE]\n"
-    if limit <= len(marker):
-        return marker[:limit]
+    omitted = len(value) - limit
+    while True:
+        marker = (
+            "\n[TRUNCATED MIDDLE]\n"
+            f"[omitted chars: {omitted} of {len(value)}]\n"
+        )
+        if limit <= len(marker):
+            return marker[:limit]
+        updated = len(value) - (limit - len(marker))
+        if updated == omitted:
+            break
+        omitted = updated
     content_budget = limit - len(marker)
     head_budget = (content_budget * 3) // 5
     tail_budget = content_budget - head_budget

@@ -190,6 +190,10 @@ Python版本：
 
 修复后选能复现问题的对手/条件，并保留基本启动与移动回归。全部对应验收条件有证据通过才关闭原issue；任一未通过继续open。拉取或推送成功、版本号变化、一次对战获胜都不是关闭依据。无法确定如何取证时反馈缺口，外网主Agent决定下一步。
 
+### T60本地候选取证说明（未部署）
+
+`nightwatch-s2-task-recovery-r1`目前仅在隔离开发树；固定issue #12仍指向r6，不能在r6日志中查找以下新增字段。若后续明确送测本候选，`decision.taskToolInputs`与`task_detail.acceptedToolInputs`只记录已由待处理请求接纳的`kind`、发出/收到回合和原始字符数；`inputAssociation`相应标`accepted_current_task`。未接纳、迟到或更替任务的结果仍为`unknown_previous_request`，不得用相邻日志强行归因。长结果提示中的`[TRUNCATED MIDDLE]`及`omitted chars`说明模型所见中段缺失；需要在剩余工具额度内针对性重查，不能从“未见”推断不存在。原始任务内容与凭据仍只留内网，issue仅传脱敏元数据、命令类别及裁判反馈。
+
 
 ## Issue归档迁移约定（2026-09-15，用户授权）
 

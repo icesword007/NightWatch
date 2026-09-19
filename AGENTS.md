@@ -449,3 +449,17 @@ T58本地验收通过，可隔离提交，构建nightwatch-s2-economy-perf-r1。
 ## R218 r6统一送测
 
 用户授权全部已验收T57–T59合入main，主会话快进bef9a5c并更新集成构建nightwatch-s2-integrated-r6、验证后提交推送。唯一执行入口固定issue #12，仓库s2-integrated-r6提示同步；停止追补r4，最多challenger再defender两场，完整SHA/包hash/部署与首帧buildId必须一致，错版停止。历史不合并推送限制由本条覆盖；旧树与缓存保留，不自动关闭issue或开发其他策略。
+
+
+## R219 T60任务失败恢复与证据联合批次
+
+本批唯一源码树仍为`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-day-work`、分支`codex/s2-day-work`，基准r6 `8f1bba16953c86f75f4b2401dfd73e51bfda0826`；`main`继续内网送测，其他树只读。按外层`design/【codex】s2-task-recovery-evidence-plan.md`实施工程失败恢复、答案依据/提交和API有效重试，构建`nightwatch-s2-task-recovery-r1`。
+
+先追踪平台结果至下一命令/答案/提交的完整数据流并写受控红测，只修复有证据的局部信息损失、过期混用、工具状态误判或无效重试；需要时加有界脱敏元数据日志。不自动改写shell或硬编码题目、凭据、端点、答案；不扩大任务期限/工具额度，不改SDK/经济/防守。开发不commit/merge/push/reset/切分支/删除/新增依赖目录/派生任务，不修改#12或开局。交付R220并更新共享todo/review后停止，待主会话R221独立验收。
+
+
+## R221 T60本地独立验收
+
+原Sol回合01a0b9ba-c6b1-7123-b53f-6b7c217e890c已completed/idle，cursor154。主会话独立546/546含16HTTP通过22.207秒，diff/cached diff/bash-n通过；209组Unicode/小limit/长文本截断长度与省略数核验通过。长缺kind信封→一次格式纠正→合法尾答案原样提交及重放一致；工具归属更替/迟到/重放只读复验无阻断，新增元数据无正文。可隔离提交，不自动合main或推送。
+
+本批修复尾部纠正信息丢失，长输出中段仍有界省略、只增明确未知与重查提示。CRLF/API/占位答案的原局语义失败未证明修复；连续测试为合成工具/模型反馈，不是执行真实check或真实网络API，更不构成程序强制完成依据门槛。r6主干保持，#12已安排现有日志定位，新字段尚未部署。

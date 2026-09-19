@@ -771,6 +771,10 @@ class DecisionEngine:
         trace = {
             "roundNo": turn.round_no,
             "taskInstanceId": task_instance_id,
+            "taskToolInputs": (
+                copy.deepcopy(task.tool_inputs_this_round)
+                if task is not None else []
+            ),
             "taskRemainingRounds": remaining,
             "solverState": solver_state,
             "solverReason": solver_reason,
