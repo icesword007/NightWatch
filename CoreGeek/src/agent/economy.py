@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from .actions import ActionProposal, PlannedAction
+from .defense import DAY_WORK_RETURN_MARGIN
 from .fortification import (
     MAX_WALL_TARGETS,
     fortification_stone_target,
@@ -111,12 +112,13 @@ class JointFundingRoute:
 @dataclass(slots=True)
 class RouteSearchContext:
     routes: dict[
-        tuple[int, Pos, Pos, int],
+        tuple[int, int, Pos, Pos, int],
         tuple[tuple[Pos, int], ...],
     ]
-    paths: dict[tuple[int, Pos, Pos, int], PathResult] = field(
+    paths: dict[tuple[int, int, Pos, Pos, int], PathResult] = field(
         default_factory=dict,
     )
+    turns: dict[int, Turn] = field(default_factory=dict)
     path_searches: int = 0
     cache_hits: int = 0
     path_computations: int = 0
@@ -125,6 +127,7 @@ class RouteSearchContext:
     truncated_reason: str | None = None
     joint_status: str | None = None
     joint_blocker: str | None = None
+    tower_status: str | None = None
     investment_targets: set[int] = field(default_factory=set)
     investment_owners: dict[int, int] = field(default_factory=dict)
     wall_upgrade_targets: tuple[Pos, ...] = ()
@@ -206,6 +209,7 @@ def propose_economy(
                 "pathExpansions": context.path_expansions,
                 "truncatedReason": context.truncated_reason,
                 "jointStatus": context.joint_status,
+                "towerPriority": context.tower_status,
                 "heldInvestment": (
                     held.proposal.command.get("action")
                     if held is not None
@@ -340,36 +344,238 @@ def _propose_economy(
             (worker.unit_id for worker in turn.workers()), None,
         )
 
+    urgent_purchase: PlannedAction | None = None
+    urgent_walls = (
+        tuple(wall for wall in turn.walls() if _wall_repair_urgent(turn, wall))
+        if turn.is_day and len(turn.weapons()) < MAX_WEAPONS
+        else ()
+    )
+    urgent_held: dict[int, PlannedAction] = {}
+    covered_urgent_ids: set[int] = set()
+    for wall in urgent_walls:
+        previous_owner = (
+            context.investment_owners.get(wall.unit_id)
+            if context is not None else None
+        )
+        if context is not None:
+            context.investment_owners.pop(wall.unit_id, None)
+            context.investment_targets.discard(wall.unit_id)
+        held_options: list[tuple[tuple[int, int, int, int], PlannedAction]] = []
+        for worker in sorted(turn.workers(), key=lambda entry: entry.unit_id):
+            if (
+                worker.unit_id in reserved_role_ids
+                or worker.unit_id in urgent_held
+                or "WallFixer" not in worker.backpack
+                or "Medicine" in worker.backpack
+                and worker.health < _max_role_health(worker)
+            ):
+                continue
+            held = _maintenance_action(
+                turn, worker, clock, deadline, max_expansions,
+                preferred_use_target_id=wall.unit_id,
+            )
+            if (
+                _is_held_investment_action(held)
+                and _plan_use_target_id(held) == wall.unit_id
+            ):
+                held_options.append((
+                    (
+                        int(held.proposal.command.get("action") != "use"),
+                        int(worker.unit_id != previous_owner),
+                        held.estimated_rounds or 0,
+                        worker.unit_id,
+                    ),
+                    held,
+                ))
+        if held_options:
+            held = min(held_options, key=lambda option: option[0])[1]
+            role_id = held.proposal.actor_id
+            urgent_held[role_id] = held
+            covered_urgent_ids.add(wall.unit_id)
+            if context is not None:
+                context.investment_owners[wall.unit_id] = role_id
+                context.investment_targets.add(wall.unit_id)
+    if (
+        turn.is_day
+        and len(turn.weapons()) < MAX_WEAPONS
+        and any(wall.unit_id not in covered_urgent_ids for wall in urgent_walls)
+        and "WallFixer" in turn.weapon_prices
+    ):
+        for worker in sorted(turn.workers(), key=lambda entry: entry.unit_id):
+            if (
+                worker.unit_id in reserved_role_ids
+                or "WallFixer" in worker.backpack
+                or "Medicine" in worker.backpack
+                and worker.health < _max_role_health(worker)
+            ):
+                continue
+            uncovered = next((
+                wall for wall in urgent_walls
+                if wall.unit_id not in covered_urgent_ids
+            ), None)
+            if uncovered is None:
+                break
+            urgent_purchase = _funding_action(
+                turn, worker, "WallFixer",
+                turn.round_no + turn.rounds_until_night - 1,
+                clock, deadline, max_expansions,
+                preferred_use_target_id=uncovered.unit_id,
+            )
+            if urgent_purchase is not None:
+                claimed_gold += min(turn.gold, turn.weapon_prices["WallFixer"])
+                break
+    tower_candidates: dict[int, PlannedAction] = {}
+    urgent_tower_workers: set[int] = set()
+    if turn.is_day and len(turn.weapons()) < MAX_WEAPONS:
+        tower_positions = (
+            state.layout_tower_targets or weapon_build_positions(turn)
+        )
+        tower_workers = sorted(turn.workers(), key=lambda worker: (
+            not (
+                (plan := state.plans.get(worker.unit_id)) is not None
+                and plan.reason.startswith(("build:rocket", "fund:build:rocket"))
+            ),
+            need_wall and worker.unit_id == fortification_builder_id,
+            min(
+                (distance(worker.pos, pos) for pos in tower_positions),
+                default=10**9,
+            ),
+            worker.unit_id,
+        ))
+        for worker in tower_workers:
+            if (
+                clock() >= deadline
+                or worker.unit_id in reserved_role_ids
+                or worker.unit_id in urgent_held
+                or urgent_purchase is not None
+                and worker.unit_id == urgent_purchase.proposal.actor_id
+            ):
+                continue
+            plan = state.plans.get(worker.unit_id)
+            maintenance = _maintenance_action(
+                turn, worker, clock, deadline, max_expansions,
+                preferred_use_target_id=_plan_use_target_id(plan),
+            )
+            if _urgent_maintenance_candidate(turn, maintenance):
+                urgent_tower_workers.add(worker.unit_id)
+                continue
+            candidate = None
+            if plan is not None and plan.reason.startswith((
+                "build:rocket", "fund:build:rocket",
+            )):
+                candidate = _continue_plan(
+                    turn, state, worker, failed_builds, failed_mines,
+                    clock, deadline, max_expansions,
+                )
+            if candidate is None:
+                candidate = _tower_action(
+                    turn, state, worker,
+                    failed_builds | unconfirmed_builds | claimed_build_targets,
+                    claimed_tower_types, turn.gold - claimed_gold,
+                    clock, deadline, max_expansions,
+                )
+            if candidate is None:
+                continue
+            tower_candidates[worker.unit_id] = candidate
+            if candidate.plan_target is not None:
+                claimed_build_targets.add(candidate.plan_target)
+            claimed_tower_types["rocket"] += 1
+            claimed_gold += 25
+    if context is not None and tower_candidates:
+        paused_owners = set(tower_candidates) | {
+            role_id for role_id, plan in state.plans.items()
+            if plan.reason.startswith(("fund:", "batch:"))
+            and not plan.reason.startswith("fund:build:")
+        }
+        context.investment_owners = {}
+        for target_id, options in contenders.items():
+            available = tuple(
+                option for option in options
+                if option[1] not in paused_owners
+            )
+            if available:
+                context.investment_owners[target_id] = min(available)[1]
+        context.investment_targets = set(context.investment_owners)
+        for role_id, held in urgent_held.items():
+            target_id = _plan_use_target_id(held)
+            if target_id is not None:
+                context.investment_owners[target_id] = role_id
+                context.investment_targets.add(target_id)
+    if context is not None:
+        if tower_candidates:
+            context.tower_status = "committed"
+        elif len(turn.weapons()) >= MAX_WEAPONS:
+            context.tower_status = "complete"
+        elif not turn.is_day:
+            context.tower_status = "night"
+        elif turn.station() is None:
+            context.tower_status = "station_missing"
+        elif urgent_purchase is not None:
+            context.tower_status = "emergency_maintenance"
+        elif not any(
+            worker.unit_id not in reserved_role_ids for worker in turn.workers()
+        ):
+            context.tower_status = "worker_unavailable"
+        elif all(
+            worker.unit_id in reserved_role_ids
+            or worker.unit_id in urgent_tower_workers
+            for worker in turn.workers()
+        ):
+            context.tower_status = "emergency_maintenance"
+        elif context.truncated_reason is not None or clock() >= deadline:
+            context.tower_status = "planning_budget_unknown"
+        elif not any(
+            turn.gold + sum(
+                turn.vendor_prices.get(item, 0)
+                for item in worker.backpack if item in MINERALS
+            ) >= 25
+            for worker in turn.workers()
+            if worker.unit_id not in reserved_role_ids
+        ):
+            context.tower_status = "funds_insufficient"
+        else:
+            context.tower_status = "no_complete_route_or_window"
+
     for role in sorted(turn.controllable(), key=lambda entry: entry.unit_id):
         if clock() >= deadline:
             break
         plan = state.plans.get(role.unit_id)
         joint_plan = _joint_plan(plan.reason) if plan is not None else None
-        candidate = _maintenance_action(
-            turn, role, clock, deadline, max_expansions,
-            preferred_use_target_id=_plan_use_target_id(plan),
-        )
-        if plan is not None and plan.reason.startswith(("fund:", "batch:")):
-            self_care = (
-                candidate is not None
-                and candidate.proposal.command.get("action") == "use"
-                and candidate.proposal.command.get("name") == "Medicine"
-            )
-            immediate_investment = (
-                joint_plan is None
-                and _is_immediate_held_investment_action(candidate)
-            )
-            if not self_care and not immediate_investment:
-                candidate = None
+        candidate = urgent_held.get(role.unit_id)
         if (
-            role.unit_id in reserved_role_ids
-            and candidate is not None
-            and not (
-                candidate.proposal.command.get("action") == "use"
-                and candidate.proposal.command.get("name") == "Medicine"
-            )
+            candidate is None
+            and urgent_purchase is not None
+            and role.unit_id == urgent_purchase.proposal.actor_id
         ):
-            candidate = None
+            candidate = urgent_purchase
+        if candidate is None:
+            candidate = tower_candidates.get(role.unit_id)
+        if candidate is None:
+            candidate = _maintenance_action(
+                turn, role, clock, deadline, max_expansions,
+                preferred_use_target_id=_plan_use_target_id(plan),
+            )
+            if plan is not None and plan.reason.startswith(("fund:", "batch:")):
+                self_care = (
+                    candidate is not None
+                    and candidate.proposal.command.get("action") == "use"
+                    and candidate.proposal.command.get("name") == "Medicine"
+                )
+                immediate_investment = (
+                    joint_plan is None
+                    and _is_immediate_held_investment_action(candidate)
+                )
+                if not self_care and not immediate_investment:
+                    candidate = None
+            if (
+                role.unit_id in reserved_role_ids
+                and candidate is not None
+                and not (
+                    candidate.proposal.command.get("action") == "use"
+                    and candidate.proposal.command.get("name") == "Medicine"
+                )
+            ):
+                candidate = None
         if candidate is not None:
             candidates.append(candidate)
             _reserve_investment_target(candidate, _ROUTE_SEARCH_CONTEXT.get())
@@ -478,10 +684,16 @@ def _propose_economy(
             if candidate is None:
                 state.plans.pop(worker.unit_id, None)
         elif candidate is None:
-            candidate = _continue_plan(
-                turn, state, worker, failed_builds, failed_mines,
-                clock, deadline, max_expansions,
-            )
+            if not (
+                tower_candidates
+                and current_plan is not None
+                and current_plan.reason.startswith(("fund:", "batch:"))
+                and not current_plan.reason.startswith("fund:build:")
+            ):
+                candidate = _continue_plan(
+                    turn, state, worker, failed_builds, failed_mines,
+                    clock, deadline, max_expansions,
+                )
             if (
                 candidate is None
                 and current_plan is not None
@@ -719,6 +931,26 @@ def _is_immediate_held_investment_action(
     )
 
 
+def _urgent_maintenance_candidate(
+    turn: Turn,
+    candidate: PlannedAction | None,
+) -> bool:
+    if candidate is None:
+        return False
+    command = candidate.proposal.command
+    if command.get("action") == "use" and command.get("name") == "Medicine":
+        return True
+    if not _is_held_investment_action(candidate):
+        return False
+    if command.get("name") != "WallFixer" and not (
+        candidate.plan_reason or ""
+    ).startswith("use:WallFixer:"):
+        return False
+    target_id = _plan_use_target_id(candidate)
+    target = turn.unit(target_id) if target_id is not None else None
+    return target is not None and _wall_repair_urgent(turn, target)
+
+
 def _plan_use_target_id(plan) -> int | None:
     if plan is None:
         return None
@@ -815,6 +1047,38 @@ def _continue_plan(
     plan = state.plans.get(worker.unit_id)
     if plan is None or plan.reason == "s0_probe":
         return None
+    if plan.reason in ("build:rocket", "fund:build:rocket"):
+        completed_tower = next((
+            weapon for weapon in turn.weapons()
+            if weapon.pos == plan.target
+        ), None)
+        if completed_tower is not None:
+            pending_walls = set(state.fortification_targets) - {
+                wall.pos for wall in turn.walls()
+            }
+            if worker.pos not in pending_walls:
+                return None
+            safe_stands = tuple(
+                route for route in _routes_to_adjacent(
+                    turn, worker, completed_tower.pos,
+                    clock, deadline, max_expansions,
+                )
+                if route[0] not in pending_walls
+            )
+            if not safe_stands:
+                return None
+            stand, cost = min(safe_stands, key=lambda route: (
+                route[1], route[0].x, route[0].y,
+            ))
+            proposal = _move_to_stand(
+                turn, worker, stand, clock, deadline, max_expansions,
+            )
+            if proposal is None:
+                return None
+            return PlannedAction(
+                proposal, completed_tower.pos, "fund:build:rocket",
+                plan.deadline_round, cost,
+            )
     if plan.deadline_round is not None and turn.round_no > plan.deadline_round:
         return None
     if plan.reason.startswith("batch:"):
@@ -829,6 +1093,16 @@ def _continue_plan(
             or not _build_plan_valid(turn, worker, plan.target, kind)
         ):
             return None
+        if kind == "rocket":
+            route = _best_adjacent_route(
+                turn, worker, plan.target,
+                clock, deadline, max_expansions,
+            )
+            if route is None or not _tower_route_can_return(
+                turn, state, worker, plan.target, route[0], route[1] + 1,
+                clock, deadline, max_expansions,
+            ):
+                return None
         return _build_or_move(
             turn, worker, plan.target, kind, clock, deadline, max_expansions,
         )
@@ -873,6 +1147,28 @@ def _continue_plan(
         )
     if plan.reason.startswith("fund:build:"):
         kind = plan.reason.rsplit(":", 1)[1]
+        if plan.target in failed_builds:
+            return None
+        if kind == "rocket":
+            if turn.gold >= 25:
+                route = _best_adjacent_route(
+                    turn, worker, plan.target,
+                    clock, deadline, max_expansions,
+                )
+                stand = route[0] if route is not None else None
+                rounds = route[1] + 1 if route is not None else None
+            else:
+                funded = _building_funding_chain(
+                    turn, worker, plan.target, 25 - turn.gold,
+                    clock, deadline, max_expansions,
+                )
+                stand = funded.build_stand if funded is not None else None
+                rounds = funded.rounds if funded is not None else None
+            if stand is None or rounds is None or not _tower_route_can_return(
+                turn, state, worker, plan.target, stand, rounds,
+                clock, deadline, max_expansions,
+            ):
+                return None
         return _funding_build_action(
             turn,
             worker,
@@ -1280,6 +1576,11 @@ def _tower_action(
         )
         if route is None or route.rounds > turn.rounds_until_night:
             return None
+        if not _tower_route_can_return(
+            turn, state, worker, target, route.build_stand,
+            route.rounds, clock, deadline, max_expansions,
+        ):
+            return None
         return _funding_build_action(
             turn,
             worker,
@@ -1290,9 +1591,68 @@ def _tower_action(
             deadline,
             max_expansions,
             verified_route=route,
+            available_gold=available_gold,
         )
+    build_route = _best_adjacent_route(
+        turn, worker, target, clock, deadline, max_expansions,
+    )
+    if build_route is None or not _tower_route_can_return(
+        turn, state, worker, target, build_route[0], build_route[1] + 1,
+        clock, deadline, max_expansions,
+    ):
+        return None
     return _build_or_move(
         turn, worker, target, kind, clock, deadline, max_expansions,
+    )
+
+
+def _tower_route_can_return(
+    turn: Turn,
+    state: SessionState,
+    worker: Unit,
+    target: Pos,
+    build_stand: Pos,
+    build_rounds: int,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> bool:
+    if not turn.weapons():
+        return build_rounds + DAY_WORK_RETURN_MARGIN <= turn.rounds_until_night
+    projected = replace(
+        turn,
+        zones={**turn.zones, target: "rocket"},
+        ours=tuple(
+            replace(role, pos=build_stand)
+            if role.unit_id == worker.unit_id else role
+            for role in turn.ours
+        ),
+    )
+    from_build = replace(worker, pos=build_stand)
+    post = state.day_return_stands.get(worker.unit_id)
+    if post is not None:
+        result = _search_path(
+            projected, from_build, post,
+            clock=clock, deadline=deadline,
+            max_expansions=max_expansions,
+        )
+        return_cost = (
+            0 if result.status == "already_there" else result.cost
+            if result.status == "found" else None
+        )
+    else:
+        routes = (
+            route for weapon in turn.weapons()
+            for route in _routes_to_adjacent(
+                projected, from_build, weapon.pos,
+                clock, deadline, max_expansions,
+            )
+        )
+        return_cost = min((route[1] for route in routes), default=None)
+    return (
+        return_cost is not None
+        and build_rounds + return_cost + DAY_WORK_RETURN_MARGIN
+        <= turn.rounds_until_night
     )
 
 
@@ -2738,6 +3098,7 @@ def _funding_build_action(
     max_expansions: int,
     *,
     verified_route: BuildingFundingRoute | None = None,
+    available_gold: int | None = None,
 ) -> PlannedAction | None:
     reason = f"fund:build:{kind}"
     if (
@@ -2749,7 +3110,8 @@ def _funding_build_action(
         or turn.round_no > hard_deadline
     ):
         return None
-    if turn.gold >= 25:
+    cash = turn.gold if available_gold is None else max(available_gold, 0)
+    if cash >= 25:
         build_route = _best_adjacent_route(
             turn, worker, target, clock, deadline, max_expansions,
         )
@@ -2784,7 +3146,7 @@ def _funding_build_action(
         turn,
         worker,
         target,
-        25 - turn.gold,
+        25 - cash,
         clock,
         deadline,
         max_expansions,
@@ -2792,7 +3154,7 @@ def _funding_build_action(
     route = verified_route or chain_rounds
     if route is None or route.rounds > turn.rounds_until_night:
         return None
-    sale = _sale_for_deficit(turn, minerals, 25 - turn.gold)
+    sale = _sale_for_deficit(turn, minerals, 25 - cash)
     if sale is None:
         return None
     name, quantity = sale
@@ -3713,8 +4075,10 @@ def _search_path(
     max_expansions: int,
 ) -> PathResult:
     context = _ROUTE_SEARCH_CONTEXT.get()
-    key = (worker.unit_id, worker.pos, stand, max_expansions)
+    turn_id = id(turn)
+    key = (turn_id, worker.unit_id, worker.pos, stand, max_expansions)
     if context is not None:
+        context.turns[turn_id] = turn
         cached = context.paths.get(key)
         if cached is not None:
             if clock() >= deadline:
@@ -3742,7 +4106,10 @@ def _routes_to_adjacent(
     max_expansions: int,
 ) -> tuple[tuple[Pos, int], ...]:
     context = _ROUTE_SEARCH_CONTEXT.get()
-    cache_key = (worker.unit_id, worker.pos, target, max_expansions)
+    turn_id = id(turn)
+    cache_key = (turn_id, worker.unit_id, worker.pos, target, max_expansions)
+    if context is not None:
+        context.turns[turn_id] = turn
     if context is not None and cache_key in context.routes:
         if clock() >= deadline:
             context.truncated_reason = "deadline"

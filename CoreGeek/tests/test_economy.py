@@ -4162,6 +4162,413 @@ class EconomyTests(unittest.TestCase):
         plan = engine.state.state.plans.get(10010)
         self.assertTrue(plan is None or not plan.reason.startswith("build:"))
 
+    def test_missing_tower_preempts_existing_ordinary_fund_plan(self):
+        payload = economy_payload(round_no=30, worker_pos=(5, 2), gold=25)
+        payload["teamOur"]["teamId"] = "tower-before-fund"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        engine = DecisionEngine()
+        previous = copy.deepcopy(payload)
+        previous["roundNo"] = 29
+        engine.decide(previous)
+        engine.state.set_plan(
+            10010, Pos(6, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020", 70,
+        )
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertTrue(engine.state.state.plans[10010].reason.endswith(
+            "build:rocket"
+        ))
+        self.assertEqual(engine.decide(payload), response)
+
+    def test_missing_tower_cash_is_not_spent_by_other_worker(self):
+        payload = economy_payload(round_no=30, worker_pos=(5, 2), gold=25)
+        payload["teamOur"]["teamId"] = "tower-shared-gold"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher1", "price": 20,
+        }]
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 9),
+        )
+        engine = DecisionEngine()
+        previous = copy.deepcopy(payload)
+        previous["roundNo"] = 29
+        engine.decide(previous)
+        engine.state.set_plan(
+            10010, Pos(6, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020", 70,
+        )
+
+        response = engine.decide(payload)
+        commands = response["roleCommandMap"]
+
+        self.assertNotEqual(commands.get("10010", {}).get("action"), "buy")
+        self.assertEqual(commands.get("10012", {}).get("action"), "build")
+        self.assertEqual(commands["10012"]["name"], "rocket")
+
+    def test_missing_tower_reserves_cash_against_ordinary_purchase(self):
+        payload = economy_payload(round_no=30, worker_pos=(5, 2), gold=25)
+        payload["teamOur"]["teamId"] = "tower-before-medicine-purchase"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["teamOur"]["roles"][0]["health"] = 180
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 9),
+        )
+        payload["weaponShopList"] = [{"name": "Medicine", "price": 10}]
+
+        missing = DecisionEngine().decide(payload)["roleCommandMap"]
+        self.assertEqual(missing["10012"]["name"], "rocket")
+        self.assertNotEqual(missing.get("10010", {}).get("action"), "buy")
+
+        complete = copy.deepcopy(payload)
+        complete["teamOur"]["roles"].append(
+            role(10040, "rocket", 11, 7, health=1000),
+        )
+        ordinary = DecisionEngine().decide(complete)["roleCommandMap"]
+        self.assertEqual(ordinary["10010"], {
+            "action": "buy", "name": "Medicine", "num": 1,
+        })
+
+    def test_tower_preemption_releases_old_upgrade_target_owner(self):
+        payload = economy_payload(round_no=30, worker_pos=(7, 9), gold=25)
+        payload["teamOur"]["teamId"] = "tower-owner-release"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 2,
+                    items=("WeaponUpgradeVoucher1",)),
+        )
+        engine = DecisionEngine()
+        previous = copy.deepcopy(payload)
+        previous["roundNo"] = 29
+        engine.decide(previous)
+        engine.state.set_plan(
+            10010, Pos(6, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020", 70,
+        )
+
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10010"]["name"], "rocket")
+        self.assertEqual(commands["10012"]["action"], "use")
+        self.assertEqual(commands["10012"]["name"], "WeaponUpgradeVoucher1")
+
+    def test_missing_tower_preempts_remote_held_voucher(self):
+        payload = economy_payload(
+            round_no=30, worker_pos=(5, 2),
+            items=("WeaponUpgradeVoucher1",), gold=25,
+        )
+        payload["teamOur"]["teamId"] = "tower-before-held"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+
+        engine = DecisionEngine()
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertTrue(engine.state.state.plans[10010].reason.endswith(
+            "build:rocket"
+        ))
+        self.assertEqual(
+            payload["teamOur"]["roles"][0]["backpack"],
+            ["WeaponUpgradeVoucher1"],
+        )
+
+    def test_missing_tower_preempts_old_mine_plan(self):
+        payload = economy_payload(round_no=30, worker_pos=(5, 2), gold=25)
+        payload["teamOur"]["teamId"] = "tower-before-mine"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        engine = DecisionEngine()
+        previous = copy.deepcopy(payload)
+        previous["roundNo"] = 29
+        engine.decide(previous)
+        engine.state.set_plan(10010, Pos(2, 2), "mine:copper", None)
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+        self.assertEqual(
+            engine.state.state.plans[10010].reason, "build:rocket",
+        )
+
+    def test_missing_tower_medicine_self_care_remains_first(self):
+        payload = economy_payload(
+            round_no=30, worker_pos=(7, 9),
+            items=("Medicine",), gold=25,
+        )
+        payload["teamOur"]["teamId"] = "tower-emergency-medicine"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["teamOur"]["roles"][0]["health"] = 30
+
+        command = DecisionEngine().decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command["action"], "use")
+        self.assertEqual(command["name"], "Medicine")
+
+    def test_missing_tower_does_not_preempt_imminent_wall_repair(self):
+        payload = economy_payload(round_no=30, worker_pos=(5, 2), gold=25)
+        payload["teamOur"]["teamId"] = "tower-emergency-wall"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["teamOur"]["roles"].append(
+            role(10100, "wall", 7, 8, health=20),
+        )
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        payload["robot"]["roles"] = [{
+            "id": 30001, "pos": {"x": 7, "y": 7},
+            "roleType": "largeRobot", "health": 500,
+            "attackPower": 20, "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+
+        engine = DecisionEngine()
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertNotEqual(command.get("name"), "rocket")
+        self.assertIn(command["action"], ("buy", "move"))
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith(
+            "fund:WallFixer:"
+        ))
+
+    def test_third_tower_feedback_releases_priority_for_held_voucher(self):
+        payload = economy_payload(
+            round_no=30, worker_pos=(7, 9),
+            items=("WeaponUpgradeVoucher1",), gold=25,
+        )
+        payload["teamOur"]["teamId"] = "tower-then-held"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first["action"], "build")
+        self.assertEqual(first["name"], "rocket")
+        payload["roundNo"] = 31
+        payload["teamOur"]["goldNum"] = 0
+        target = first["targetPos"][0]
+        payload["teamOur"]["roles"].append(
+            role(10040, "rocket", target["x"], target["y"], health=1000)
+        )
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+
+        second = engine.decide(payload)["roleCommandMap"].get("10010")
+
+        self.assertIsNotNone(second)
+        self.assertEqual(second["action"], "use")
+        self.assertEqual(second["name"], "WeaponUpgradeVoucher1")
+        self.assertEqual(payload["teamOur"]["roles"][0]["backpack"], [
+            "WeaponUpgradeVoucher1",
+        ])
+
+    def test_tower_funding_waits_when_sale_build_return_cannot_finish(self):
+        payload = economy_payload(
+            round_no=68, worker_pos=(7, 9),
+            items=("copper",) * 5, gold=0,
+        )
+        payload["teamOur"]["teamId"] = "tower-full-route-window"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 8, "y": 10}, "neutralType": "vendor",
+        }]
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        self.assertFalse(any(
+            command.get("action") == "build"
+            and command.get("name") == "rocket"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertEqual(
+            traces[0]["economyPlanning"]["towerPriority"],
+            "no_complete_route_or_window",
+        )
+
+    def _urgent_tower_wall_payload(self):
+        payload = economy_payload(round_no=30, worker_pos=(5, 2), gold=25)
+        payload["teamOur"]["teamId"] = "tower-urgent-review"
+        payload["teamOur"]["roles"] = payload["teamOur"]["roles"][:-1]
+        payload["teamOur"]["roles"].append(
+            role(10100, "wall", 7, 8, health=20),
+        )
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        payload["robot"]["roles"] = [{
+            "id": 30001, "pos": {"x": 7, "y": 7},
+            "roleType": "largeRobot", "health": 500,
+            "attackPower": 20, "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+        return payload
+
+    def test_urgent_wall_purchase_does_not_override_held_medicine(self):
+        payload = self._urgent_tower_wall_payload()
+        worker = payload["teamOur"]["roles"][0]
+        worker["health"] = 30
+        worker["backpack"] = ["Medicine", "WallFixer"]
+
+        command = DecisionEngine().decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command, {"action": "use", "name": "Medicine"})
+
+    def test_urgent_wall_held_fix_prevents_duplicate_purchase(self):
+        payload = self._urgent_tower_wall_payload()
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 6, 8, items=("WallFixer",)),
+        )
+
+        for reversed_roles in (False, True):
+            ordered = copy.deepcopy(payload)
+            ordered["teamOur"]["teamId"] += str(reversed_roles)
+            if reversed_roles:
+                ordered["teamOur"]["roles"].reverse()
+            commands = DecisionEngine().decide(ordered)["roleCommandMap"]
+
+            self.assertEqual(commands["10012"], {
+                "action": "use", "name": "WallFixer",
+                "targetPos": [{"x": 7, "y": 8}],
+            })
+            self.assertNotEqual(commands.get("10010", {}).get("action"), "buy")
+
+    def test_urgent_wall_immediate_owner_beats_remote_held_worker(self):
+        payload = self._urgent_tower_wall_payload()
+        payload["teamOur"]["roles"][0]["backpack"] = ["WallFixer"]
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 6, 8, items=("WallFixer",)),
+        )
+        for reversed_roles in (False, True):
+            ordered = copy.deepcopy(payload)
+            ordered["teamOur"]["teamId"] += str(reversed_roles)
+            if reversed_roles:
+                ordered["teamOur"]["roles"].reverse()
+            engine = DecisionEngine()
+            engine.state.state = state_for(ordered)
+            engine.state.set_plan(
+                10012, Pos(7, 8), "use:WallFixer:10100", 70,
+            )
+
+            commands = engine.decide(ordered)["roleCommandMap"]
+
+            self.assertEqual(commands["10012"], {
+                "action": "use", "name": "WallFixer",
+                "targetPos": [{"x": 7, "y": 8}],
+            })
+            self.assertNotEqual(commands.get("10010", {}).get("action"), "use")
+
+    def test_urgent_wall_preselection_stays_in_daytime_missing_tower_scope(self):
+        for round_no, has_third_tower in ((71, False), (30, True)):
+            with self.subTest(round_no=round_no, third=has_third_tower):
+                payload = self._urgent_tower_wall_payload()
+                payload["roundNo"] = round_no
+                payload["teamOur"]["roles"][0]["backpack"] = ["WallFixer"]
+                payload["teamOur"]["roles"].insert(
+                    1, role(10012, "worker", 6, 8,
+                            items=("WallFixer",)),
+                )
+                if has_third_tower:
+                    payload["teamOur"]["roles"].append(
+                        role(10040, "rocket", 11, 7, health=1000),
+                    )
+                engine = DecisionEngine()
+                engine.state.state = state_for(payload)
+                engine.state.set_plan(
+                    10012, Pos(7, 8), "use:WallFixer:10100", 130,
+                )
+
+                commands = engine.decide(payload)["roleCommandMap"]
+
+                self.assertEqual(commands["10012"], {
+                    "action": "use", "name": "WallFixer",
+                    "targetPos": [{"x": 7, "y": 8}],
+                })
+
+    def test_reserved_held_fixer_does_not_block_other_worker_purchase(self):
+        payload = self._urgent_tower_wall_payload()
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 6, 8, items=("WallFixer",)),
+        )
+        candidates = economy.propose_economy(
+            Turn.load(payload), state_for(payload),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+            reserved_role_ids=frozenset((10012,)),
+        )
+
+        buyer = next(
+            candidate for candidate in candidates
+            if candidate.proposal.actor_id == 10010
+        )
+        self.assertEqual(buyer.proposal.command, {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+
+    def test_unreachable_held_fixer_does_not_block_other_worker_purchase(self):
+        payload = self._urgent_tower_wall_payload()
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 0, 0, items=("WallFixer",)),
+        )
+        payload["mapInfo"]["zones"].extend(
+            {"pos": {"x": x, "y": y}, "neutralType": "stone"}
+            for x, y in ((1, 0), (0, 1), (1, 1))
+        )
+
+        commands = DecisionEngine().decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10010"], {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+        self.assertNotEqual(commands.get("10012", {}).get("action"), "use")
+
+    def test_projected_tower_route_cannot_reuse_original_map_paths(self):
+        from dataclasses import replace
+
+        payload = economy_payload(round_no=30, worker_pos=(0, 0))
+        turn = replace(Turn.load(payload), width=4, height=1, zones={})
+        worker = turn.unit(10010)
+        state = state_for(payload)
+        state.day_return_stands[worker.unit_id] = Pos(2, 0)
+        clock = lambda: 0.0
+        target = Pos(1, 0)
+        post = Pos(2, 0)
+        projected = replace(turn, zones={target: "rocket"})
+        for first, second, expected in (
+            (turn, projected, "unreachable"),
+            (projected, turn, "found"),
+        ):
+            context = economy.RouteSearchContext({})
+            token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+            try:
+                economy._search_path(
+                    first, worker, post, clock=clock,
+                    deadline=1.0, max_expansions=64,
+                )
+                result = economy._search_path(
+                    second, worker, post, clock=clock,
+                    deadline=1.0, max_expansions=64,
+                )
+                self.assertEqual(result.status, expected)
+                self.assertEqual(context.path_computations, 2)
+            finally:
+                economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            self.assertEqual(economy._search_path(
+                turn, worker, post, clock=clock,
+                deadline=1.0, max_expansions=64,
+            ).status, "found")
+            self.assertFalse(economy._tower_route_can_return(
+                turn, state, worker, target, worker.pos, 1,
+                clock, 1.0, 64,
+            ))
+            self.assertEqual(economy._routes_to_adjacent(
+                turn, worker, Pos(3, 0), clock, 1.0, 64,
+            ), ((Pos(2, 0), 2),))
+            self.assertEqual(economy._routes_to_adjacent(
+                projected, worker, Pos(3, 0), clock, 1.0, 64,
+            ), ())
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
 
 if __name__ == "__main__":
     unittest.main()

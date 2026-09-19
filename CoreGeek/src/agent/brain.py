@@ -178,7 +178,10 @@ class DecisionEngine:
                 if candidate not in critical_economy
             )
             funding_roles, funding_posts = self._funding_reservations(
-                critical_economy if turn.is_day else (),
+                critical_economy + tuple(
+                    candidate for candidate in ordinary_economy
+                    if (candidate.plan_reason or "").startswith("build:rocket")
+                ) if turn.is_day else (),
                 state,
                 turn,
                 include_existing=turn.is_day,
@@ -626,6 +629,14 @@ class DecisionEngine:
     ) -> tuple[frozenset[int], frozenset[int]]:
         roles: set[int] = set()
         weapons: set[int] = set()
+        tower_roles = {
+            candidate.proposal.actor_id for candidate in candidates
+            if isinstance(candidate.plan_reason, str)
+            and candidate.plan_reason.startswith((
+                "build:rocket", "fund:build:rocket",
+            ))
+        }
+        tower_pending = bool(tower_roles)
         for candidate in candidates:
             reason = candidate.plan_reason
             if not isinstance(reason, str) or reason.startswith("fund:build:"):
@@ -643,7 +654,8 @@ class DecisionEngine:
             weapons.add(weapon_id)
         for role_id, plan in state.plans.items() if include_existing else ():
             if (
-                not plan.reason.startswith(("fund:", "batch:"))
+                tower_pending
+                or not plan.reason.startswith(("fund:", "batch:"))
                 or plan.reason.startswith("fund:build:")
             ):
                 continue

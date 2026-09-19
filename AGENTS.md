@@ -428,3 +428,19 @@ T57本批本地验收通过，可隔离提交，构建nightwatch-s2-task-envelop
 原Sol+medium回合01a0b764-953e-7a71-8343-1b4247ca3ee9已completed/idle，cursor145。主会话独立523/523含16HTTP通过21.348秒，diff/cached diff/bash-n通过；只读代码审查无确定阻断。独立14墙基准实测A*636→517，扩展15062→9468，move(1,0)、fund:WallFixer:10020:20010与13轮估计不变。六组旧ce7bab3源码/新源码无时压逐字段提案及原pathSearches一致，覆盖输入乱序、临夜、无资金、障碍、多vendor/shop。
 
 T58本地验收通过，可隔离提交，构建nightwatch-s2-economy-perf-r1。原pathSearches仍计候选访问，新增pathComputations/pathCacheHits/pathExpansions记录真正A*开销；不增加预算、候选剪枝或跨轮缓存。原平台约3秒问题未获完整原始帧，实际收益待验。main365c8cc/r5与#12保持，不自动合并推送/开局或继续开发，旧树及缓存保留。
+
+
+## R214 三塔建设优先与资金保护开发授权
+
+本批继续使用`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-day-work`与`codex/s2-day-work`，基准`40b934483a43bc891871604b8024cc61e98ec53d`；按外层`design/【codex】s2-three-tower-priority-plan.md`实施T59，构建标识`nightwatch-s2-tower-priority-r1`。`main`/r5、其他工作树与固定issue #12保持只读。
+
+仅在第三座火箭塔有合法目标、可完成的资金与建造回岗路线及足够白天窗口时，让塔的既有承诺先于普通采矿、投资和非紧急维护；保护实际所需共享金币与builder，不假定未出售矿石为现金，不新增跨工人筹资。即时Medicine及正在受击墙的紧急维修、任务/防守占用和P1动态回防继续优先。不可行时保留原经济，不永久锁定资金或角色；不改布局、预算、夜间禁建或其他策略。
+
+先以真实连续DecisionEngine反例复现遮挡及双工人抢金，再最小修订；覆盖现金/可售矿/不足资金、普通fund/mine/持券、既有塔计划、三塔完成恢复、失败/占位/期限/无工人、紧急/跨日、重放乱序。沿现有源码/测试/手册目录开发，不新增目录依赖。开发不commit/merge/push/reset/切分支/删除/派生Agent，不更新#12或开局；R215交付后停止等R216独立验收。
+
+
+## R216 T59三塔优先本地验收
+
+原Sol最终回合01a0b7a4-3ff2-7e33-9000-cb390900ef64已completed/idle，cursor151。主会话独立540/540含16HTTP通过22.009秒，diff/cached diff/bash-n通过。两轮独立审查发现并交回修复Medicine被采购抢占、重复买券阻挡即时修墙、新塔投影复用原图缓存、远处持券者覆盖相邻有效owner四项回归，最终反例及角色反序通过。投影单通道现拒绝错误回防，原图仍命中缓存；T58性能回归保持。
+
+本批本地验收通过，构建nightwatch-s2-tower-priority-r1，可隔离提交。三塔目标在合法资金/工人/施工与回防窗口下优先，普通旧计划让位，即时救命保留；新紧急预选仅白天缺塔，立即use优先且保持有效owner稳定。未改布局或全局预算。连续合成用例售矿补第三塔并完成14墙仅证明本地链路，不代表原r4两塔零墙因果或平台收益已验证。main365c8cc/r5、#12和全部旧树保持，不自动合并推送、开局或清理。

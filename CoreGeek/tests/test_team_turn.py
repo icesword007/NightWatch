@@ -1695,7 +1695,9 @@ class TeamTurnTests(unittest.TestCase):
                 self.assertIsNotNone(built_rocket_round)
                 self.assertGreater(len(built_walls), 0)
                 self.assertLess(wall_rounds[0], built_rocket_round)
-                self.assertEqual(tuple(built_walls), plan.wall_targets)
+                # A tower worker can temporarily occupy a later wall cell;
+                # the safety planner may defer that wall without dropping it.
+                self.assertCountEqual(built_walls, plan.wall_targets)
                 self.assertEqual(len(turn.weapons()), 3)
                 self.assertEqual(
                     len(staffed), 3,
