@@ -139,6 +139,7 @@ class SessionState:
     task_sequence: int = 0
     plans: dict[int, PlanState] = field(default_factory=dict)
     procurement_blocked_days: dict[int, int] = field(default_factory=dict)
+    emergency_purchase_night: int | None = None
     pending_actions: dict[int, PendingAction] = field(default_factory=dict)
     action_history: list[CompletedAction] = field(default_factory=list)
     active_task: TaskMemory | None = None

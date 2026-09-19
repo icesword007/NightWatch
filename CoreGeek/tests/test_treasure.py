@@ -3,6 +3,7 @@ import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.brain import DecisionEngine
 from agent.intelligence import (
@@ -11,7 +12,7 @@ from agent.intelligence import (
     NewsCitation,
     TreasureConditions,
 )
-from agent.protocol import Turn
+from agent.protocol import Pos, Turn
 from agent import server as server_module
 from agent.treasure import evaluate_treasure_candidates
 
@@ -114,7 +115,390 @@ def response_for(pending, *, location=(4, 4), window=(2, 20), items=None):
     })
 
 
+def simple_route_case(*, round_no=10, target=(2, 2), window=(10, 20)):
+    current = payload(round_no)
+    current["mapInfo"].update({"width": 6, "height": 6, "zones": []})
+    current["teamEnemy"]["roles"] = []
+    current["robot"]["roles"] = []
+    current["teamOur"]["roles"][0]["pos"] = {"x": 4, "y": 4}
+    pioneer = current["teamOur"]["roles"][1]
+    pioneer["pos"] = {"x": 1, "y": 1}
+    pioneer["backpack"] = ["StarSand"]
+    current["teamOur"]["roles"].append({
+        "id": 10020, "pos": {"x": 1, "y": 2},
+        "roleType": "gatling", "health": 1000, "level": 1,
+        "cooldown": 0, "backpack": [],
+    })
+    turn = Turn.load(current)
+    hypothesis = candidate(
+        location={"x": target[0], "y": target[1]},
+        window={"startRound": window[0], "endRound": window[1]},
+        items=("StarSand",),
+    )
+    assignments = {
+        10020: (turn.pioneers()[0], (Pos(1, 1), None, 0)),
+    }
+    return current, turn, hypothesis, assignments
+
+
 class TreasureEvaluationTests(unittest.TestCase):
+    def test_route_zero_step_wait_and_window_end_are_counted_by_action_round(self):
+        _, turn, hypothesis, assignments = simple_route_case(
+            window=(12, 12),
+        )
+        route = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(route["status"], "feasible")
+        self.assertEqual(route["outboundMoveRounds"], 0)
+        self.assertEqual(route["waitRounds"], 2)
+        self.assertEqual(route["earliestActionRound"], 12)
+        self.assertEqual(route["returnMoveRounds"], 0)
+
+        _, turn, hypothesis, assignments = simple_route_case(
+            target=(3, 1), window=(10, 11),
+        )
+        route = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(route["status"], "feasible")
+        self.assertEqual(route["earliestActionRound"], 11)
+
+        _, turn, hypothesis, assignments = simple_route_case(
+            target=(3, 1), window=(10, 10),
+        )
+        route = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(route["status"], "candidate_window_missed")
+        self.assertFalse(route["returnWithMargin"])
+
+    def test_route_return_margin_exact_boundary_and_missing_post_unknown(self):
+        _, turn, hypothesis, assignments = simple_route_case(
+            round_no=68, window=(68, 68),
+        )
+        route = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(route["status"], "feasible")
+        self.assertTrue(route["returnWithMargin"])
+
+        _, turn, hypothesis, assignments = simple_route_case(
+            round_no=69, window=(69, 69),
+        )
+        route = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(route["status"], "candidate_return_too_late")
+        self.assertFalse(route["returnWithMargin"])
+        self.assertEqual(route["outboundMoveRounds"], 0)
+        self.assertEqual(route["returnMoveRounds"], 0)
+
+        _, turn, hypothesis, _ = simple_route_case()
+        route = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=None,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(route["status"], "return_post_unknown")
+        self.assertEqual(route["returnWithMargin"], "unknown")
+
+        _, turn, hypothesis, _ = simple_route_case(
+            target=(3, 1), window=(10, 10),
+        )
+        route = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=None,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(route["status"], "candidate_window_missed")
+        self.assertEqual(route["returnWithMargin"], "unknown")
+
+    def test_route_prerequisites_block_search_without_claiming_reachability(self):
+        cases = []
+        current, _, hypothesis, assignments = simple_route_case()
+        missing = copy.deepcopy(current)
+        missing["teamOur"]["roles"][1]["backpack"] = []
+        cases.append(("missing", missing, hypothesis, "procurement_route_not_evaluated"))
+        active = copy.deepcopy(current)
+        active["phaseTask"] = "active task"
+        cases.append(("active", active, hypothesis, "prerequisite_blocked"))
+        night = copy.deepcopy(current)
+        night["roundNo"] = 71
+        cases.append(("night", night, hypothesis, "night"))
+        expired = candidate(
+            location={"x": 2, "y": 2},
+            window={"startRound": 1, "endRound": 9},
+            items=("StarSand",),
+        )
+        cases.append(("expired", current, expired, "prerequisite_blocked"))
+        other_session = replace(hypothesis, source_session=2)
+        cases.append(("source", current, other_session, "prerequisite_blocked"))
+        truncated = replace(
+            hypothesis,
+            citation_source_truncated=True,
+        )
+        cases.append(("truncated", current, truncated, "prerequisite_blocked"))
+        incomplete = candidate(items=("StarSand",))
+        cases.append(("incomplete", current, incomplete, "prerequisite_blocked"))
+        for label, raw, value, expected in cases:
+            with self.subTest(label=label):
+                result = evaluate_treasure_candidates(
+                    Turn.load(raw), (value,), session_index=1,
+                    daytime_assignments=assignments,
+                    clock=lambda: 0.0, deadline=1.0,
+                )[0]
+                self.assertEqual(result["route"]["status"], expected)
+                self.assertEqual(result["route"]["expansions"], 0)
+                self.assertFalse(result["actionEnabled"])
+
+        conflicting = candidate(
+            location={"x": 3, "y": 2},
+            window={"startRound": 10, "endRound": 20},
+            items=("StarSand",),
+        )
+        results = evaluate_treasure_candidates(
+            Turn.load(current), (hypothesis, conflicting), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )
+        self.assertTrue(all(
+            result["route"]["status"] == "prerequisite_blocked"
+            and result["route"]["expansions"] == 0
+            for result in results
+        ))
+
+    def test_route_distinguishes_exhausted_map_from_shared_search_cutoff(self):
+        current, _, hypothesis, _ = simple_route_case(target=(4, 4))
+        current["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": y}, "neutralType": "stone"}
+            for y in range(6)
+        ]
+        turn = Turn.load(current)
+        assignments = {10020: (turn.pioneers()[0], (Pos(1, 1), None, 0))}
+        unreachable = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(unreachable["status"], "unreachable")
+        self.assertGreater(unreachable["expansions"], 0)
+
+        occupied = copy.deepcopy(current)
+        occupied["mapInfo"]["zones"] = [
+            {"pos": {"x": x, "y": y}, "neutralType": "stone"}
+            for x in (3, 4, 5) for y in (3, 4, 5)
+            if (x, y) != (4, 4)
+        ]
+        no_stand = evaluate_treasure_candidates(
+            Turn.load(occupied), (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(no_stand["status"], "unreachable")
+        self.assertEqual(no_stand["expansions"], 0)
+
+        with patch("agent.treasure.MAX_TREASURE_ROUTE_EXPANSIONS", 1):
+            routes = [item["route"] for item in evaluate_treasure_candidates(
+                turn, (hypothesis,) * 5, session_index=1,
+                daytime_assignments=assignments,
+                clock=lambda: 0.0, deadline=1.0,
+            )]
+        self.assertEqual(routes[0]["status"], "expansion_limit")
+        self.assertEqual(routes[-1]["status"], "candidate_limit")
+        self.assertLessEqual(sum(route["expansions"] for route in routes), 1)
+        self.assertTrue(all(
+            route["status"] != "unreachable" for route in routes
+        ))
+
+        deadline = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: 2.0, deadline=1.0,
+        )[0]["route"]
+        self.assertEqual(deadline["status"], "deadline")
+        self.assertEqual(deadline["expansions"], 0)
+
+        ticks = iter((0.0, 0.02))
+        short_budget = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments=assignments,
+            clock=lambda: next(ticks), deadline=10.0,
+        )[0]["route"]
+        self.assertEqual(short_budget["status"], "deadline")
+        self.assertEqual(short_budget["expansions"], 0)
+
+    def test_held_recipe_route_uses_legal_adjacent_stand_and_returns_to_post(self):
+        current = payload(10)
+        current["mapInfo"].update({
+            "width": 10, "height": 10,
+            "zones": [
+                {"pos": {"x": x, "y": 1}, "neutralType": "stone"}
+                for x in (2, 3, 4)
+            ],
+        })
+        pioneer = current["teamOur"]["roles"][1]
+        pioneer["pos"] = {"x": 1, "y": 1}
+        pioneer["backpack"] = ["StarSand"]
+        current["teamEnemy"]["roles"] = []
+        current["robot"]["roles"] = []
+        current["teamOur"]["roles"].append({
+            "id": 10020, "pos": {"x": 1, "y": 4},
+            "roleType": "gatling", "health": 1000, "level": 1,
+            "cooldown": 0, "backpack": [],
+        })
+        turn = Turn.load(current)
+        hero = turn.pioneers()[0]
+        hypothesis = candidate(
+            location={"x": 5, "y": 1},
+            window={"startRound": 10, "endRound": 20},
+            items=("StarSand",),
+        )
+
+        result = evaluate_treasure_candidates(
+            turn, (hypothesis,), session_index=1,
+            daytime_assignments={10020: (hero, (Pos(1, 3), None, 0))},
+            clock=lambda: 0.0, deadline=1.0,
+        )[0]
+
+        self.assertEqual(result["route"]["status"], "feasible")
+        self.assertGreater(result["route"]["outboundMoveRounds"], 0)
+        self.assertGreater(result["route"]["returnMoveRounds"], 0)
+        self.assertTrue(result["route"]["returnWithMargin"])
+        self.assertFalse(result["actionEnabled"])
+
+    def test_missing_recipe_cost_uses_selected_pioneer_current_cash_and_real_capacity(self):
+        current = payload(5)
+        current["teamOur"]["goldNum"] = 20
+        current["teamOur"]["roles"][0]["backpack"] = ["StarSand", "StarSand"]
+        pioneer = current["teamOur"]["roles"][1]
+        pioneer["backpack"] = ["StarSand", "other-a", "other-b"]
+        pioneer["backPackCapability"] = 4
+        hypothesis = candidate(
+            location={"x": 4, "y": 4},
+            window={"startRound": 2, "endRound": 20},
+            items=("StarSand", "StarSand", "StarSand"),
+        )
+
+        result = evaluate_treasure_candidates(
+            Turn.load(current), (hypothesis,), session_index=1,
+        )[0]
+
+        self.assertEqual(result["missingItems"], {"StarSand": 2})
+        self.assertEqual(result["procurement"], {
+            "missingItemCount": 2,
+            "missingCost": 30,
+            "backpackFreeSlots": 1,
+            "shopAvailable": True,
+            "currentCashCoversMissingCost": False,
+            "backpackFitsMissing": False,
+            "routeScope": "missing_item_procurement",
+            "spendingBudgetEvaluated": False,
+            "routeEvaluated": False,
+            "returnWindowEvaluated": False,
+            "semanticValidationEvaluated": False,
+        })
+        self.assertFalse(result["localChecksPassed"])
+        self.assertFalse(result["actionEnabled"])
+
+    def test_procurement_unknown_and_already_held_cases_stay_distinct(self):
+        base = candidate(
+            location={"x": 4, "y": 4},
+            window={"startRound": 2, "endRound": 20},
+            items=("StarSand", "StarSand"),
+        )
+        unknown_recipe = replace(
+            base,
+            treasure_conditions=replace(base.treasure_conditions, items=None),
+        )
+        result = evaluate_treasure_candidates(
+            Turn.load(payload(5)), (unknown_recipe,), session_index=1,
+        )[0]["procurement"]
+        self.assertIsNone(result["missingItemCount"])
+        self.assertIsNone(result["missingCost"])
+        self.assertEqual(result["shopAvailable"], "unknown")
+
+        dead = payload(5)
+        dead["teamOur"]["roles"][1]["health"] = 0
+        result = evaluate_treasure_candidates(
+            Turn.load(dead), (base,), session_index=1,
+        )[0]["procurement"]
+        self.assertIsNone(result["missingItemCount"])
+        self.assertIsNone(result["missingCost"])
+
+        missing_price = payload(5)
+        missing_price["weaponShopList"] = []
+        result = evaluate_treasure_candidates(
+            Turn.load(missing_price), (base,), session_index=1,
+        )[0]["procurement"]
+        self.assertEqual(result["missingItemCount"], 2)
+        self.assertFalse(result["shopAvailable"])
+        self.assertIsNone(result["missingCost"])
+        self.assertEqual(result["currentCashCoversMissingCost"], "unknown")
+
+        partly_listed = candidate(items=("StarSand", "UnknownRelic"))
+        result = evaluate_treasure_candidates(
+            Turn.load(payload(5)), (partly_listed,), session_index=1,
+        )[0]["procurement"]
+        self.assertEqual(result["missingItemCount"], 2)
+        self.assertFalse(result["shopAvailable"])
+        self.assertIsNone(result["missingCost"])
+
+        held = payload(5)
+        held["weaponShopList"] = []
+        held["teamOur"]["roles"][1]["backpack"] = ["StarSand", "StarSand"]
+        result = evaluate_treasure_candidates(
+            Turn.load(held), (base,), session_index=1,
+        )[0]["procurement"]
+        self.assertEqual(result["missingItemCount"], 0)
+        self.assertEqual(result["missingCost"], 0)
+        self.assertTrue(result["shopAvailable"])
+        self.assertTrue(result["currentCashCoversMissingCost"])
+
+        empty = replace(
+            base,
+            treasure_conditions=replace(
+                base.treasure_conditions, items=cited(()),
+            ),
+        )
+        result = evaluate_treasure_candidates(
+            Turn.load(payload(5)), (empty,), session_index=1,
+        )[0]["procurement"]
+        self.assertEqual(result["missingItemCount"], 0)
+        self.assertEqual(result["missingCost"], 0)
+
+    def test_procurement_uses_current_prices_and_does_not_merge_pioneer_bags(self):
+        current = payload(5)
+        current["teamOur"]["roles"][1]["backpack"] = ["StarSand"]
+        current["teamOur"]["roles"][1]["backPackCapability"] = None
+        current["teamOur"]["roles"].append({
+            "id": 10015, "pos": {"x": 4, "y": 3},
+            "roleType": "pioneer", "health": 200,
+            "backPackCapability": 40, "backpack": ["StarSand"],
+        })
+        current["weaponShopList"] = [{"name": "StarSand", "price": 23}]
+        hypothesis = candidate(items=("StarSand", "StarSand", "StarSand"))
+
+        result = evaluate_treasure_candidates(
+            Turn.load(current), (hypothesis,), session_index=1,
+        )[0]
+
+        self.assertEqual(result["pioneerId"], "10011")
+        self.assertEqual(result["procurement"]["missingItemCount"], 2)
+        self.assertEqual(result["procurement"]["missingCost"], 46)
+        self.assertIsNone(result["procurement"]["backpackFreeSlots"])
+        self.assertEqual(result["procurement"]["backpackFitsMissing"], "unknown")
+
     def test_unstructured_and_unknown_fields_stay_blocked(self):
         # Break caught: an interpretation-only candidate is treated as actionable.
         turn = Turn.load(payload(5))
@@ -488,6 +872,85 @@ class TreasureEvaluationTests(unittest.TestCase):
         self.assertEqual(decision["candidates"][0]["missingItemKinds"], 1)
         self.assertNotIn("missingItems", decision["candidates"][0])
         self.assertIn("PrivateMapRelic", json.dumps(news_record))
+
+    def test_news_response_procurement_summary_is_read_only_and_redacted(self):
+        candidate_engine = DecisionEngine()
+        control_engine = DecisionEngine()
+        first = payload(1, team_id="treasure-price-candidate")
+        first["teamOur"]["goldNum"] = 20
+        first["teamOur"]["roles"][1]["backpack"] = ["PrivateMapRelic"]
+        first["weaponShopList"] = [{"name": "PrivateMapRelic", "price": 17}]
+        control_first = copy.deepcopy(first)
+        control_first["teamOur"]["teamId"] = "treasure-price-control"
+        candidate_engine.decide(first)
+        control_engine.decide(control_first)
+        pending = candidate_engine.state.state.pending_news_request
+        control_pending = control_engine.state.state.pending_news_request
+        returned = copy.deepcopy(first)
+        returned["roundNo"] = 2
+        returned["llmResp"] = response_for(
+            pending, items=["PrivateMapRelic"] * 3,
+        )
+        control = copy.deepcopy(control_first)
+        control["roundNo"] = 2
+        control["llmResp"] = json.dumps({
+            "requestId": control_pending.request_id, "candidates": [],
+        })
+        traces = []
+
+        actual = candidate_engine.decide(returned, trace_sink=traces.append)
+        baseline = control_engine.decide(control)
+
+        self.assertEqual(actual["roleCommandMap"], baseline["roleCommandMap"])
+        self.assertEqual(actual["executeCmd"], baseline["executeCmd"])
+        summary = traces[-1]["treasureConditions"]["candidates"][0]
+        self.assertFalse(summary["actionEnabled"])
+        self.assertEqual(summary["procurement"]["missingItemCount"], 2)
+        self.assertEqual(summary["procurement"]["missingCost"], 34)
+        self.assertFalse(summary["procurement"]["currentCashCoversMissingCost"])
+        self.assertNotIn("PrivateMapRelic", json.dumps(summary))
+        self.assertNotIn("At (4,4)", json.dumps(summary))
+
+    def test_news_response_route_uses_current_assignment_without_changing_actions(self):
+        candidate_engine = DecisionEngine()
+        control_engine = DecisionEngine()
+        first, _, _, _ = simple_route_case(round_no=1)
+        first["teamOur"]["teamId"] = "treasure-route-candidate"
+        control_first = copy.deepcopy(first)
+        control_first["teamOur"]["teamId"] = "treasure-route-control"
+        candidate_engine.decide(first)
+        control_engine.decide(control_first)
+        pending = candidate_engine.state.state.pending_news_request
+        control_pending = control_engine.state.state.pending_news_request
+        returned = copy.deepcopy(first)
+        returned["roundNo"] = 2
+        returned["llmResp"] = response_for(
+            pending, location=(2, 2), window=(2, 20), items=["StarSand"],
+        )
+        control = copy.deepcopy(control_first)
+        control["roundNo"] = 2
+        control["llmResp"] = json.dumps({
+            "requestId": control_pending.request_id, "candidates": [],
+        })
+        traces = []
+
+        actual = candidate_engine.decide(returned, trace_sink=traces.append)
+        baseline = control_engine.decide(control)
+
+        self.assertEqual(actual["roleCommandMap"], baseline["roleCommandMap"])
+        self.assertEqual(actual["executeCmd"], baseline["executeCmd"])
+        summary = traces[-1]["treasureConditions"]["candidates"][0]
+        self.assertEqual(summary["route"]["status"], "feasible")
+        self.assertTrue(summary["route"]["returnWithMargin"])
+        self.assertFalse(summary["actionEnabled"])
+        self.assertEqual(summary["status"], "pending_validation")
+        self.assertEqual(
+            summary["procurement"]["routeScope"],
+            "missing_item_procurement",
+        )
+        self.assertFalse(summary["procurement"]["routeEvaluated"])
+        self.assertNotIn("StarSand", json.dumps(summary))
+        self.assertNotIn('"x"', json.dumps(summary))
 
     def test_window_does_not_slide_and_session_switch_drops_candidates(self):
         # Break caught: absolute rounds slide by day or prior-session candidates leak.

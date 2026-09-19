@@ -76,7 +76,312 @@ def state_for(payload):
     return store.state
 
 
+def purchase_payload(*, round_no=71, gold=200):
+    payload = emergency_payload(round_no=round_no, item="Bomb", holder_pos=(1, 1))
+    payload["teamOur"]["roles"][0]["backpack"] = []
+    payload["teamOur"]["goldNum"] = gold
+    payload["mapInfo"]["zones"] = [{
+        "pos": {"x": 1, "y": 2}, "neutralType": "weaponShop",
+    }] + [
+        {"pos": {"x": x, "y": y}, "neutralType": "blocked"}
+        for x in (5, 6, 7) for y in (5, 6, 7) if (x, y) != (6, 6)
+    ]
+    payload["weaponShopList"] = [
+        {"name": "Bomb", "price": 100},
+        {"name": "DizzyWeapon", "price": 100},
+    ]
+    return payload
+
+
 class HeldEmergencyTests(unittest.TestCase):
+    def test_real_engine_buys_one_bomb_for_urgent_kill(self):
+        payload = purchase_payload()
+        traces = []
+
+        response = DecisionEngine().decide(payload, trace_sink=traces.append)
+
+        purchases = [
+            command for command in response["roleCommandMap"].values()
+            if command["action"] == "buy"
+            and command.get("name") in ("Bomb", "DizzyWeapon")
+        ]
+        self.assertEqual(purchases, [{"action": "buy", "name": "Bomb", "num": 1}])
+        self.assertEqual(response["roleCommandMap"]["10010"], purchases[0])
+        self.assertFalse(any(
+            command["action"] == "use"
+            and command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in response["roleCommandMap"].values()
+        ))
+        purchase_trace = next(
+            action for action in traces[-1]["actions"]
+            if action["reason"] == "emergency"
+        )
+        self.assertEqual(purchase_trace["emergency"], {
+            "kind": "emergencyPurchase", "item": "Bomb", "price": 100,
+            "affectedUrgent": 1, "killedUrgent": 1,
+        })
+
+    def test_purchase_uses_only_arrived_inventory_and_never_rebuys_that_night(self):
+        engine = DecisionEngine()
+        first = purchase_payload()
+        self.assertEqual(
+            engine.decide(first)["roleCommandMap"]["10010"],
+            {"action": "buy", "name": "Bomb", "num": 1},
+        )
+        arrived = purchase_payload(round_no=72)
+        arrived["teamOur"]["roles"][0]["backpack"] = ["Bomb"]
+        arrived["teamOur"]["goldNum"] = 100
+        arrived["lastRoundRoleActionResults"] = {"10010": True}
+        self.assertEqual(
+            engine.decide(arrived)["roleCommandMap"]["10010"],
+            {"action": "use", "name": "Bomb", "targetPos": [{"x": 8, "y": 7}]},
+        )
+        consumed = purchase_payload(round_no=73)
+        consumed["teamOur"]["goldNum"] = 100
+        consumed["lastRoundRoleActionResults"] = {"10010": True}
+        response = engine.decide(consumed)
+        self.assertFalse(any(
+            command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_failed_or_missing_delivery_does_not_use_or_repeat_purchase(self):
+        for feedback in (False, True):
+            with self.subTest(feedback=feedback):
+                engine = DecisionEngine()
+                engine.decide(purchase_payload())
+                missing = purchase_payload(round_no=72)
+                missing["lastRoundRoleActionResults"] = {"10010": feedback}
+                response = engine.decide(missing)
+                self.assertFalse(any(
+                    command.get("name") in ("Bomb", "DizzyWeapon")
+                    for command in response["roleCommandMap"].values()
+                ))
+
+    def test_purchase_falls_back_to_dizzy_only_when_bomb_cannot_kill(self):
+        payload = purchase_payload()
+        payload["robot"]["roles"][0]["health"] = 101
+
+        self.assertEqual(
+            DecisionEngine().decide(payload)["roleCommandMap"]["10010"],
+            {"action": "buy", "name": "DizzyWeapon", "num": 1},
+        )
+
+    def test_purchase_requires_current_threat_shop_capacity_and_price(self):
+        cases = []
+        day = purchase_payload(round_no=1)
+        cases.append(("day", day))
+        last_night_round = purchase_payload(round_no=130)
+        cases.append(("last_night_round", last_night_round))
+        far = purchase_payload()
+        far["robot"]["roles"][0]["pos"] = {"x": 1, "y": 20}
+        cases.append(("far", far))
+        enemy = purchase_payload()
+        enemy["robot"]["roles"][0]["targetTeam"] = "defender"
+        cases.append(("enemy", enemy))
+        dizzy = purchase_payload()
+        dizzy["robot"]["roles"][0]["abnormalState"] = "dizzy"
+        cases.append(("dizzy", dizzy))
+        no_base = purchase_payload()
+        no_base["teamOur"]["roles"] = [
+            role for role in no_base["teamOur"]["roles"]
+            if role["roleType"] != "station"
+        ]
+        cases.append(("no_base", no_base))
+        missing_shop = purchase_payload()
+        missing_shop["mapInfo"]["zones"] = [
+            zone for zone in missing_shop["mapInfo"]["zones"]
+            if zone["neutralType"] != "weaponShop"
+        ]
+        cases.append(("missing_shop", missing_shop))
+        distant_shop = purchase_payload()
+        distant_shop["mapInfo"]["zones"][0]["pos"] = {"x": 1, "y": 3}
+        cases.append(("distant_shop", distant_shop))
+        full = purchase_payload()
+        full["teamOur"]["roles"][0]["backPackCapability"] = 0
+        cases.append(("full", full))
+        no_listing = purchase_payload()
+        no_listing["weaponShopList"] = []
+        cases.append(("no_listing", no_listing))
+        no_funds = purchase_payload(gold=99)
+        cases.append(("no_funds", no_funds))
+        held = purchase_payload()
+        held["teamOur"]["roles"][1]["backpack"] = ["Bomb"]
+        cases.append(("held", held))
+        for label, payload in cases:
+            with self.subTest(label=label):
+                response = DecisionEngine().decide(payload)
+                self.assertFalse(any(
+                    command["action"] == "buy"
+                    and command.get("name") in ("Bomb", "DizzyWeapon")
+                    for command in response["roleCommandMap"].values()
+                ))
+
+    def test_purchase_does_not_displace_gunner_return_or_task_owner(self):
+        returning = purchase_payload()
+        returning["mapInfo"]["zones"] = returning["mapInfo"]["zones"][:1]
+        response = DecisionEngine().decide(returning)
+        self.assertEqual(response["roleCommandMap"]["10010"]["action"], "move")
+
+        task = purchase_payload()
+        task["teamOur"]["roles"][0]["pos"] = {"x": 12, "y": 5}
+        task["teamOur"]["roles"][2]["pos"] = {"x": 1, "y": 1}
+        task["phaseTask"] = "solve active task"
+        response = DecisionEngine().decide(task)
+        self.assertFalse(any(
+            command["action"] == "buy"
+            and command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_purchase_preserves_missing_tower_funds(self):
+        payload = purchase_payload(gold=124)
+        payload["teamOur"]["roles"] = [
+            role for role in payload["teamOur"]["roles"]
+            if role["roleType"] != "gatling"
+        ]
+        self.assertFalse(any(
+            command["action"] == "buy"
+            and command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in DecisionEngine().decide(payload)["roleCommandMap"].values()
+        ))
+        payload["teamOur"]["goldNum"] = 125
+        self.assertEqual(
+            DecisionEngine().decide(payload)["roleCommandMap"]["10010"],
+            {"action": "buy", "name": "Bomb", "num": 1},
+        )
+
+    def test_attack_self_care_and_deadline_prevent_procurement(self):
+        attack = purchase_payload()
+        next(
+            role for role in attack["teamOur"]["roles"]
+            if role["roleType"] == "railgun"
+        )["cooldown"] = 0
+        response = DecisionEngine().decide(attack)
+        self.assertTrue(any(
+            command["action"] == "attack"
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertFalse(any(
+            command["action"] == "buy"
+            and command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in response["roleCommandMap"].values()
+        ))
+
+        self_care = purchase_payload()
+        self_care["teamOur"]["roles"][0]["health"] = 20
+        self_care["teamOur"]["roles"][0]["backpack"] = ["Medicine"]
+        response = DecisionEngine().decide(self_care)
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "use", "name": "Medicine",
+        })
+
+        expired = DecisionEngine(clock=lambda: 10.0, budget_seconds=0.0)
+        self.assertFalse(any(
+            command["action"] == "buy"
+            and command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in expired.decide(purchase_payload())["roleCommandMap"].values()
+        ))
+
+    def test_two_eligible_buyers_choose_one_stably_and_replay_is_cached(self):
+        choices = []
+        for reverse in (False, True):
+            payload = purchase_payload()
+            payload["teamOur"]["roles"][1]["pos"] = {"x": 2, "y": 1}
+            payload["teamOur"]["roles"][2]["pos"] = {"x": 20, "y": 20}
+            payload["mapInfo"]["zones"].extend(
+                {"pos": {"x": x, "y": y}, "neutralType": "blocked"}
+                for cx, cy in ((9, 6), (12, 6))
+                for x in (cx - 1, cx, cx + 1)
+                for y in (cy - 1, cy, cy + 1)
+                if (x, y) != (cx, cy)
+            )
+            if reverse:
+                payload["teamOur"]["roles"].reverse()
+            engine = DecisionEngine()
+            response = engine.decide(payload)
+            self.assertEqual(engine.decide(copy.deepcopy(payload)), response)
+            purchases = [
+                (role_id, command)
+                for role_id, command in response["roleCommandMap"].items()
+                if command["action"] == "buy"
+                and command.get("name") in ("Bomb", "DizzyWeapon")
+            ]
+            self.assertEqual(len(purchases), 1)
+            choices.append(purchases[0])
+        self.assertEqual(choices[0], choices[1])
+        self.assertEqual(choices[0][0], "10010")
+
+    def test_purchase_limit_resets_only_for_a_new_night_or_session(self):
+        engine = DecisionEngine()
+        engine.decide(purchase_payload())
+        later = purchase_payload(round_no=73)
+        self.assertFalse(any(
+            command["action"] == "buy"
+            and command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in engine.decide(later)["roleCommandMap"].values()
+        ))
+        new_night = purchase_payload(round_no=201)
+        self.assertEqual(
+            engine.decide(new_night)["roleCommandMap"]["10010"]["name"],
+            "Bomb",
+        )
+        new_session = purchase_payload()
+        new_session["teamOur"]["teamId"] = "new-match"
+        self.assertEqual(
+            engine.decide(new_session)["roleCommandMap"]["10010"]["name"],
+            "Bomb",
+        )
+
+    def test_prior_medicine_purchase_preserves_gold_and_does_not_mark_emergency(self):
+        def with_medicine_buyer(payload):
+            buyer = payload["teamOur"]["roles"][1]
+            buyer["pos"] = {"x": 2, "y": 1}
+            buyer["health"] = 40
+            payload["weaponShopList"].append({"name": "Medicine", "price": 10})
+            payload["mapInfo"]["zones"].extend(
+                {"pos": {"x": x, "y": y}, "neutralType": "blocked"}
+                for x in (8, 9, 10) for y in (5, 6, 7)
+                if (x, y) != (9, 6)
+            )
+            return payload
+
+        engine = DecisionEngine()
+        first = with_medicine_buyer(purchase_payload(gold=100))
+        response = engine.decide(first)
+        self.assertEqual(response["roleCommandMap"]["10012"], {
+            "action": "buy", "name": "Medicine", "num": 1,
+        })
+        self.assertFalse(any(
+            command.get("name") in ("Bomb", "DizzyWeapon")
+            for command in response["roleCommandMap"].values()
+        ))
+        self.assertIsNone(engine.state.state.emergency_purchase_night)
+
+        funded = with_medicine_buyer(purchase_payload(round_no=72, gold=100))
+        funded["teamOur"]["roles"][1]["backpack"] = ["Medicine"]
+        funded["lastRoundRoleActionResults"] = {"10012": True}
+        response = engine.decide(funded)
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy", "name": "Bomb", "num": 1,
+        })
+        self.assertEqual(response["roleCommandMap"]["10012"], {
+            "action": "use", "name": "Medicine",
+        })
+
+    def test_arrived_bomb_is_not_forced_when_urgent_threat_has_disappeared(self):
+        engine = DecisionEngine()
+        engine.decide(purchase_payload())
+        cleared = purchase_payload(round_no=72, gold=100)
+        cleared["teamOur"]["roles"][0]["backpack"] = ["Bomb"]
+        cleared["robot"]["roles"] = []
+        cleared["lastRoundRoleActionResults"] = {"10010": True}
+        response = engine.decide(cleared)
+        self.assertFalse(any(
+            command.get("name") == "Bomb"
+            for command in response["roleCommandMap"].values()
+        ))
+
     def test_real_engine_uses_held_bomb_during_cooling_attack_gap(self):
         payload = emergency_payload()
         traces = []

@@ -1,11 +1,17 @@
 from collections import Counter
-from typing import Iterable
+from dataclasses import replace
+from typing import Callable, Iterable
 
+from .defense import DAY_WORK_RETURN_MARGIN
+from .grid import next_step
 from .intelligence import NewsCandidate, TreasureConditions
-from .protocol import PIONEER, Turn
+from .protocol import PIONEER, TOWER_TYPES, Pos, Turn, Unit, distance
 
 
 MAX_TREASURE_CANDIDATES = 32
+MAX_TREASURE_ROUTE_CANDIDATES = 4
+MAX_TREASURE_ROUTE_EXPANSIONS = 256
+TREASURE_ROUTE_SECONDS = 0.01
 
 
 def evaluate_treasure_candidates(
@@ -13,6 +19,11 @@ def evaluate_treasure_candidates(
     candidates: Iterable[NewsCandidate],
     *,
     session_index: int,
+    daytime_assignments: dict[
+        int, tuple[Unit, tuple[Pos, Pos | None, int]]
+    ] | None = None,
+    clock: Callable[[], float] | None = None,
+    deadline: float | None = None,
 ) -> tuple[dict, ...]:
     current = tuple(
         candidate for candidate in candidates
@@ -21,6 +32,14 @@ def evaluate_treasure_candidates(
     conflicting_indexes = _conflicting_candidate_indexes(
         current, session_index=session_index,
     )
+    route_budget = (
+        {
+            "remaining": MAX_TREASURE_ROUTE_EXPANSIONS,
+            "evaluated": 0,
+            "deadline": min(deadline, clock() + TREASURE_ROUTE_SECONDS),
+        }
+        if clock is not None and deadline is not None else None
+    )
     return tuple(
         _evaluate_candidate(
             turn,
@@ -28,6 +47,9 @@ def evaluate_treasure_candidates(
             candidate_index=index,
             session_index=session_index,
             alternatives=index in conflicting_indexes,
+            daytime_assignments=daytime_assignments,
+            clock=clock,
+            route_budget=route_budget,
         )
         for index, candidate in enumerate(current)
     )
@@ -40,6 +62,11 @@ def _evaluate_candidate(
     candidate_index: int,
     session_index: int,
     alternatives: bool,
+    daytime_assignments: dict[
+        int, tuple[Unit, tuple[Pos, Pos | None, int]]
+    ] | None,
+    clock: Callable[[], float] | None,
+    route_budget: dict | None,
 ) -> dict:
     reasons: list[str] = []
     result = {
@@ -52,6 +79,28 @@ def _evaluate_candidate(
         "timeStatus": "unknown",
         "missingItems": {},
         "pioneerId": None,
+        "route": {
+            "status": "not_evaluated",
+            "outboundMoveRounds": None,
+            "waitRounds": None,
+            "earliestActionRound": None,
+            "returnMoveRounds": None,
+            "returnWithMargin": "unknown",
+            "expansions": 0,
+        },
+        "procurement": {
+            "missingItemCount": None,
+            "missingCost": None,
+            "backpackFreeSlots": None,
+            "shopAvailable": "unknown",
+            "currentCashCoversMissingCost": "unknown",
+            "backpackFitsMissing": "unknown",
+            "routeScope": "missing_item_procurement",
+            "spendingBudgetEvaluated": False,
+            "routeEvaluated": False,
+            "returnWindowEvaluated": False,
+            "semanticValidationEvaluated": False,
+        },
     }
     conditions = candidate.treasure_conditions
     if conditions is None:
@@ -131,13 +180,203 @@ def _evaluate_candidate(
             )
             result["pioneerId"] = str(pioneer.unit_id)
             result["missingItems"] = dict(sorted(missing.items()))
+            procurement = result["procurement"]
+            missing_count = sum(missing.values())
+            procurement["missingItemCount"] = missing_count
+            procurement["shopAvailable"] = all(
+                item in turn.weapon_prices for item in missing
+            )
+            if procurement["shopAvailable"]:
+                cost = sum(
+                    count * turn.weapon_prices[item]
+                    for item, count in missing.items()
+                )
+                procurement["missingCost"] = cost
+                procurement["currentCashCoversMissingCost"] = turn.gold >= cost
+            if pioneer.capacity is not None:
+                free_slots = max(0, pioneer.capacity - len(pioneer.backpack))
+                procurement["backpackFreeSlots"] = free_slots
+                procurement["backpackFitsMissing"] = free_slots >= missing_count
             if missing:
                 reasons.append("missing_items")
         if turn.phase_task:
             reasons.append("active_task")
 
     result["localChecksPassed"] = not reasons
+    if route_budget is not None and clock is not None:
+        _assess_route(
+            turn, conditions, result, daytime_assignments, clock,
+            route_budget,
+        )
     return result
+
+
+def _assess_route(
+    turn: Turn,
+    conditions: TreasureConditions,
+    result: dict,
+    assignments: dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]] | None,
+    clock: Callable[[], float],
+    budget: dict,
+) -> None:
+    route = result["route"]
+    if not turn.is_day:
+        route["status"] = "night"
+        return
+    if result["procurement"]["missingItemCount"] not in (None, 0):
+        route["status"] = "procurement_route_not_evaluated"
+        return
+    if any(reason != "window_future" for reason in result["reasons"]):
+        route["status"] = "prerequisite_blocked"
+        return
+    if (
+        conditions.location is None or conditions.window is None
+        or conditions.items is None or result["pioneerId"] is None
+    ):
+        route["status"] = "prerequisite_blocked"
+        return
+    if budget["evaluated"] >= MAX_TREASURE_ROUTE_CANDIDATES:
+        route["status"] = "candidate_limit"
+        return
+    budget["evaluated"] += 1
+    if clock() >= budget["deadline"]:
+        route["status"] = "deadline"
+        return
+    pioneer = turn.unit(int(result["pioneerId"]))
+    if pioneer is None:
+        route["status"] = "prerequisite_blocked"
+        return
+    post = _assigned_post(turn, pioneer, assignments)
+    location = Pos(**conditions.location.value)
+    window = conditions.window.value
+    day_end = turn.round_no + turn.rounds_until_night - 1
+    blocked = turn.blocked(pioneer)
+    stands = sorted(
+        (
+            Pos(location.x + dx, location.y + dy)
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if dx or dy
+        ),
+        key=lambda stand: (distance(pioneer.pos, stand), stand.x, stand.y),
+    )
+    legal = [stand for stand in stands if turn.land(stand) and stand not in blocked]
+    if not legal:
+        route["status"] = "unreachable"
+        route["returnWithMargin"] = False if post is not None else "unknown"
+        return
+    first_failure = None
+    for stand in legal:
+        if clock() >= budget["deadline"]:
+            route["status"] = "deadline"
+            route["returnWithMargin"] = "unknown"
+            return
+        if budget["remaining"] <= 0:
+            route["status"] = "expansion_limit"
+            route["returnWithMargin"] = "unknown"
+            return
+        outward = next_step(
+            turn, pioneer, stand, clock=clock,
+            deadline=budget["deadline"],
+            max_expansions=budget["remaining"],
+        )
+        budget["remaining"] -= outward.expansions
+        route["expansions"] += outward.expansions
+        if outward.status in ("deadline", "expansion_limit"):
+            route["status"] = outward.status
+            route["returnWithMargin"] = "unknown"
+            return
+        if outward.status == "unreachable" or outward.cost is None:
+            continue
+        move_rounds = outward.cost
+        action_round = max(turn.round_no + move_rounds, window["startRound"])
+        attempt = {
+            "outboundMoveRounds": move_rounds,
+            "waitRounds": action_round - turn.round_no - move_rounds,
+            "earliestActionRound": action_round,
+            "returnMoveRounds": None,
+            "returnWithMargin": "unknown",
+        }
+        if action_round > window["endRound"] or action_round > day_end:
+            attempt.update(
+                status="candidate_window_missed",
+                returnWithMargin=False if post is not None else "unknown",
+            )
+            if first_failure is None:
+                first_failure = attempt
+            continue
+        if post is None:
+            route.update(attempt, status="return_post_unknown")
+            return
+        projected = replace(pioneer, pos=stand)
+        projected_turn = replace(
+            turn,
+            ours=tuple(
+                projected if role.unit_id == pioneer.unit_id else role
+                for role in turn.ours
+            ),
+        )
+        if clock() >= budget["deadline"]:
+            route["status"] = "deadline"
+            route["returnWithMargin"] = "unknown"
+            return
+        if budget["remaining"] <= 0:
+            route["status"] = "expansion_limit"
+            route["returnWithMargin"] = "unknown"
+            return
+        home = next_step(
+            projected_turn, projected, post, clock=clock,
+            deadline=budget["deadline"],
+            max_expansions=budget["remaining"],
+        )
+        budget["remaining"] -= home.expansions
+        route["expansions"] += home.expansions
+        if home.status in ("deadline", "expansion_limit"):
+            route["status"] = home.status
+            route["returnWithMargin"] = "unknown"
+            return
+        if home.status == "unreachable" or home.cost is None:
+            attempt.update(status="candidate_return_unreachable", returnWithMargin=False)
+            if first_failure is None:
+                first_failure = attempt
+            continue
+        attempt["returnMoveRounds"] = home.cost
+        timely = (
+            action_round - turn.round_no + 1 + home.cost
+            + DAY_WORK_RETURN_MARGIN <= turn.rounds_until_night
+        )
+        attempt["returnWithMargin"] = timely
+        attempt["status"] = "feasible" if timely else "candidate_return_too_late"
+        if timely:
+            route.update(attempt)
+            return
+        if first_failure is None:
+            first_failure = attempt
+    if first_failure is not None:
+        route.update(first_failure)
+    else:
+        route["status"] = "unreachable"
+        route["returnWithMargin"] = False if post is not None else "unknown"
+
+
+def _assigned_post(
+    turn: Turn,
+    pioneer: Unit,
+    assignments: dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]] | None,
+) -> Pos | None:
+    for weapon_id, (role, route) in sorted((assignments or {}).items()):
+        weapon = turn.unit(weapon_id)
+        stand = route[0]
+        if (
+            role.unit_id == pioneer.unit_id
+            and role.pos == pioneer.pos
+            and weapon is not None
+            and weapon.kind in TOWER_TYPES
+            and distance(stand, weapon.pos) == 1
+            and turn.land(stand)
+            and stand not in turn.blocked(pioneer)
+        ):
+            return stand
+    return None
 
 
 def _fields(conditions: TreasureConditions) -> tuple:
