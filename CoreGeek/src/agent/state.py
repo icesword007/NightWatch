@@ -68,6 +68,7 @@ class TaskMemory:
     pending_cmd_round: int | None = None
     tool_results: list[tuple[str, str]] = field(default_factory=list)
     consumed_tool_results: int = 0
+    tool_inputs_this_round: list[dict[str, int | str]] = field(default_factory=list)
     owner_id: int | None = None
     task_cells: tuple[Pos, ...] = ()
     accepted_round: int | None = None
@@ -138,6 +139,7 @@ class SessionState:
     task_sequence: int = 0
     plans: dict[int, PlanState] = field(default_factory=dict)
     procurement_blocked_days: dict[int, int] = field(default_factory=dict)
+    emergency_purchase_night: int | None = None
     pending_actions: dict[int, PendingAction] = field(default_factory=dict)
     action_history: list[CompletedAction] = field(default_factory=list)
     active_task: TaskMemory | None = None
@@ -717,6 +719,7 @@ class StateStore:
             )
 
         task = state.active_task
+        task.tool_inputs_this_round = []
         self._apply_tool_result(
             task,
             kind="llm",
@@ -882,6 +885,12 @@ class StateStore:
         pending_round = getattr(task, pending_attr)
         if accept_result and pending_round == round_no - 1:
             task.tool_results.append((kind, result))
+            task.tool_inputs_this_round.append({
+                "kind": kind,
+                "issuedRound": pending_round,
+                "receivedRound": round_no,
+                "originalChars": len(result),
+            })
             task.phase = "solving"
             if kind == "cmd":
                 task.last_accepted_cmd_result_round = round_no

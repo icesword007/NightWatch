@@ -1067,6 +1067,217 @@ class TaskTests(unittest.TestCase):
                     stopped_reason,
                 )
 
+    def test_format_correction_retains_tail_answer_from_long_invalid_envelope(self):
+        # Break caught: a missing-kind object with a long explanation loses its
+        # answer tail before the model gets its one format-only correction.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="synthetic task",
+        )
+        engine.decide(active)
+        invalid = copy.deepcopy(active)
+        invalid["roundNo"] = 2
+        invalid["llmResp"] = json.dumps({
+            "explanation": "x" * 5_000,
+            "content": "TAIL_ANSWER_41",
+        })
+
+        correction = engine.decide(invalid)
+
+        self.assertIn("TAIL_ANSWER_41", correction["prompt"])
+        self.assertIn("[TRUNCATED MIDDLE]", correction["prompt"])
+        self.assertNotIn("submitAnswer", str(correction["roleCommandMap"]))
+
+    def test_long_tool_result_marks_omitted_range_without_guessing_middle(self):
+        # Break caught: a bounded output hides its middle without telling the
+        # solver how much is unknown, encouraging a false negative inference.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="inspect API evidence",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"inspect"}'
+        engine.decide(command)
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = (
+            "[exitCode:0]\n" + "a" * 9_000 + "TOKEN_SYNTHETIC_MIDDLE"
+            + "z" * 9_000
+        )
+
+        prompt = engine.decide(result)["prompt"]
+
+        self.assertIn("[TRUNCATED MIDDLE]", prompt)
+        self.assertIn("omitted chars", prompt)
+        self.assertNotIn("TOKEN_SYNTHETIC_MIDDLE", prompt)
+        self.assertEqual(engine.state.state.active_task.tool_results[-1][1], result["lastCmdResult"])
+
+    def test_tool_input_trace_proves_current_task_request_association(self):
+        # Break caught: logs call an accepted prior prompt/command result
+        # unknown even though pending request state proves the association.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="API evidence task",
+        )
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = '{"kind":"command","content":"inspect-api"}'
+        traces = []
+        engine.decide(command, trace_sink=traces.append)
+        self.assertEqual(traces[-1]["taskToolInputs"], [{
+            "kind": "llm", "issuedRound": 1, "receivedRound": 2,
+            "originalChars": len(command["llmResp"]),
+        }])
+        server = importlib.import_module("agent.server")
+        llm_detail = server.task_detail_log_record(
+            command,
+            {"roleCommandMap": {}, "prompt": "", "executeCmd": "inspect-api"},
+            decision_trace=traces[-1],
+        )
+        self.assertEqual(
+            llm_detail["inputAssociation"]["llmResp"],
+            "accepted_current_task",
+        )
+
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:0]\nHTTP/1.1 404 Not Found"
+        engine.decide(result, trace_sink=traces.append)
+        self.assertEqual(traces[-1]["taskToolInputs"], [{
+            "kind": "cmd", "issuedRound": 2, "receivedRound": 3,
+            "originalChars": len(result["lastCmdResult"]),
+        }])
+        detail = server.task_detail_log_record(
+            result, {"roleCommandMap": {}, "prompt": "", "executeCmd": ""},
+            decision_trace=traces[-1],
+        )
+        self.assertEqual(
+            detail["inputAssociation"]["lastCmdResult"],
+            "accepted_current_task",
+        )
+        self.assertEqual(detail["acceptedToolInputs"], traces[-1]["taskToolInputs"])
+
+        replacement = copy.deepcopy(active)
+        replacement["roundNo"] = 4
+        replacement["phaseTask"] = "different task"
+        replacement["lastCmdResult"] = "late result"
+        engine.decide(replacement, trace_sink=traces.append)
+        self.assertEqual(traces[-1]["taskToolInputs"], [])
+        late_detail = server.task_detail_log_record(
+            replacement,
+            {"roleCommandMap": {}, "prompt": "", "executeCmd": ""},
+            decision_trace=traces[-1],
+        )
+        self.assertEqual(
+            late_detail["inputAssociation"]["lastCmdResult"],
+            "unknown_previous_request",
+        )
+
+    def test_crlf_failure_can_be_followed_by_model_repair_and_checked_answer(self):
+        # Characterization: no local shell rewrite or inferred success; only
+        # the model's revised command and later real check permit submission.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="repair script and report check",
+        )
+        engine.decide(active)
+        first = copy.deepcopy(active)
+        first["roundNo"] = 2
+        first["llmResp"] = json.dumps({
+            "kind": "command", "content": "./check.sh",
+        })
+        self.assertEqual(engine.decide(first)["executeCmd"], "./check.sh")
+        failed = copy.deepcopy(active)
+        failed["roundNo"] = 3
+        failed["lastCmdResult"] = (
+            "[exitCode:126]\n/bin/sh^M: bad interpreter"
+        )
+        prompt = engine.decide(failed)["prompt"]
+        self.assertIn("bad interpreter", prompt)
+        self.assertIn("./check.sh", prompt)
+        revised = copy.deepcopy(active)
+        revised["roundNo"] = 4
+        revised["llmResp"] = json.dumps({
+            "kind": "command", "content": "python3 check.py",
+        })
+        self.assertEqual(engine.decide(revised)["executeCmd"], "python3 check.py")
+        checked = copy.deepcopy(active)
+        checked["roundNo"] = 5
+        checked["lastCmdResult"] = "[exitCode:0]\nCHECK PASS synthetic"
+        self.assertIn("CHECK PASS synthetic", engine.decide(checked)["prompt"])
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 6
+        answer["llmResp"] = json.dumps({
+            "kind": "answer", "content": "check passed", "complete": True,
+        })
+        self.assertEqual(
+            engine.decide(answer)["roleCommandMap"]["10011"],
+            {"action": "submitAnswer", "taskAnswer": "check passed"},
+        )
+
+    def test_api_404_does_not_become_success_or_block_revised_request(self):
+        # Characterization: exit 0 only completes the process; a different
+        # model request can follow HTTP 404, and abandon stays available.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="inspect API and answer",
+        )
+        engine.decide(active)
+        first = copy.deepcopy(active)
+        first["roundNo"] = 2
+        first["llmResp"] = json.dumps({
+            "kind": "command", "content": "curl -i /documented",
+        })
+        self.assertEqual(engine.decide(first)["executeCmd"], "curl -i /documented")
+        failed = copy.deepcopy(active)
+        failed["roundNo"] = 3
+        failed["lastCmdResult"] = "[exitCode:0]\nHTTP/1.1 404 Not Found"
+        prompt = engine.decide(failed)["prompt"]
+        self.assertIn("HTTP/1.1 404", prompt)
+        self.assertIn("tool process completed with exit code 0", prompt)
+        second = copy.deepcopy(active)
+        second["roundNo"] = 4
+        second["llmResp"] = json.dumps({
+            "kind": "command", "content": "curl -i /observed",
+        })
+        self.assertEqual(engine.decide(second)["executeCmd"], "curl -i /observed")
+        later = copy.deepcopy(active)
+        later["roundNo"] = 5
+        later["lastCmdResult"] = "[exitCode:0]\nHTTP/1.1 404 Not Found"
+        self.assertIn("HTTP/1.1 404", engine.decide(later)["prompt"])
+        abandon = copy.deepcopy(active)
+        abandon["roundNo"] = 6
+        abandon["llmResp"] = json.dumps({
+            "kind": "abandon", "reason": "No verified answer",
+        })
+        response = engine.decide(abandon)
+        self.assertEqual(response["executeCmd"], "")
+        self.assertFalse(any(
+            command.get("action") == "submitAnswer"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_valid_answer_with_placeholder_word_keeps_strict_submit_path(self):
+        # Break caught: a global keyword veto rejects an otherwise legal
+        # answer merely because the task's literal output contains this word.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="report the literal label",
+        )
+        engine.decide(active)
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 2
+        answer["llmResp"] = json.dumps({
+            "kind": "answer", "content": "placeholder is the label",
+            "complete": True,
+        })
+        self.assertEqual(engine.decide(answer)["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "placeholder is the label",
+        })
+
     def test_format_correction_uses_last_round_but_not_elapsed_deadline(self):
         # Break caught: a fixed two-round guard discards a legal last-round submit,
         # or a correction prompt is emitted when no response can arrive in time.

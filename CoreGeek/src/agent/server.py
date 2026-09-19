@@ -11,7 +11,7 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s2-integrated-r6"
+BUILD_ID = "nightwatch-s2-integrated-r7"
 MAX_TASK_DETAIL_CHARS = 131_072
 MAX_NEWS_DETAIL_CHARS = 4_096
 MAX_LOG_ITEMS = 16
@@ -57,6 +57,14 @@ def task_detail_log_record(
         })
     trace = decision_trace if isinstance(decision_trace, dict) else {}
     task_instance_id = trace.get("taskInstanceId")
+    tool_inputs = trace.get("taskToolInputs")
+    accepted_tool_inputs = [
+        value for value in tool_inputs[:2]
+        if isinstance(value, dict)
+        and value.get("kind") in ("llm", "cmd")
+        and value.get("receivedRound") == payload.get("roundNo")
+    ] if isinstance(tool_inputs, list) and task_instance_id is not None else []
+    accepted_kinds = {value["kind"] for value in accepted_tool_inputs}
     news = trace.get("newsInterpretation")
     news = news if isinstance(news, dict) else {}
     news_events = news.get("events")
@@ -121,8 +129,14 @@ def task_detail_log_record(
                 and bool(payload.get("phaseTask"))
                 else "unknown"
             ),
-            "llmResp": "unknown_previous_request",
-            "lastCmdResult": "unknown_previous_request",
+            "llmResp": (
+                "accepted_current_task" if "llm" in accepted_kinds
+                else "unknown_previous_request"
+            ),
+            "lastCmdResult": (
+                "accepted_current_task" if "cmd" in accepted_kinds
+                else "unknown_previous_request"
+            ),
             "prompt": (
                 "current_active_task"
                 if task_instance_id is not None else "unknown"
@@ -144,6 +158,7 @@ def task_detail_log_record(
             "executeCmd": "response_current",
             "submittedAnswers": "response_current",
         },
+        "acceptedToolInputs": accepted_tool_inputs,
         "text": {
             name: _detail_text(value) for name, value in raw_text.items()
         },

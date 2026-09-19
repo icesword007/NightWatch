@@ -17,7 +17,7 @@ from .defense import (
     task_pioneer_day_return_action,
     task_pioneer_recall_action,
 )
-from .emergency import propose_held_emergency
+from .emergency import propose_emergency_purchase, propose_held_emergency
 from .defense_pressure import pressure_diagnostic
 from .economy import (
     daytime_liquidation_actions,
@@ -30,6 +30,7 @@ from .layout import ensure_defense_layout
 from .protocol import (
     ROUNDS_PER_DAY,
     TOWER_TYPES,
+    WEAPON_BUILD_COST,
     Pos,
     Turn,
     Unit,
@@ -407,6 +408,23 @@ class DecisionEngine:
                     )
             if urgent_recall is not None:
                 defense_candidates = (urgent_recall, *defense_candidates)
+            emergency_purchase = propose_emergency_purchase(
+                turn,
+                state,
+                defense_actions=defense_candidates,
+                unavailable_role_ids=(
+                    task_role_ids
+                    | funding_roles
+                    | frozenset(
+                        candidate.proposal.actor_id
+                        for candidate in (*critical_economy, *task_turn.actions)
+                    )
+                    | protected_gunners(turn, night_cleared=night_cleared)
+                ),
+                reserved_weapon_ids=funding_posts,
+                clock=self.clock,
+                deadline=deadline,
+            )
             defense_first = (
                 not turn.is_day
                 or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
@@ -424,6 +442,7 @@ class DecisionEngine:
                 ("defense", defense_candidates),
                 ("tasks", task_turn.actions),
                 ("economy", deferred_ordinary),
+                ("emergency", (emergency_purchase,) if emergency_purchase else ()),
             )
             if not defense_first and not unsafe_day_work_ids:
                 domains = (
@@ -471,6 +490,13 @@ class DecisionEngine:
                         and not self._is_immediate_held_investment(candidate)
                     ):
                         rejected_economy.add(id(candidate))
+                        continue
+                    if (
+                        domain == "emergency"
+                        and allocator.gold_remaining
+                        - candidate.proposal.gold_cost
+                        < WEAPON_BUILD_COST * max(0, 3 - len(turn.weapons()))
+                    ):
                         continue
                     if allocator.try_add(candidate.proposal):
                         accepted.append((domain, candidate))
@@ -538,9 +564,16 @@ class DecisionEngine:
                 task_start_skip_reason=task_turn.start_skip_reason,
                 session_boundary=observation.boundary,
                 night_clearance_status=clearance_status,
+                treasure_assignments=copy.deepcopy(daytime_assignments),
+                treasure_clock=self.clock,
+                treasure_deadline=deadline,
             )
             self.state.record_response(turn, fingerprint, last_valid, trace)
-            for _, candidate in accepted:
+            for domain, candidate in accepted:
+                if domain == "emergency":
+                    state.emergency_purchase_night = (
+                        turn.round_no - 1
+                    ) // ROUNDS_PER_DAY
                 actor_id = candidate.proposal.actor_id
                 if (
                     candidate.plan_target is not None
@@ -692,6 +725,9 @@ class DecisionEngine:
         task_start_skip_reason: str | None = None,
         session_boundary: str | None = None,
         night_clearance_status: str | None = None,
+        treasure_assignments: dict | None = None,
+        treasure_clock: Callable[[], float] | None = None,
+        treasure_deadline: float | None = None,
     ) -> dict[str, Any]:
         task = state.active_task if state is not None else None
         remaining = None
@@ -763,7 +799,9 @@ class DecisionEngine:
                 "deadlineRound": candidate.deadline_round,
             }
             if candidate.diagnostic is not None:
-                if candidate.diagnostic.get("kind") == "heldEmergency":
+                if candidate.diagnostic.get("kind") in (
+                    "heldEmergency", "emergencyPurchase",
+                ):
                     action["emergency"] = copy.deepcopy(candidate.diagnostic)
                 else:
                     action["economy"] = copy.deepcopy(candidate.diagnostic)
@@ -771,6 +809,10 @@ class DecisionEngine:
         trace = {
             "roundNo": turn.round_no,
             "taskInstanceId": task_instance_id,
+            "taskToolInputs": (
+                copy.deepcopy(task.tool_inputs_this_round)
+                if task is not None else []
+            ),
             "taskRemainingRounds": remaining,
             "solverState": solver_state,
             "solverReason": solver_reason,
@@ -881,6 +923,9 @@ class DecisionEngine:
                 turn,
                 tuple(state.news_candidates),
                 session_index=state.session_index,
+                daytime_assignments=treasure_assignments,
+                clock=treasure_clock,
+                deadline=treasure_deadline,
             )
             if state is not None else ()
         )
