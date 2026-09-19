@@ -396,3 +396,19 @@ T56本批本地验收通过，可隔离提交；构建nightwatch-s2-procurement-
 用户明确要求版本提交远端并更新issue12。主会话获准将已验收0f7ffde快进main，统一构建nightwatch-s2-integrated-r5，完整验证后提交推送，并先保存远端原文再全量刷新#12。本条覆盖T56历史隔离不合并/推送限制；不扩大策略开发，不重启Sol，不清理旧树/缓存，不关闭缺陷或自动开局。
 
 R207主干验证：509/509含16HTTP通过21.297秒，diff/cached diff/bash-n通过。与已验收0f7ffde相比策略源码及经济测试无差异，仅server/test_server统一r5标识；已快进无冲突。固定#12以R207完整SHA为准，平台收益待验。
+
+
+## R208 任务收尾格式纠正开发授权
+
+本批继续使用`/Users/icesword/Documents/Project/CCN-Comp/code/NightWatch-s2-day-work`与`codex/s2-day-work`，基准`365c8ccdcaa67f4e73df3cc7c79ac9c5398418fb`；按外层`design/【codex】s2-task-envelope-recovery-plan.md`实施T57，构建标识`nightwatch-s2-task-envelope-r1`。`main`正在r5内网验证，全部其他工作树只读。
+
+仅为非法LLM信封增加一次明确、有界的格式纠正机会；纠正结果仍须通过既有严格parser，合法answer沿原deferred/allocator/submitAnswer链提交，合法abandon沿原终止链，纠正期间禁止command。剩余1轮仍保留下一轮合法answer同轮提交机会，剩余0停止；未知截止仍只允许本次纠正。不得提取或猜测答案、接受裸JSON、扩大任务截止/命令预算或改变正常command、P2重复失败保护。
+
+开发不commit/merge/push/reset/切分支/删除/新目录依赖/派生Agent，不修改issue #12或启动对战；交付R209后停止，等待主会话R210独立验收。
+
+
+## R210 T57本地独立验收
+
+原Sol+medium交付回合01a0b753-5f51-7cc3-b6e9-00108871aab9已completed/idle，cursor143。主会话独立516/516含16HTTP通过21.094秒，diff/cached diff/bash-n通过。首次516项全绿后独立审查发现format-only与允许command的提示矛盾，已交原Sol关闭；再次独立核对纠正提示周期0/无command示例，普通prompt与365c8cc逐字一致，剩1回合纠正后截止当轮原样提交、重放一致。其他边界只读复验未发现确定阻断。
+
+T57本批本地验收通过，可隔离提交，构建nightwatch-s2-task-envelope-r1。只证明一次格式纠正及合法提交链可用，不保证模型遵守纠正或全部answer_error/abandoned已修。main365c8cc/r5及issue #12保持内网验证，不自动合并推送或继续新开发，旧树/缓存保留。

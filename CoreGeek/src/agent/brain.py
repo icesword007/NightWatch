@@ -691,6 +691,9 @@ class DecisionEngine:
         entry_read_attempted = False
         final_only_correction_requested = False
         repeated_command_correction_requested = False
+        envelope_correction_requested = False
+        envelope_correction_pending = False
+        envelope_rejection_class = None
         consecutive_nonzero_failures = 0
         if task is not None:
             task_instance_id = task.instance_id
@@ -734,6 +737,9 @@ class DecisionEngine:
             repeated_command_correction_requested = (
                 task.repeated_command_correction_requested
             )
+            envelope_correction_requested = task.envelope_correction_requested
+            envelope_correction_pending = task.envelope_correction_pending
+            envelope_rejection_class = task.last_envelope_rejection
             consecutive_nonzero_failures = task.consecutive_nonzero_count
         actions = []
         for domain, candidate in accepted:
@@ -774,6 +780,9 @@ class DecisionEngine:
             "taskRepeatedCommandCorrectionRequested": (
                 repeated_command_correction_requested
             ),
+            "taskEnvelopeCorrectionRequested": envelope_correction_requested,
+            "taskEnvelopeCorrectionPending": envelope_correction_pending,
+            "taskEnvelopeRejectionClass": envelope_rejection_class,
             "taskConsecutiveNonzeroFailures": consecutive_nonzero_failures,
             "coordinationReason": coordination_reason,
             "taskStartSkipReason": task_start_skip_reason,

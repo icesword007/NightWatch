@@ -6,6 +6,8 @@
 
 R195报告的连续约3秒经济规划、检查通过未提交及统计矛盾仍需原局补证，本批不声称已修。执行仓库【codex】s2-integrated-r5-intranet-prompt.md及#12当次范围，不自动补场。
 
+隔离树另有本地候选`nightwatch-s2-task-envelope-r1`：严格parser不变；当前任务首次收到非法LLM外层且至少还剩1轮时，只提供一次格式纠正，要求模型把已有可靠答案原样放入合法`kind=answer`、字符串`content`和布尔`complete`外层，或合法abandon。纠正prompt统一标明command禁用、剩余工具周期0，并移除command示例和探索指导；第二个非法外层有界终止，合法answer仍走原deferred/allocator/submitAnswer链。该候选尚未合入或送测，固定issue #12仍执行r5，不得据此改变当前内网批次或宣称所有`answer_error`/`abandoned`已解决。
+
 
 ## 0. 当前增量与反馈规范
 

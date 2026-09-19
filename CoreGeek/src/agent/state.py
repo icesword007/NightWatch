@@ -97,6 +97,9 @@ class TaskMemory:
     entry_read_attempted: bool = False
     final_answer_requested: bool = False
     final_only_correction_requested: bool = False
+    envelope_correction_requested: bool = False
+    envelope_correction_pending: bool = False
+    last_envelope_rejection: str | None = None
     coordination_final_requested: bool = False
     coordination_deadline_round: int | None = None
     abandon_move_attempted: bool = False

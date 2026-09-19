@@ -934,7 +934,7 @@ class TaskTests(unittest.TestCase):
         invalid = copy.deepcopy(active)
         invalid["roundNo"] = 2
         invalid["llmResp"] = oversized
-        self.assertIn("violated the JSON envelope", engine.decide(invalid)["prompt"])
+        self.assertIn("one format-only correction", engine.decide(invalid)["prompt"])
         valid = copy.deepcopy(active)
         valid["roundNo"] = 3
         valid["llmResp"] = (
@@ -942,6 +942,296 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(engine.decide(valid)["roleCommandMap"]["10011"], {
             "action": "submitAnswer", "taskAnswer": "42",
+        })
+
+    def test_missing_kind_gets_one_format_correction_then_submits_json_answer(self):
+        # Break caught: a likely answer object receives only generic JSON advice,
+        # then repetition protection ends the task before a legal answer can submit.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="synthetic task",
+        )
+        normal_prompt = engine.decide(active)["prompt"]
+        self.assertIn("Command exploration is allowed.", normal_prompt)
+        self.assertIn("Maximum remaining tool cycles: 4", normal_prompt)
+        self.assertIn('{"kind":"command"', normal_prompt)
+
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = (
+            '{"kind":"command","content":"inspect-input"}'
+        )
+        self.assertEqual(engine.decide(command)["executeCmd"], "inspect-input")
+        result = copy.deepcopy(active)
+        result["roundNo"] = 3
+        result["lastCmdResult"] = "[exitCode:0]\nsynthetic verified evidence"
+        self.assertTrue(engine.decide(result)["prompt"])
+
+        invalid = copy.deepcopy(active)
+        invalid["roundNo"] = 4
+        invalid["llmResp"] = '{"result":"synthetic-value"}'
+        traces = []
+        correction = engine.decide(invalid, trace_sink=traces.append)
+
+        self.assertEqual(correction["executeCmd"], "")
+        self.assertNotIn("10011", correction["roleCommandMap"])
+        self.assertIn("one format-only correction", correction["prompt"])
+        self.assertIn('"kind":"answer"', correction["prompt"])
+        self.assertIn("content must be a JSON string", correction["prompt"])
+        self.assertNotIn("Command exploration is allowed.", correction["prompt"])
+        self.assertIn(
+            "Command exploration is not allowed", correction["prompt"],
+        )
+        self.assertIn("Maximum remaining tool cycles: 0", correction["prompt"])
+        self.assertNotIn('{"kind":"command"', correction["prompt"])
+        self.assertNotIn("One command request consumes", correction["prompt"])
+        task = engine.state.state.active_task
+        self.assertTrue(task.envelope_correction_requested)
+        self.assertTrue(task.envelope_correction_pending)
+        self.assertEqual(task.last_envelope_rejection, "missing_kind")
+        self.assertTrue(traces[-1]["taskEnvelopeCorrectionRequested"])
+        self.assertTrue(traces[-1]["taskEnvelopeCorrectionPending"])
+        self.assertEqual(
+            traces[-1]["taskEnvelopeRejectionClass"], "missing_kind",
+        )
+
+        answer_text = '{"result":"synthetic-value"}'
+        corrected = copy.deepcopy(active)
+        corrected["roundNo"] = 5
+        corrected["llmResp"] = json.dumps({
+            "kind": "answer",
+            "content": answer_text,
+            "complete": True,
+        })
+        submitted = engine.decide(corrected)
+
+        self.assertEqual(submitted["executeCmd"], "")
+        self.assertEqual(submitted["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": answer_text,
+        })
+        self.assertFalse(task.envelope_correction_pending)
+
+        finished = copy.deepcopy(active)
+        finished["roundNo"] = 6
+        finished["phaseTask"] = ""
+        finished["lastRoundRoleActionResults"] = {"10011": True}
+        first_finish = engine.decide(finished)
+        replay_finish = engine.decide(copy.deepcopy(finished))
+        self.assertFalse(any(
+            command.get("action") == "submitAnswer"
+            for command in first_finish["roleCommandMap"].values()
+        ))
+        self.assertEqual(replay_finish, first_finish)
+
+    def test_format_correction_rejects_command_and_any_second_invalid_envelope(self):
+        # Break caught: format correction can be converted into another command,
+        # or changing an invalid response fingerprint opens an unbounded prompt loop.
+        for followup, stopped_reason in (
+            (
+                '{"kind":"command","content":"echo unsafe"}',
+                "command_after_envelope_correction",
+            ),
+            (
+                '{"kind":"unknown","content":"changed"}',
+                "invalid_envelope_after_correction",
+            ),
+            (
+                '{"kind":"answer","content":7,"complete":true}',
+                "invalid_envelope_after_correction",
+            ),
+        ):
+            with self.subTest(followup=followup):
+                engine = DecisionEngine()
+                active = task_payload(
+                    round_no=1, pioneer_pos=(3, 3), phase_task="synthetic task",
+                )
+                engine.decide(active)
+                invalid = copy.deepcopy(active)
+                invalid["roundNo"] = 2
+                invalid["llmResp"] = '{"answer":"synthetic"}'
+                self.assertTrue(engine.decide(invalid)["prompt"])
+
+                repeated = copy.deepcopy(active)
+                repeated["roundNo"] = 3
+                repeated["llmResp"] = followup
+                response = engine.decide(repeated)
+
+                self.assertEqual(response["executeCmd"], "")
+                self.assertEqual(response["prompt"], "")
+                self.assertFalse(any(
+                    command.get("action") == "submitAnswer"
+                    for command in response["roleCommandMap"].values()
+                ))
+                self.assertEqual(
+                    engine.state.state.active_task.solver_stopped_reason,
+                    stopped_reason,
+                )
+
+    def test_format_correction_uses_last_round_but_not_elapsed_deadline(self):
+        # Break caught: a fixed two-round guard discards a legal last-round submit,
+        # or a correction prompt is emitted when no response can arrive in time.
+        for remaining in (0, 1, 2):
+            with self.subTest(remaining=remaining):
+                engine = DecisionEngine()
+                active = task_payload(
+                    round_no=1, pioneer_pos=(3, 3), phase_task="synthetic task",
+                )
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.timeout_round = 2 + remaining
+                invalid = copy.deepcopy(active)
+                invalid["roundNo"] = 2
+                invalid["llmResp"] = '{"answer":"synthetic"}'
+
+                correction = engine.decide(invalid)
+
+                if remaining == 0:
+                    self.assertEqual(correction["prompt"], "")
+                    self.assertFalse(task.envelope_correction_requested)
+                    self.assertEqual(
+                        task.solver_stopped_reason, "deadline_without_answer",
+                    )
+                    continue
+                self.assertIn("one format-only correction", correction["prompt"])
+                answer = copy.deepcopy(active)
+                answer["roundNo"] = 3
+                answer["llmResp"] = (
+                    '{"kind":"answer","content":"supported",'
+                    '"complete":false}'
+                )
+                submitted = engine.decide(answer)
+                self.assertEqual(submitted["roleCommandMap"]["10011"], {
+                    "action": "submitAnswer", "taskAnswer": "supported",
+                })
+
+    def test_format_correction_accepts_abandon_and_resets_on_task_replacement(self):
+        # Break caught: correction state leaks across task instances or blocks the
+        # existing explicit abandon outcome.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="first task",
+        )
+        engine.decide(active)
+        invalid = copy.deepcopy(active)
+        invalid["roundNo"] = 2
+        invalid["llmResp"] = '{"answer":"synthetic"}'
+        engine.decide(invalid)
+
+        abandon = copy.deepcopy(active)
+        abandon["roundNo"] = 3
+        abandon["llmResp"] = (
+            '{"kind":"abandon","reason":"insufficient evidence"}'
+        )
+        response = engine.decide(abandon)
+        self.assertEqual(response["executeCmd"], "")
+        self.assertEqual(
+            engine.state.state.active_task.solver_stopped_reason,
+            "solver_abandoned",
+        )
+
+        replacement = copy.deepcopy(active)
+        replacement["roundNo"] = 4
+        replacement["phaseTask"] = "second task"
+        replacement["llmResp"] = ""
+        replaced = engine.decide(replacement)
+        task = engine.state.state.active_task
+        self.assertTrue(replaced["prompt"])
+        self.assertFalse(task.envelope_correction_requested)
+        self.assertFalse(task.envelope_correction_pending)
+        self.assertIsNone(task.last_envelope_rejection)
+
+    def test_late_invalid_envelope_is_not_misassociated_with_current_task_prompt(self):
+        # Break caught: a response arriving later than the existing next-round
+        # association consumes the one correction chance for the current prompt.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="synthetic task",
+        )
+        engine.decide(active)
+        late = copy.deepcopy(active)
+        late["roundNo"] = 3
+        late["llmResp"] = '{"answer":"late synthetic"}'
+
+        response = engine.decide(late)
+
+        task = engine.state.state.active_task
+        self.assertTrue(response["prompt"])
+        self.assertNotIn("one format-only correction", response["prompt"])
+        self.assertFalse(task.envelope_correction_requested)
+        self.assertEqual(engine.state.state.late_tool_results, 1)
+
+    def test_coordination_last_round_allows_corrected_answer_submission(self):
+        # Break caught: the coordination return deadline is either extended by
+        # correction or treated as requiring two remaining rounds.
+        engine = DecisionEngine()
+        active = self._third_post_payload(59)
+        engine.decide(active)
+        task = engine.state.state.active_task
+        self.assertEqual(task.coordination_deadline_round, 62)
+        invalid = self._third_post_payload(60)
+        invalid["llmResp"] = '{"answer":"synthetic"}'
+
+        correction = engine.decide(invalid)
+
+        self.assertIn("Known remaining task rounds: 2", correction["prompt"])
+        self.assertEqual(task.coordination_deadline_round, 62)
+        answer = self._third_post_payload(61)
+        answer["llmResp"] = (
+            '{"kind":"answer","content":"supported",'
+            '"complete":true}'
+        )
+        submitted = engine.decide(answer)
+        self.assertEqual(submitted["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "supported",
+        })
+
+    def test_corrected_answer_deferred_by_combat_retries_without_second_llm_call(self):
+        # Break caught: allocator rejection loses a corrected answer or prompts the
+        # model again instead of retrying the existing deferred submission.
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=71, pioneer_pos=(3, 3), phase_task="synthetic task",
+        )
+        active["teamOur"]["roles"].append(
+            unit(10020, "gatling", 3, 2, health=1000)
+        )
+        active["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 3, "y": 5},
+            "roleType": "smallRobot",
+            "health": 40,
+            "abnormalState": "",
+            "targetTeam": "challenger",
+        }]
+        engine.decide(active)
+        invalid = copy.deepcopy(active)
+        invalid["roundNo"] = 72
+        invalid["lastRoundRoleActionResults"] = {"10020": True}
+        invalid["llmResp"] = '{"answer":"synthetic"}'
+        self.assertTrue(engine.decide(invalid)["prompt"])
+
+        corrected = copy.deepcopy(active)
+        corrected["roundNo"] = 73
+        corrected["lastRoundRoleActionResults"] = {"10020": True}
+        corrected["llmResp"] = (
+            '{"kind":"answer","content":"supported",'
+            '"complete":true}'
+        )
+        blocked = engine.decide(corrected)
+        self.assertEqual(blocked["roleCommandMap"]["10020"]["action"], "attack")
+        self.assertNotIn("10011", blocked["roleCommandMap"])
+        self.assertEqual(
+            engine.state.state.active_task.deferred_answer, "supported",
+        )
+
+        safe = copy.deepcopy(active)
+        safe["roundNo"] = 74
+        safe["robot"]["roles"] = []
+        safe["lastRoundRoleActionResults"] = {"10020": True}
+        retried = engine.decide(safe)
+        self.assertEqual(retried["prompt"], "")
+        self.assertEqual(retried["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "supported",
         })
 
     def test_real_engine_runs_accept_prompt_command_result_answer_chain(self):
@@ -1048,6 +1338,7 @@ class TaskTests(unittest.TestCase):
             round_no=1, pioneer_pos=(3, 3), phase_task="use the specification",
         )
         engine.decide(active)
+        engine.state.state.active_task.timeout_round = 100
 
         command = copy.deepcopy(active)
         command["roundNo"] = 2
@@ -1075,11 +1366,19 @@ class TaskTests(unittest.TestCase):
                 f"[exitCode:0]\nlater evidence {index}"
             )
             prompt = engine.decide(later_result)["prompt"]
-        for round_no in range(10, 15):
-            invalid = copy.deepcopy(active)
-            invalid["roundNo"] = round_no
-            invalid["llmResp"] = f"invalid-response-{round_no}"
-            prompt = engine.decide(invalid)["prompt"]
+        for index in range(5):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 10 + index * 2
+            command["llmResp"] = json.dumps({
+                "kind": "command", "content": f"evict-history-{index}",
+            })
+            engine.decide(command)
+            later_result = copy.deepcopy(active)
+            later_result["roundNo"] = 11 + index * 2
+            later_result["lastCmdResult"] = (
+                f"[exitCode:0]\neviction evidence {index}"
+            )
+            prompt = engine.decide(later_result)["prompt"]
 
         self.assertIn("Verified constraint: output must be decimal.", prompt)
         self.assertLessEqual(
@@ -1430,11 +1729,17 @@ class TaskTests(unittest.TestCase):
             result["lastCmdResult"] = f"[exitCode:1]\nfailed-result-{index}"
             prompt = engine.decide(result)["prompt"]
 
+        tasks = importlib.import_module("agent.tasks")
+        task_memory = engine.state.state.active_task
         for index in range(9):
-            invalid = copy.deepcopy(active)
-            invalid["roundNo"] = 8 + index
-            invalid["llmResp"] = f"invalid-response-{index}"
-            prompt = engine.decide(invalid)["prompt"]
+            tasks._remember(
+                task_memory,
+                f"History filler {index}",
+                "x" * 1_000,
+            )
+        prompt = tasks._solver_prompt(
+            Turn.load(active), task_memory, "continue from retained evidence",
+        )
 
         self.assertIn("Recent failed or incomplete command observations", prompt)
         self.assertNotIn("failed-command-0", prompt)
@@ -1447,7 +1752,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(engine.state.state.active_task.environment_paths, ())
 
         replacement = copy.deepcopy(active)
-        replacement["roundNo"] = 17
+        replacement["roundNo"] = 8
         replacement["phaseTask"] = "replacement task"
         replacement["llmResp"] = ""
         prompt = engine.decide(replacement)["prompt"]
@@ -1831,17 +2136,12 @@ class TaskTests(unittest.TestCase):
         active["roundNo"] = 2
         active["phaseTask"] = "active task"
         active["lastRoundRoleActionResults"] = {"10011": True}
-        engine.decide(active)
-
-        retry = copy.deepcopy(active)
-        retry["roundNo"] = 3
-        retry["llmResp"] = "invalid-response"
-        prompt = engine.decide(retry)["prompt"]
-        self.assertIn("Known remaining task rounds: 4", prompt)
+        prompt = engine.decide(active)["prompt"]
+        self.assertIn("Known remaining task rounds: 5", prompt)
         self.assertIn("Command exploration is allowed", prompt)
 
         in_flight = copy.deepcopy(active)
-        in_flight["roundNo"] = 4
+        in_flight["roundNo"] = 3
         in_flight["llmResp"] = (
             '{"kind":"command","content":"final-evidence-read"}'
         )
@@ -2154,11 +2454,21 @@ class TaskTests(unittest.TestCase):
             round_no=1, pioneer_pos=(3, 3), phase_task="active task",
         )
         engine.decide(active)
-        for round_no in range(2, 12):
-            repeated = copy.deepcopy(active)
-            repeated["roundNo"] = round_no
-            repeated["llmResp"] = f"invalid-{round_no}-" + "x" * 5_000
-            engine.decide(repeated)
+        engine.state.state.active_task.timeout_round = 100
+        for index in range(10):
+            command = copy.deepcopy(active)
+            command["roundNo"] = 2 + index * 2
+            command["llmResp"] = json.dumps({
+                "kind": "command",
+                "content": f"history-{index}-" + "x" * 1_000,
+            })
+            engine.decide(command)
+            result = copy.deepcopy(active)
+            result["roundNo"] = 3 + index * 2
+            result["lastCmdResult"] = (
+                f"[exitCode:0]\nhistory-result-{index}-" + "y" * 5_000
+            )
+            engine.decide(result)
 
         task = engine.state.state.active_task
         self.assertLessEqual(len(task.solver_history), tasks.MAX_SOLVER_EVENTS)
@@ -2847,19 +3157,18 @@ class TaskTests(unittest.TestCase):
         )
         self.assertTrue(engine.decide(payload)["prompt"])
 
-        for round_no in (2, 3):
-            repeated = copy.deepcopy(payload)
-            repeated["roundNo"] = round_no
-            self.assertTrue(engine.decide(repeated)["prompt"])
+        correction = copy.deepcopy(payload)
+        correction["roundNo"] = 2
+        self.assertTrue(engine.decide(correction)["prompt"])
 
         stopped = copy.deepcopy(payload)
-        stopped["roundNo"] = 4
+        stopped["roundNo"] = 3
         response = engine.decide(stopped)
         self.assertEqual(response["prompt"], "")
         self.assertEqual(response["executeCmd"], "")
         self.assertEqual(response["roleCommandMap"]["10011"]["action"], "move")
 
-        for round_no in range(5, 9):
+        for round_no in range(4, 9):
             still_stopped = copy.deepcopy(payload)
             still_stopped["roundNo"] = round_no
             response = engine.decide(still_stopped)
