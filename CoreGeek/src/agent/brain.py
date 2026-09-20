@@ -21,7 +21,10 @@ from .emergency import propose_emergency_purchase, propose_held_emergency
 from .defense_pressure import pressure_diagnostic
 from .economy import (
     daytime_liquidation_actions,
+    prepare_base_reserve,
+    propose_base_upgrade,
     propose_economy,
+    reserve_purchase_candidate,
     wall_build_positions,
 )
 from .fortification import fortification_diagnostic, prepare_fortification
@@ -29,7 +32,6 @@ from .intelligence import MAX_NEWS_CALLS_PER_DAY, MAX_NEWS_CANDIDATES
 from .layout import ensure_defense_layout
 from .protocol import (
     ROUNDS_PER_DAY,
-    TOWER_TYPES,
     WEAPON_BUILD_COST,
     Pos,
     Turn,
@@ -38,7 +40,7 @@ from .protocol import (
     move_command,
 )
 from .pressure_shadow import observe_shadow, shadow_diagnostic
-from .state import MAX_HISTORY_FACTS, StateStore, request_fingerprint
+from .state import BaseReserve, MAX_HISTORY_FACTS, StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
 from .treasure import MAX_TREASURE_CANDIDATES, evaluate_treasure_candidates
 
@@ -112,10 +114,15 @@ class DecisionEngine:
                         state.plans.pop(role_id)
             ensure_defense_layout(turn, state)
             task_role_ids = self._active_task_role_ids(turn, state)
+            prepare_base_reserve(
+                turn, state, task_role_ids, self.clock, deadline,
+                self.max_search_expansions,
+            )
             task_pioneer = next((
                 turn.unit(role_id) for role_id in task_role_ids
             ), None)
             economy_diagnostics = []
+            defense_planning = []
             economy_deadline = min(
                 deadline,
                 started + self.budget_seconds * ECONOMY_BUDGET_FRACTION,
@@ -138,6 +145,7 @@ class DecisionEngine:
                     deadline=fortification_deadline,
                     max_expansions=self.max_search_expansions,
                     unavailable_role_ids=unavailable_for_defense,
+                    diagnostic_sink=defense_planning.append,
                 )
                 if turn.is_day else None
             )
@@ -167,6 +175,9 @@ class DecisionEngine:
                 night_cleared=night_cleared,
                 diagnostic_sink=economy_diagnostics.append,
             )
+            economy_candidates = reserve_purchase_candidate(
+                turn, state, economy_candidates, task_role_ids,
+            )
             if economy_diagnostics:
                 economy_diagnostics[0]["fortification"] = (
                     fortification_diagnostic(turn, state)
@@ -184,9 +195,6 @@ class DecisionEngine:
                     candidate for candidate in ordinary_economy
                     if (candidate.plan_reason or "").startswith("build:rocket")
                 ) if turn.is_day else (),
-                state,
-                turn,
-                include_existing=turn.is_day,
             )
             daytime_assignments = (
                 preliminary_assignments
@@ -196,6 +204,7 @@ class DecisionEngine:
                     max_expansions=self.max_search_expansions,
                     unavailable_role_ids=unavailable_for_defense | funding_roles,
                     reserved_weapon_ids=funding_posts,
+                    diagnostic_sink=defense_planning.append,
                 )
                 if turn.is_day else None
             )
@@ -371,6 +380,21 @@ class DecisionEngine:
             )
             if emergency is not None:
                 defense_candidates = (emergency, *defense_candidates)
+            base_upgrade = propose_base_upgrade(
+                turn, state,
+                unavailable_role_ids=task_role_ids | funding_roles,
+                protected_role_ids=protected_gunners(
+                    turn, night_cleared=night_cleared,
+                ),
+                clock=self.clock, deadline=deadline,
+                max_expansions=self.max_search_expansions,
+            )
+            if base_upgrade is not None:
+                defense_candidates = (
+                    (emergency, base_upgrade, *defense_candidates[1:])
+                    if emergency is not None
+                    else (base_upgrade, *defense_candidates)
+                )
             task_turn = propose_tasks(
                 turn,
                 state,
@@ -599,6 +623,62 @@ class DecisionEngine:
                 (time.perf_counter() - shadow_started) * 1000, 3,
             )
             trace["pressureShadow"] = shadow_trace
+            reserve = state.base_reserve
+            preparing = next((
+                candidate for _, candidate in accepted
+                if isinstance(candidate.diagnostic, dict)
+                and candidate.diagnostic.get("kind") == "baseReserve"
+                and candidate.diagnostic.get("phase") == "preparing"
+            ), None)
+            base_accepted = any(
+                candidate is base_upgrade for _, candidate in accepted
+            )
+            trace["baseUpgrade"] = {
+                "phase": (
+                    "held" if reserve is not None and turn.unit(reserve.holder_id)
+                    and reserve.item in turn.unit(reserve.holder_id).backpack
+                    else "preparing" if reserve is not None or preparing is not None
+                    else "idle"
+                ),
+                "holderId": (
+                    str(reserve.holder_id) if reserve else
+                    str(preparing.proposal.actor_id) if preparing else None
+                ),
+                "stationId": (
+                    str(reserve.station_id) if reserve else
+                    preparing.diagnostic.get("stationId") if preparing else None
+                ),
+                "recentDrops": list(state.base_recent_drops),
+                "event": state.base_reserve_event,
+                "reason": (
+                    "allocator_conflict"
+                    if base_upgrade is not None and not base_accepted
+                    else state.base_reserve_reason
+                ),
+                "action": (
+                    base_upgrade.diagnostic if base_upgrade is not None else None
+                ),
+                "accepted": base_accepted,
+            }
+            post_planning = defense_planning[-1] if defense_planning else None
+            trace["defensePlanning"] = {
+                "postStatus": (
+                    post_planning["status"] if post_planning else "night"
+                ),
+                "assignedPosts": post_planning["assigned"] if post_planning else 0,
+                "requiredPosts": post_planning["required"] if post_planning else 0,
+                "routeResults": (
+                    post_planning["routeResults"] if post_planning else {}
+                ),
+                "fundingReservedRoles": len(funding_roles),
+                "fundingReservedPosts": len(funding_posts),
+                "unsafeDayWork": len(unsafe_day_work_ids),
+                "returnCandidates": sum(
+                    candidate.proposal.command.get("action") == "move"
+                    and (candidate.plan_reason or "").startswith("gunner:")
+                    for candidate in defense_candidates
+                ),
+            }
             self.state.record_response(turn, fingerprint, last_valid, trace)
             for domain, candidate in accepted:
                 if domain == "emergency":
@@ -606,6 +686,18 @@ class DecisionEngine:
                         turn.round_no - 1
                     ) // ROUNDS_PER_DAY
                 actor_id = candidate.proposal.actor_id
+                if (
+                    isinstance(candidate.diagnostic, dict)
+                    and candidate.diagnostic.get("kind") == "baseReserve"
+                    and candidate.diagnostic.get("phase") == "preparing"
+                ):
+                    station = turn.station()
+                    if station is not None:
+                        state.base_reserve = BaseReserve(
+                            actor_id, station.unit_id, station.level,
+                            f"StationUpgradeVoucher{station.level}",
+                        )
+                        state.base_reserve_event = "preparing"
                 if (
                     candidate.plan_target is not None
                     and candidate.plan_reason is not None
@@ -686,21 +778,9 @@ class DecisionEngine:
     @staticmethod
     def _funding_reservations(
         candidates: tuple[Any, ...],
-        state: Any,
-        turn: Turn,
-        *,
-        include_existing: bool = True,
     ) -> tuple[frozenset[int], frozenset[int]]:
         roles: set[int] = set()
         weapons: set[int] = set()
-        tower_roles = {
-            candidate.proposal.actor_id for candidate in candidates
-            if isinstance(candidate.plan_reason, str)
-            and candidate.plan_reason.startswith((
-                "build:rocket", "fund:build:rocket",
-            ))
-        }
-        tower_pending = bool(tower_roles)
         for candidate in candidates:
             reason = candidate.plan_reason
             if not isinstance(reason, str) or reason.startswith("fund:build:"):
@@ -715,32 +795,6 @@ class DecisionEngine:
             if weapon_id <= 0:
                 continue
             roles.add(candidate.proposal.actor_id)
-            weapons.add(weapon_id)
-        for role_id, plan in state.plans.items() if include_existing else ():
-            if (
-                tower_pending
-                or not plan.reason.startswith(("fund:", "batch:"))
-                or plan.reason.startswith("fund:build:")
-            ):
-                continue
-            parts = plan.reason.split(":")
-            if len(parts) < 3:
-                continue
-            try:
-                weapon_id = int(parts[2])
-            except ValueError:
-                continue
-            if weapon_id <= 0:
-                continue
-            role = turn.unit(role_id)
-            weapon = turn.unit(weapon_id)
-            if (
-                role is None
-                or weapon is None
-                or weapon.kind not in TOWER_TYPES
-            ):
-                continue
-            roles.add(role_id)
             weapons.add(weapon_id)
         return frozenset(roles), frozenset(weapons)
 

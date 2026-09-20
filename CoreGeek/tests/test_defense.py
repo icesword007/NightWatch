@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import json
 import unittest
 from pathlib import Path
@@ -90,6 +91,48 @@ def proposals(payload):
 
 
 class DefenseTests(unittest.TestCase):
+    def test_post_assignment_diagnostic_distinguishes_budget_partial_and_deadline(self):
+        self.assertIn(
+            "diagnostic_sink", inspect.signature(daytime_post_assignments).parameters,
+        )
+        payload = defense_payload(round_no=60)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 5, 5),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+            unit(10030, "railgun", 12, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = []
+        turn = Turn.load(payload)
+
+        empty_payload = json.loads(json.dumps(payload))
+        empty_payload["teamOur"]["roles"][0]["pos"] = {"x": 1, "y": 1}
+        empty_trace = []
+        empty = daytime_post_assignments(
+            Turn.load(empty_payload), state_for(empty_payload),
+            clock=lambda: 0, deadline=1,
+            max_expansions=0, diagnostic_sink=empty_trace.append,
+        )
+        self.assertEqual(empty, {})
+        self.assertEqual(empty_trace[0]["status"], "empty")
+        self.assertGreater(empty_trace[0]["routeResults"]["expansion_limit"], 0)
+
+        partial_trace = []
+        partial = daytime_post_assignments(
+            turn, state_for(payload), clock=lambda: 0, deadline=1,
+            max_expansions=256, diagnostic_sink=partial_trace.append,
+        )
+        self.assertEqual(len(partial), 1)
+        self.assertEqual(partial_trace[0]["status"], "partial")
+
+        deadline_trace = []
+        self.assertIsNone(daytime_post_assignments(
+            turn, state_for(payload), clock=lambda: 10, deadline=1,
+            max_expansions=256, diagnostic_sink=deadline_trace.append,
+        ))
+        self.assertEqual(deadline_trace[0]["status"], "deadline")
+        self.assertEqual(deadline_trace[0]["required"], 2)
+
     def test_mixed_inventory_requires_every_sale_before_return(self):
         payload = defense_payload(round_no=67)
         worker = unit(10010, "worker", 5, 5)
@@ -595,6 +638,87 @@ class DefenseTests(unittest.TestCase):
             },
             {10010, 10012},
         )
+
+    def test_unactionable_funding_plan_does_not_hold_worker_through_dusk(self):
+        # A stale fund plan cannot reserve the only worker and tower for 11 idle rounds.
+        payload = defense_payload(round_no=60)
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 18, 18),
+            unit(10013, "station", 8, 9, health=1500),
+            unit(10020, "gatling", 6, 6, health=1000),
+        ]
+        payload["robot"]["roles"] = []
+        payload["weaponShopList"] = []
+        payload["mapInfo"]["zones"] = []
+        engine = DecisionEngine()
+        engine.state.observe(
+            Turn.load(payload), payload, request_fingerprint(payload),
+        )
+        engine.state.set_plan(
+            10010, Pos(8, 9),
+            "fund:StationUpgradeVoucher1:10020:10013", 70,
+        )
+
+        rounds_with_no_return = []
+        first_trace = []
+        for round_no in range(60, 73):
+            payload["roundNo"] = round_no
+            if round_no >= 71:
+                payload["robot"]["roles"] = [
+                    robot(30001, "smallRobot", 2, 10, 30),
+                ]
+            if round_no > 60:
+                payload["lastRoundRoleActionResults"] = {"10010": True}
+            trace = []
+            command = engine.decide(
+                payload, trace_sink=trace.append,
+            )["roleCommandMap"].get("10010")
+            if round_no == 60:
+                first_trace = trace
+            position = payload["teamOur"]["roles"][0]["pos"]
+            if max(abs(position["x"] - 6), abs(position["y"] - 6)) > 1:
+                if command is None or command.get("action") != "move":
+                    rounds_with_no_return.append(round_no)
+            if command is not None and command.get("action") == "move":
+                payload["teamOur"]["roles"][0]["pos"] = command["targetPos"][0]
+        self.assertEqual(rounds_with_no_return, [])
+        self.assertIn("defensePlanning", first_trace[0])
+        self.assertEqual(first_trace[0]["defensePlanning"]["fundingReservedRoles"], 0)
+        self.assertEqual(first_trace[0]["defensePlanning"]["postStatus"], "complete")
+        self.assertGreaterEqual(
+            first_trace[0]["defensePlanning"]["returnCandidates"], 1,
+        )
+
+    def test_long_open_return_starts_before_night_and_arrives(self):
+        payload = defense_payload(round_no=281)
+        payload["mapInfo"].update({
+            "width": 41, "height": 32,
+            "zones": [{"pos": {"x": 34, "y": 14}, "neutralType": "copper"}],
+        })
+        payload["teamOur"]["roles"] = [
+            unit(10010, "worker", 33, 14),
+            unit(10013, "station", 9, 22, health=1500),
+            unit(10020, "gatling", 8, 19, health=1000),
+        ]
+        payload["robot"]["roles"] = []
+        payload["weaponShopList"] = []
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        engine = DecisionEngine()
+        first_return_round = None
+        for round_no in range(281, 332):
+            payload["roundNo"] = round_no
+            if round_no > 281:
+                payload["lastRoundRoleActionResults"] = {"10010": True}
+            command = engine.decide(payload)["roleCommandMap"].get("10010")
+            if command is not None and command.get("action") == "move":
+                if first_return_round is None:
+                    first_return_round = round_no
+                payload["teamOur"]["roles"][0]["pos"] = command["targetPos"][0]
+        position = payload["teamOur"]["roles"][0]["pos"]
+        self.assertIsNotNone(first_return_round)
+        self.assertLess(first_return_round, 331)
+        self.assertLessEqual(max(abs(position["x"] - 8),
+                                 abs(position["y"] - 19)), 1)
 
     def test_route_cost_can_start_recall_before_fixed_dusk_window(self):
         # Break caught: the fixed 12-round gate hides a 28-step return route.
