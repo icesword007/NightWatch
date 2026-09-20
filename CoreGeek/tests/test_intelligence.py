@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from agent import intelligence
+from agent import server as server_module
 from agent.brain import DecisionEngine
 from agent.protocol import Turn
 from agent.state import MAX_NEWS_DAY_RECORDS, StateStore, request_fingerprint
@@ -94,6 +95,87 @@ def task_payload(round_no=1, *, phase=""):
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_news_rejection_detail_identifies_first_invalid_candidate(self):
+        # Break caught: one malformed candidate hides which field rejected the batch.
+        store = StateStore()
+        first = payload(team_id="intelligence-rejection-detail")
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        good = treasure_candidate(request, conditions={
+            "location": None, "window": None, "items": None,
+        })
+        cases = [
+            ({"type": "treasure", "private-key": "secret"}, "candidate", "invalid_shape"),
+            ({**good, "type": "private-type"}, "type", "invalid_type"),
+            ({**good, "interpretation": ""}, "interpretation", "invalid_text"),
+            ({**good, "missingConditions": ["", "secret"]},
+             "missingConditions", "invalid_list"),
+            ({**good, "citations": [{"sourceId": "private-source", "excerpt": "secret"}]},
+             "citations", "unknown_source"),
+            ({**good, "citations": [{"sourceId": source.source_id, "excerpt": "private-secret"}]},
+             "citations", "excerpt_mismatch"),
+            ({**good, "treasureConditions": {"location": {"value": {"x": "secret", "y": 1},
+                "citations": cited(source, {"x": 1, "y": 1})["citations"]},
+                "window": None, "items": None}},
+             "treasureConditions.location", "invalid_value"),
+            ({**good, "treasureConditions": {"location": None, "window": None,
+                "items": cited(source, ["", "secret"])}},
+             "treasureConditions.items", "invalid_value"),
+            ({**good, "treasureConditions": {"location": None,
+                "window": cited(source, {"startRound": 30, "endRound": 20}), "items": None}},
+             "treasureConditions.window", "out_of_range"),
+            ({**good, "treasureConditions": {"location": None,
+                "window": {**cited(source, {"startRound": 2, "endRound": 20}),
+                    "derivation": {"kind": "derived", "explanation": "secret",
+                        "unresolved": [], "timeBasis": "private-basis"}}, "items": None}},
+             "treasureConditions.window.derivation.timeBasis", "invalid_time_basis"),
+            ({**good, "treasureConditions": {"location": None,
+                "window": {**cited(source, {"startRound": 2, "endRound": 20}),
+                    "derivation": {"kind": "private-kind", "explanation": "secret",
+                        "unresolved": [], "timeBasis": "absolute_rounds"}}, "items": None}},
+             "treasureConditions.window.derivation.kind", "invalid_kind"),
+        ]
+        for bad, field, code in cases:
+            with self.subTest(field=field, code=code):
+                result = intelligence.parse_news_response(
+                    request, valid_response(request, candidates=[good, bad]),
+                )
+                self.assertEqual(result.rejection_reason, "invalid_candidate")
+                self.assertEqual(result.rejection_detail, {
+                    "candidateIndex": 1, "field": field, "code": code,
+                })
+                self.assertEqual(result.candidates, ())
+                self.assertNotIn("secret", json.dumps(result.rejection_detail))
+
+    def test_news_rejection_detail_reaches_next_round_news_log(self):
+        # Break caught: parser detail disappears before the existing news log.
+        engine = DecisionEngine()
+        first = payload(team_id="intelligence-rejection-log")
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        returned = copy.deepcopy(first)
+        returned["roundNo"] = 2
+        returned["llmResp"] = valid_response(pending, candidates=[{
+            **treasure_candidate(pending),
+            "treasureConditions": {"location": None,
+                "window": cited(pending.sources[0], {"startRound": 9, "endRound": 2}),
+                "items": None},
+        }])
+        traces = []
+        engine.decide(returned, trace_sink=traces.append)
+        event = traces[-1]["newsInterpretation"]["events"][0]
+        record = server_module.news_detail_log_record(
+            returned, decision_trace=traces[-1],
+        )
+        expected = {"candidateIndex": 0, "field": "treasureConditions.window",
+                    "code": "out_of_range"}
+        self.assertEqual(event["reason"], "invalid_candidate")
+        self.assertEqual(event["rejectionDetail"], expected)
+        self.assertEqual(record["events"][0]["rejectionDetail"], expected)
+        self.assertEqual(engine.state.state.news_candidates, [])
+
     def test_derivation_audit_deduplicates_source_text_without_verifying_claims(self):
         store = StateStore()
         first = payload(team_id="intelligence-audit-same-text")

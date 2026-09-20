@@ -39,7 +39,9 @@ from .protocol import (
     distance,
     move_command,
 )
-from .pressure_shadow import observe_shadow, shadow_diagnostic
+from .pressure_shadow import (
+    historical_investment_assessment, observe_shadow, shadow_diagnostic,
+)
 from .state import BaseReserve, MAX_HISTORY_FACTS, StateStore, request_fingerprint
 from .tasks import TaskTurnProposal, propose_tasks
 from .treasure import MAX_TREASURE_CANDIDATES, evaluate_treasure_candidates
@@ -65,10 +67,12 @@ class DecisionEngine:
         clock: Callable[[], float] = time.monotonic,
         budget_seconds: float = 4.0,
         max_search_expansions: int = 256,
+        history_investment_enabled: bool = True,
     ) -> None:
         self.clock = clock
         self.budget_seconds = budget_seconds
         self.max_search_expansions = max_search_expansions
+        self.history_investment_enabled = history_investment_enabled
         self.state = StateStore()
         self._lock = threading.Lock()
 
@@ -615,7 +619,10 @@ class DecisionEngine:
                 treasure_allocation_context=allocation_context,
             )
             shadow_started = time.perf_counter()
-            observe_shadow(turn, state.pressure_shadow)
+            observe_shadow(
+                turn, state.pressure_shadow, task_role_ids,
+                collect_investment_history=self.history_investment_enabled,
+            )
             shadow_trace = shadow_diagnostic(state.pressure_shadow)
             shadow_trace["session"] = state.session_index
             shadow_trace["team"] = turn.team_type
@@ -623,6 +630,21 @@ class DecisionEngine:
                 (time.perf_counter() - shadow_started) * 1000, 3,
             )
             trace["pressureShadow"] = shadow_trace
+            if self.history_investment_enabled:
+                try:
+                    trace["historyInvestment"] = historical_investment_assessment(
+                        turn, state.pressure_shadow,
+                        self._history_base_candidate(
+                            economy_candidates, base_upgrade, accepted,
+                            allocation_context is not None,
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    trace["historyInvestment"] = {
+                        "status": "unknown",
+                        "unknowns": ["assessment_error"],
+                        "candidate": {"status": "not_evaluated"},
+                    }
             reserve = state.base_reserve
             preparing = next((
                 candidate for _, candidate in accepted
@@ -714,6 +736,68 @@ class DecisionEngine:
             return copy.deepcopy(last_valid)
         finally:
             self._lock.release()
+
+    @staticmethod
+    def _history_base_candidate(
+        candidates: tuple[Any, ...],
+        held_candidate: Any,
+        accepted: list[tuple[str, Any]],
+        final_allocation_valid: bool,
+    ) -> dict[str, Any]:
+        base_candidates = tuple(
+            candidate for candidate in (
+                *candidates,
+                *((held_candidate,) if held_candidate is not None else ()),
+            )
+            if "StationUpgradeVoucher" in (candidate.plan_reason or "")
+            or str(candidate.proposal.command.get("name", "")).startswith(
+                "StationUpgradeVoucher"
+            )
+        )
+        if not base_candidates:
+            return {"status": "not_evaluated", "route": "not_evaluated"}
+        accepted_actions = tuple(action for _, action in accepted)
+        candidate = next(
+            (action for action in base_candidates
+             if any(action is accepted_action for accepted_action in accepted_actions)),
+            base_candidates[0],
+        )
+        accepted_by_allocator = any(
+            candidate is accepted_action for accepted_action in accepted_actions
+        )
+        return {
+            "status": (
+                "allocator_accepted" if accepted_by_allocator
+                else "computed_not_accepted"
+            ),
+            "finalResponse": (
+                "selected" if accepted_by_allocator and final_allocation_valid
+                else "not_confirmed" if accepted_by_allocator
+                else "not_selected"
+            ),
+            "execution": "unconfirmed",
+            "item": next((
+                part for part in (candidate.plan_reason or "").split(":")
+                if part.startswith("StationUpgradeVoucher")
+            ), candidate.proposal.command.get("name")),
+            "actorId": str(candidate.proposal.actor_id),
+            "route": (
+                "evaluated" if candidate.estimated_rounds is not None
+                else "not_evaluated"
+            ),
+            "routeScope": (
+                "use_only" if candidate is held_candidate
+                else "procurement_batch" if (
+                    candidate.plan_reason or ""
+                ).startswith("batch:")
+                else "held_use_return" if (
+                    candidate.plan_reason or ""
+                ).startswith("use:")
+                else "purchase_use_return"
+            ) if candidate.estimated_rounds is not None else None,
+            "totalRounds": candidate.estimated_rounds,
+            "action": candidate.proposal.command.get("action"),
+        }
 
     @staticmethod
     def _is_immediate_held_investment(candidate: Any) -> bool:

@@ -93,6 +93,13 @@ class NewsCandidate:
 class ParseResult:
     candidates: tuple[NewsCandidate, ...] = ()
     rejection_reason: str | None = None
+    rejection_detail: dict[str, Any] | None = None
+
+
+class _CandidateReject(Exception):
+    def __init__(self, field: str, code: str) -> None:
+        self.field = field
+        self.code = code
 
 
 def source_id(session: int, category: str, fingerprint: str) -> str:
@@ -241,10 +248,18 @@ def parse_news_response(request: NewsRequest, raw: str) -> ParseResult:
         return ParseResult(rejection_reason="invalid_candidates")
     sources = {source.source_id: source for source in request.sources}
     candidates = []
-    for raw_candidate in raw_candidates:
-        candidate = _parse_candidate(request, sources, raw_candidate)
-        if candidate is None:
-            return ParseResult(rejection_reason="invalid_candidate")
+    for index, raw_candidate in enumerate(raw_candidates):
+        try:
+            candidate = _parse_candidate(request, sources, raw_candidate)
+        except _CandidateReject as error:
+            return ParseResult(
+                rejection_reason="invalid_candidate",
+                rejection_detail={
+                    "candidateIndex": index,
+                    "field": error.field,
+                    "code": error.code,
+                },
+            )
         candidates.append(candidate)
     return ParseResult(candidates=tuple(candidates))
 
@@ -253,35 +268,33 @@ def _parse_candidate(
     request: NewsRequest,
     sources: dict[str, NewsSource],
     raw: Any,
-) -> NewsCandidate | None:
+) -> NewsCandidate:
     base_keys = {
         "type", "interpretation", "citations", "missingConditions", "conflicts",
     }
     if not isinstance(raw, dict):
-        return None
+        raise _CandidateReject("candidate", "invalid_shape")
     kind = raw.get("type")
+    if kind not in ("news", "treasure"):
+        raise _CandidateReject("type", "invalid_type")
     allowed_keys = base_keys | ({"treasureConditions"} if kind == "treasure" else set())
     if set(raw) not in (base_keys, allowed_keys):
-        return None
+        raise _CandidateReject("candidate", "invalid_shape")
     interpretation = raw.get("interpretation")
-    if kind not in ("news", "treasure") or not _bounded_text(
-        interpretation, MAX_INTERPRETATION_CHARS,
-    ):
-        return None
-    citations = _parse_citations(raw.get("citations"), sources)
-    if citations is None:
-        return None
+    if not _bounded_text(interpretation, MAX_INTERPRETATION_CHARS):
+        raise _CandidateReject("interpretation", "invalid_text")
+    citations = _parse_citations(raw.get("citations"), sources, "citations")
     missing = _bounded_text_list(raw.get("missingConditions"))
     conflicts = _bounded_text_list(raw.get("conflicts"))
-    if missing is None or conflicts is None:
-        return None
+    if missing is None:
+        raise _CandidateReject("missingConditions", "invalid_list")
+    if conflicts is None:
+        raise _CandidateReject("conflicts", "invalid_list")
     treasure_conditions = None
     if "treasureConditions" in raw:
         treasure_conditions = _parse_treasure_conditions(
             raw.get("treasureConditions"), sources,
         )
-        if treasure_conditions is None:
-            return None
     cited_sources = [sources[citation.source_id] for citation in citations]
     return NewsCandidate(
         request_id=request.request_id,
@@ -305,19 +318,12 @@ def _parse_candidate(
 def _parse_treasure_conditions(
     raw: Any,
     sources: dict[str, NewsSource],
-) -> TreasureConditions | None:
+) -> TreasureConditions:
     if not isinstance(raw, dict) or set(raw) != {"location", "window", "items"}:
-        return None
+        raise _CandidateReject("treasureConditions", "invalid_shape")
     location = _parse_treasure_field(raw.get("location"), sources, "location")
     window = _parse_treasure_field(raw.get("window"), sources, "window")
     items = _parse_treasure_field(raw.get("items"), sources, "items")
-    if any(
-        raw.get(name) is not None and parsed is None
-        for name, parsed in (
-            ("location", location), ("window", window), ("items", items),
-        )
-    ):
-        return None
     return TreasureConditions(location=location, window=window, items=items)
 
 
@@ -328,28 +334,25 @@ def _parse_treasure_field(
 ) -> CitedTreasureValue | None:
     if raw is None:
         return None
+    field = f"treasureConditions.{kind}"
     if not isinstance(raw, dict) or set(raw) not in (
         {"value", "citations"}, {"value", "citations", "derivation"},
     ):
-        return None
-    citations = _parse_citations(raw.get("citations"), sources)
-    if citations is None:
-        return None
+        raise _CandidateReject(field, "invalid_shape")
+    citations = _parse_citations(raw.get("citations"), sources, f"{field}.citations")
     derivation = None
     if "derivation" in raw:
         derivation = _parse_derivation(raw["derivation"], kind)
-        if derivation is None:
-            return None
     value = raw.get("value")
     if kind == "location":
         if not _strict_int_object(value, ("x", "y")):
-            return None
+            raise _CandidateReject(field, "invalid_value")
         parsed_value: Any = {"x": value["x"], "y": value["y"]}
     elif kind == "window":
         if not _strict_int_object(value, ("startRound", "endRound")):
-            return None
+            raise _CandidateReject(field, "invalid_value")
         if not 1 <= value["startRound"] <= value["endRound"] <= 1300:
-            return None
+            raise _CandidateReject(field, "out_of_range")
         parsed_value = {
             "startRound": value["startRound"],
             "endRound": value["endRound"],
@@ -360,7 +363,7 @@ def _parse_treasure_field(
             or len(value) > MAX_TREASURE_ITEMS
             or not all(_bounded_text(item, MAX_TREASURE_ITEM_CHARS) for item in value)
         ):
-            return None
+            raise _CandidateReject(field, "invalid_value")
         parsed_value = tuple(value)
     cited_sources = [sources[citation.source_id] for citation in citations]
     return CitedTreasureValue(
@@ -373,51 +376,53 @@ def _parse_treasure_field(
     )
 
 
-def _parse_derivation(raw: Any, field_kind: str) -> TreasureDerivation | None:
+def _parse_derivation(raw: Any, field_kind: str) -> TreasureDerivation:
+    field = f"treasureConditions.{field_kind}.derivation"
     if not isinstance(raw, dict) or set(raw) != {
         "kind", "explanation", "unresolved", "timeBasis",
     }:
-        return None
-    if raw["kind"] not in ("direct", "derived", "unknown") or not _bounded_text(
-        raw["explanation"], MAX_CONDITION_CHARS,
-    ):
-        return None
+        raise _CandidateReject(field, "invalid_shape")
+    if raw["kind"] not in ("direct", "derived", "unknown"):
+        raise _CandidateReject(f"{field}.kind", "invalid_kind")
+    if not _bounded_text(raw["explanation"], MAX_CONDITION_CHARS):
+        raise _CandidateReject(f"{field}.explanation", "invalid_text")
     unresolved = _bounded_text_list(raw["unresolved"])
     if unresolved is None:
-        return None
+        raise _CandidateReject(f"{field}.unresolved", "invalid_list")
     basis = raw["timeBasis"]
     allowed = (
         ("absolute_rounds", "relative", "first_observed", "unknown")
         if field_kind == "window" else ("not_applicable",)
     )
     if basis not in allowed:
-        return None
+        raise _CandidateReject(f"{field}.timeBasis", "invalid_time_basis")
     return TreasureDerivation(raw["kind"], raw["explanation"], unresolved, basis)
 
 
 def _parse_citations(
     raw: Any,
     sources: dict[str, NewsSource],
-) -> tuple[NewsCitation, ...] | None:
+    field: str,
+) -> tuple[NewsCitation, ...]:
     if not isinstance(raw, list) or not raw or len(raw) > MAX_CITATIONS:
-        return None
+        raise _CandidateReject(field, "invalid_list")
     citations = []
     for raw_citation in raw:
         if not isinstance(raw_citation, dict) or set(raw_citation) != {
             "sourceId", "excerpt",
         }:
-            return None
+            raise _CandidateReject(field, "invalid_shape")
         raw_source_id = raw_citation.get("sourceId")
         if not isinstance(raw_source_id, str):
-            return None
+            raise _CandidateReject(field, "invalid_source_id")
         cited = sources.get(raw_source_id)
+        if cited is None:
+            raise _CandidateReject(field, "unknown_source")
         excerpt = raw_citation.get("excerpt")
-        if (
-            cited is None
-            or not _bounded_text(excerpt, MAX_CITATION_CHARS)
-            or excerpt not in cited.text
-        ):
-            return None
+        if not _bounded_text(excerpt, MAX_CITATION_CHARS):
+            raise _CandidateReject(field, "invalid_excerpt")
+        if excerpt not in cited.text:
+            raise _CandidateReject(field, "excerpt_mismatch")
         citations.append(NewsCitation(cited.source_id, excerpt))
     return tuple(citations)
 

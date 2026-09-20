@@ -1,9 +1,13 @@
 import unittest
 
+from agent.actions import ActionProposal, PlannedAction
 from agent.brain import DecisionEngine
-from agent.economy import propose_base_upgrade, propose_economy
-from agent.protocol import Turn
-from agent.state import BaseReserve, request_fingerprint
+from agent.economy import (
+    prepare_base_reserve, propose_base_upgrade, propose_economy,
+    reserve_purchase_candidate,
+)
+from agent.protocol import Pos, Turn
+from agent.state import BaseReserve, PlanState, request_fingerprint
 from test_economy import economy_payload, role, state_for
 
 
@@ -30,6 +34,156 @@ def seed_reserve(engine, payload):
 
 
 class BaseUpgradeTests(unittest.TestCase):
+    def test_day_damage_releases_only_the_station_reserve_plan(self):
+        payload = base_payload(
+            round_no=131, worker_pos=(8, 9), gold=0, health=300,
+            items=("StationUpgradeVoucher1",),
+        )
+        turn = Turn.load(payload)
+        for reason, should_keep in (
+            ("fund:StationUpgradeVoucher1:10020:10013", False),
+            ("mine:copper", True),
+            ("gunner:10020", True),
+        ):
+            with self.subTest(reason=reason):
+                state = state_for(payload)
+                state.base_reserve = BaseReserve(
+                    10010, 10013, 1, "StationUpgradeVoucher1",
+                )
+                state.plans[10010] = PlanState(
+                    10010, Pos(9, 9), reason, None, state.session_index,
+                )
+                prepare_base_reserve(
+                    turn, state, frozenset(), lambda: 0.0, 1.0, 256,
+                )
+                self.assertIsNone(state.base_reserve)
+                self.assertEqual(state.base_reserve_event, "day_damage_released")
+                self.assertEqual(10010 in state.plans, should_keep)
+
+        state = state_for(payload)
+        state.base_reserve = BaseReserve(
+            10010, 10013, 1, "StationUpgradeVoucher1",
+        )
+        prepare_base_reserve(
+            turn, state, frozenset((10010,)), lambda: 0.0, 1.0, 256,
+        )
+        self.assertIsNone(state.base_reserve)
+        self.assertEqual(state.base_reserve_event, "holder_task_reserved")
+
+    def test_held_reserve_crosses_night_then_releases_only_if_day_base_damaged(self):
+        for health, expect_use in ((1500, False), (300, True)):
+            with self.subTest(health=health):
+                engine = DecisionEngine(clock=lambda: 0.0)
+                payload = base_payload(
+                    round_no=71, worker_pos=(8, 9), gold=0,
+                    items=("StationUpgradeVoucher1",),
+                )
+                payload["teamOur"]["teamId"] = f"cross-night-base-{health}"
+                seed_reserve(engine, payload)
+                engine.decide(payload)
+                self.assertIsNotNone(engine.state.state.base_reserve)
+                payload["roundNo"] = 130
+                engine.decide(payload)
+                self.assertIsNotNone(engine.state.state.base_reserve)
+                payload["roundNo"] = 131
+                payload["teamOur"]["roles"][1]["health"] = health
+                command = engine.decide(payload)["roleCommandMap"].get("10010", {})
+                self.assertEqual(command.get("action") == "use", expect_use)
+                self.assertEqual(engine.state.state.base_reserve is None, expect_use)
+
+    def test_damaged_base_buys_then_uses_via_ordinary_day_path(self):
+        engine = DecisionEngine()
+        payload = base_payload(health=1000)
+        payload["teamOur"]["teamId"] = "damaged-ordinary-base-upgrade"
+        first = engine.decide(payload)
+        self.assertEqual(first["roleCommandMap"]["10010"]["action"], "buy")
+        self.assertIsNone(engine.state.state.base_reserve)
+        payload["roundNo"] = 2
+        payload["teamOur"]["goldNum"] = 0
+        payload["teamOur"]["roles"][0]["backpack"] = [
+            "StationUpgradeVoucher1"
+        ]
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 8, "y": 9}
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        second = engine.decide(payload)
+        self.assertEqual(second["roleCommandMap"]["10010"]["action"], "use")
+        self.assertIsNone(engine.state.state.base_reserve)
+
+    def test_damaged_reserve_release_does_not_invent_blocked_route(self):
+        payload = base_payload(
+            round_no=131, worker_pos=(0, 0), gold=0, health=300,
+            items=("StationUpgradeVoucher1",),
+        )
+        payload["teamOur"]["teamId"] = "blocked-damaged-reserve"
+        payload["teamOur"]["roles"].extend(
+            role(20100 + index, "wall", x, y, health=1000)
+            for index, (x, y) in enumerate(((0, 1), (1, 0), (1, 1)))
+        )
+        engine = DecisionEngine(clock=lambda: 0.0)
+        seed_reserve(engine, payload)
+        command = engine.decide(payload)["roleCommandMap"].get("10010")
+        self.assertIsNone(command)
+        self.assertIsNone(engine.state.state.base_reserve)
+
+    def test_reserve_skip_reason_names_existing_gates(self):
+        other_funding = PlannedAction(
+            ActionProposal(10010, 10010, {
+                "action": "move", "targetPos": [{"x": 5, "y": 1}],
+            }),
+            plan_reason="fund:WeaponUpgradeVoucher1:10020:10020",
+        )
+        for label, change, candidates, expected in (
+            ("night", {"roundNo": 71}, (), "night"),
+            ("dusk", {"roundNo": 70}, (), "dusk"),
+            ("damaged", {"health": 1000}, (), "station_damaged"),
+            ("towers", {"removeTower": True}, (), "towers_incomplete"),
+            ("low_cash", {"goldNum": 0}, (), "cash_insufficient"),
+            ("no_route", {}, (), "route_or_priority_unavailable"),
+            ("other", {}, (other_funding,), "other_funding_priority"),
+        ):
+            with self.subTest(label=label):
+                payload = base_payload()
+                if "roundNo" in change:
+                    payload["roundNo"] = change["roundNo"]
+                if "health" in change:
+                    payload["teamOur"]["roles"][1]["health"] = change["health"]
+                if "goldNum" in change:
+                    payload["teamOur"]["goldNum"] = change["goldNum"]
+                if change.get("removeTower"):
+                    payload["teamOur"]["roles"].pop()
+                state = state_for(payload)
+                result = reserve_purchase_candidate(
+                    Turn.load(payload), state, candidates, frozenset(),
+                )
+                self.assertEqual(result, candidates)
+                self.assertEqual(state.base_reserve_reason, expected)
+
+    def test_day_damage_releases_bought_reserve_for_immediate_use(self):
+        # Break caught: an earlier night reserve hides a usable daytime voucher.
+        engine = DecisionEngine()
+        payload = base_payload()
+        payload["teamOur"]["teamId"] = "damaged-held-base-reserve"
+        first = engine.decide(payload)
+        self.assertEqual(first["roleCommandMap"]["10010"], {
+            "action": "buy", "name": "StationUpgradeVoucher1", "num": 1,
+        })
+        self.assertIsNotNone(engine.state.state.base_reserve)
+
+        payload["roundNo"] = 2
+        payload["teamOur"]["goldNum"] = 0
+        payload["teamOur"]["roles"][0]["backpack"] = [
+            "StationUpgradeVoucher1"
+        ]
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 8, "y": 9}
+        payload["teamOur"]["roles"][1]["health"] = 1000
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        second = engine.decide(payload)
+        self.assertEqual(second["roleCommandMap"]["10010"], {
+            "action": "use", "name": "StationUpgradeVoucher1",
+            "targetPos": [{"x": 9, "y": 9}],
+        })
+        self.assertIsNone(engine.state.state.base_reserve)
+
     def test_reserve_does_not_stall_day_work_after_leaving_base(self):
         payload = base_payload(
             worker_pos=(8, 9), gold=0,

@@ -799,6 +799,12 @@ def prepare_base_reserve(
             and plan.reason.startswith(f"fund:{reserve.item}:")
         ):
             state.plans.pop(reserve.holder_id)
+        if (
+            turn.is_day and station is not None
+            and station.health < _max_building_health(station)
+        ):
+            state.base_reserve = None
+            state.base_reserve_event = "day_damage_released"
         return
     if (
         station is None or station.level not in (1, 2)
@@ -846,27 +852,37 @@ def reserve_purchase_candidate(turn: Turn, state: SessionState,
                                candidates: tuple[PlannedAction, ...],
                                unavailable_role_ids: frozenset[int]) -> tuple[PlannedAction, ...]:
     station = turn.station()
-    if (
-        not turn.is_day
-        or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
-        or station is None or station.level not in (1, 2)
-        or len(turn.weapons()) < MAX_WEAPONS
-        or station.health != _max_building_health(station)
-        or state.base_reserve is not None
-        or any(min(distance(robot.pos, cell)
-                   for cell in turn.footprint(station)) <= ROBOT_ATTACK_RANGE
-               and robot.target_team == turn.team_type for robot in turn.robots)
-        or any(
-            candidate.plan_reason and candidate.plan_reason.startswith("fund:")
-            and not candidate.plan_reason.startswith(
-                f"fund:StationUpgradeVoucher{station.level}:"
-            ) for candidate in candidates
+    reason = None
+    if not turn.is_day:
+        reason = "night"
+    elif turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS:
+        reason = "dusk"
+    elif station is None:
+        reason = "station_missing"
+    elif station.level not in (1, 2):
+        reason = "station_level_ineligible"
+    elif len(turn.weapons()) < MAX_WEAPONS:
+        reason = "towers_incomplete"
+    elif station.health != _max_building_health(station):
+        reason = (
+            "station_damaged" if station.health < _max_building_health(station)
+            else "station_health_ineligible"
         )
+    elif state.base_reserve is not None:
+        reason = "held_for_night"
+    elif any(min(distance(robot.pos, cell)
+                 for cell in turn.footprint(station)) <= ROBOT_ATTACK_RANGE
+             and robot.target_team == turn.team_type for robot in turn.robots):
+        reason = "threat_near_station"
+    elif any(
+        candidate.plan_reason and candidate.plan_reason.startswith("fund:")
+        and not candidate.plan_reason.startswith(
+            f"fund:StationUpgradeVoucher{station.level}:"
+        ) for candidate in candidates
     ):
-        state.base_reserve_reason = (
-            "held_for_night" if state.base_reserve is not None
-            else "reserve_ineligible"
-        )
+        reason = "other_funding_priority"
+    if reason is not None:
+        state.base_reserve_reason = reason
         return candidates
     item = f"StationUpgradeVoucher{station.level}"
     price = turn.weapon_prices.get(item)
@@ -4325,9 +4341,11 @@ def _search_path(
                 return PathResult("deadline", None, 0, None)
             context.path_cache_hits += 1
             return cached
+    # Prefer progress within equal-cost fronts under the same expansion cap.
     result = next_step(
         turn, worker, stand, clock=clock, deadline=deadline,
         max_expansions=max_expansions,
+        prefer_deep_ties=True,
     )
     if context is not None:
         context.path_computations += 1
