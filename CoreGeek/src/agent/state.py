@@ -877,12 +877,15 @@ class StateStore:
                 "response": self._news_text_detail(raw),
             })
         else:
-            state.news_events.append({
+            event = {
                 "kind": "response_rejected",
                 "requestId": pending.request_id,
                 "reason": parsed.rejection_reason,
                 "response": self._news_text_detail(raw),
-            })
+            }
+            if parsed.rejection_detail is not None:
+                event["rejectionDetail"] = parsed.rejection_detail
+            state.news_events.append(event)
         return bool(raw)
 
     def _trim_news_days(self, current_day: int) -> None:

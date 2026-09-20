@@ -3,8 +3,12 @@ import json
 import unittest
 from pathlib import Path
 
+from agent.actions import ActionProposal, PlannedAction
 from agent.brain import DecisionEngine
-from agent.pressure_shadow import ShadowState, observe_shadow, shadow_diagnostic
+from agent.pressure_shadow import (
+    ShadowState, historical_investment_assessment, observe_shadow,
+    shadow_diagnostic,
+)
 from agent.protocol import Turn
 
 
@@ -40,6 +44,211 @@ def wall(wall_id, health=100, level=1):
 
 
 class PressureShadowTests(unittest.TestCase):
+    def test_historical_investment_uses_complete_night_and_dawn(self):
+        for team in ("challenger", "defender"):
+            with self.subTest(team=team):
+                state = ShadowState()
+                for round_no in range(1, 132):
+                    turn = Turn.load(payload(
+                        round_no, team=team,
+                        our_hp=1000 if round_no < 75 else 500,
+                    ))
+                    observe_shadow(turn, state, frozenset())
+                    assessment = historical_investment_assessment(turn, state)
+                    if round_no == 130:
+                        self.assertIn(
+                            "current_night_in_progress", assessment["unknowns"],
+                        )
+                self.assertEqual(assessment["baselineNight"], 1)
+                self.assertEqual(assessment["observedDamage"], 500)
+                self.assertEqual(assessment["currentMargin"], 0)
+                self.assertEqual(assessment["upgradeMargin"], 2500)
+                self.assertEqual(
+                    assessment["defenseComparison"], "approximately_comparable",
+                )
+                self.assertEqual(assessment["candidate"]["status"], "not_evaluated")
+
+    def test_historical_investment_rejects_gaps_healing_and_level_changes(self):
+        for label, skip, hp_for, level_for, expected in (
+            ("gap", {90}, lambda r: 900, lambda r: 1,
+             "night_or_dawn_sequence_incomplete"),
+            ("healing", set(), lambda r: 900 if r < 90 else 950,
+             lambda r: 1, "base_hp_increased"),
+            ("level", set(), lambda r: 900, lambda r: 2 if r >= 100 else 1,
+             "base_level_changed"),
+        ):
+            with self.subTest(label=label):
+                state = ShadowState()
+                for round_no in range(1, 132):
+                    if round_no in skip:
+                        continue
+                    turn = Turn.load(payload(
+                        round_no, our_hp=hp_for(round_no),
+                        our_level=level_for(round_no),
+                    ))
+                    observe_shadow(turn, state, frozenset())
+                assessment = historical_investment_assessment(turn, state)
+                self.assertIsNone(assessment["observedDamage"])
+                self.assertIn(expected, assessment["unknowns"])
+
+    def test_historical_investment_marks_defense_changes_without_damage_factor(self):
+        state = ShadowState()
+        for round_no in range(1, 133):
+            value = payload(
+                round_no, our_hp=900 if round_no >= 90 else 1000,
+                our_walls=(wall(11, health=90 if round_no >= 90 else 100),),
+            )
+            value["teamOur"]["roles"].extend((
+                dict(id=10020, roleType="gatling", pos=dict(x=7, y=7),
+                     health=1000, level=2 if round_no == 132 else 1),
+                dict(id=10010, roleType="worker", pos=dict(x=6, y=7),
+                     health=220, backpack=[], backPackCapability=40),
+            ))
+            turn = Turn.load(value)
+            observe_shadow(
+                turn, state,
+                frozenset((10010,)) if 90 <= round_no < 100 else frozenset(),
+            )
+        assessment = historical_investment_assessment(turn, state)
+        self.assertEqual(assessment["status"], "assessed")
+        self.assertEqual(assessment["observedDamage"], 100)
+        self.assertEqual(assessment["defenseComparison"], "changed_unquantified")
+        self.assertIn("towers_changed", assessment["defenseChanges"])
+        self.assertIn("task_occupancy_changed", assessment["defenseChanges"])
+        self.assertIn("night_walls_changed", assessment["defenseChanges"])
+
+    def test_historical_investment_needs_dawn_and_current_base_level(self):
+        state = ShadowState()
+        for round_no in (*range(1, 131), 132):
+            turn = Turn.load(payload(round_no, our_hp=900))
+            observe_shadow(turn, state, frozenset())
+        assessment = historical_investment_assessment(turn, state)
+        self.assertIn("night_or_dawn_sequence_incomplete", assessment["unknowns"])
+
+        state = ShadowState()
+        for round_no in range(1, 133):
+            turn = Turn.load(payload(
+                round_no, our_hp=900,
+                our_level=2 if round_no == 132 else 1,
+            ))
+            observe_shadow(turn, state, frozenset())
+        assessment = historical_investment_assessment(turn, state)
+        self.assertIn("current_base_identity_or_level_changed", assessment["unknowns"])
+
+        state = ShadowState()
+        for round_no in range(1, 133):
+            turn = Turn.load(payload(
+                round_no, our_hp=950 if round_no == 132 else 900,
+            ))
+            observe_shadow(turn, state, frozenset())
+        assessment = historical_investment_assessment(turn, state)
+        self.assertIn("day_base_hp_increased", assessment["unknowns"])
+
+    def test_historical_investment_day_gap_stays_unknown_after_resuming(self):
+        for changed_hp in (False, True):
+            with self.subTest(changed_hp=changed_hp):
+                state = ShadowState()
+                for round_no in range(1, 132):
+                    turn = Turn.load(payload(
+                        round_no, our_hp=1000 if round_no < 90 else 500,
+                    ))
+                    observe_shadow(turn, state, frozenset())
+                for round_no in (140, 141, 142):
+                    turn = Turn.load(payload(
+                        round_no, our_hp=800 if changed_hp else 500,
+                    ))
+                    observe_shadow(turn, state, frozenset())
+                    assessment = historical_investment_assessment(turn, state)
+                    self.assertIsNone(assessment["observedDamage"])
+                    self.assertIn(
+                        "day_observation_incomplete", assessment["unknowns"],
+                    )
+
+    def test_historical_investment_missing_base_and_zero_damage_are_not_safe(self):
+        state = ShadowState()
+        for round_no in range(1, 132):
+            value = payload(round_no, our_hp=900)
+            if round_no == 90:
+                value["teamOur"]["roles"] = []
+            turn = Turn.load(value)
+            observe_shadow(turn, state, frozenset())
+        self.assertIn(
+            "base_missing",
+            historical_investment_assessment(turn, state)["unknowns"],
+        )
+
+        state = ShadowState()
+        for round_no in range(1, 132):
+            turn = Turn.load(payload(round_no, our_hp=4500, our_level=3))
+            observe_shadow(turn, state, frozenset())
+        assessment = historical_investment_assessment(turn, state)
+        self.assertEqual(assessment["observedDamage"], 0)
+        self.assertEqual(assessment["status"], "no_upgrade_candidate")
+        self.assertIsNone(assessment["upgradeFullHp"])
+
+    def test_history_switch_preserves_commands_prompts_and_model_requests(self):
+        enabled = DecisionEngine(history_investment_enabled=True)
+        disabled = DecisionEngine(history_investment_enabled=False)
+        for round_no in (1, 70, 71, 72, 130, 131):
+            value = payload(round_no, robots=[robot(1, "challenger")]
+                            if round_no in (71, 72, 130) else [])
+            value["teamOur"]["roles"].append(dict(
+                id=10011, roleType="pioneer", pos=dict(x=4, y=4),
+                health=200, backpack=[], backPackCapability=40,
+            ))
+            if round_no == 70:
+                value["phaseTask"] = "Return the observed marker."
+            on_traces, off_traces = [], []
+            on = enabled.decide(copy.deepcopy(value), trace_sink=on_traces.append)
+            off = disabled.decide(copy.deepcopy(value), trace_sink=off_traces.append)
+            self.assertEqual(on, off)
+            self.assertIn("historyInvestment", on_traces[0])
+            self.assertNotIn("historyInvestment", off_traces[0])
+
+    def test_historical_investment_candidate_uses_existing_route_only(self):
+        from test_base_upgrade import base_payload, seed_reserve
+        traces = []
+        DecisionEngine().decide(base_payload(), trace_sink=traces.append)
+        candidate = traces[0]["historyInvestment"]["candidate"]
+        self.assertEqual(candidate["status"], "allocator_accepted")
+        self.assertEqual(candidate["finalResponse"], "selected")
+        self.assertEqual(candidate["route"], "evaluated")
+        self.assertEqual(candidate["routeScope"], "purchase_use_return")
+        self.assertEqual(candidate["totalRounds"], 10)
+
+        engine = DecisionEngine()
+        held = base_payload(
+            round_no=71, worker_pos=(8, 9), gold=0, health=1000,
+            items=("StationUpgradeVoucher1",),
+        )
+        seed_reserve(engine, held)
+        traces = []
+        engine.decide(held, trace_sink=traces.append)
+        candidate = traces[0]["historyInvestment"]["candidate"]
+        self.assertEqual(candidate["status"], "allocator_accepted")
+        self.assertEqual(candidate["finalResponse"], "selected")
+        self.assertEqual(candidate["action"], "use")
+        self.assertEqual(candidate["routeScope"], "use_only")
+        self.assertEqual(candidate["execution"], "unconfirmed")
+
+        self.assertEqual(
+            DecisionEngine._history_base_candidate((), None, [], False),
+            {"status": "not_evaluated", "route": "not_evaluated"},
+        )
+
+        pending = PlannedAction(
+            ActionProposal(10010, 10010, {
+                "action": "buy", "name": "StationUpgradeVoucher1", "num": 1,
+            }),
+            plan_reason="fund:StationUpgradeVoucher1:10020:10013",
+            estimated_rounds=10,
+        )
+        fallback = DecisionEngine._history_base_candidate(
+            (pending,), None, [("economy", pending)], False,
+        )
+        self.assertEqual(fallback["status"], "allocator_accepted")
+        self.assertEqual(fallback["finalResponse"], "not_confirmed")
+
     def observe(self, state, round_no, **kwargs):
         observe_shadow(Turn.load(payload(round_no, **kwargs)), state)
         return shadow_diagnostic(state)
@@ -226,6 +435,10 @@ class PressureShadowTests(unittest.TestCase):
         self.assertEqual(traces[-1]["pressureShadow"]["current"]["roundNo"], 1)
         self.assertEqual(traces[-1]["pressureShadow"]["recentNights"], [])
         self.assertIn("elapsedMs", traces[-1]["pressureShadow"])
+        self.assertIn(
+            "adjacent_complete_night_missing",
+            traces[-1]["historyInvestment"]["unknowns"],
+        )
 
     def test_action_equivalence_covers_economy_defense_and_task(self):
         from unittest import mock

@@ -1,8 +1,8 @@
 # NightWatch 内网验证手册
 
-仓库当前构建`nightwatch-s2-integrated-r10`：增加回防修复、夜间基地应急升级及只读压力旁路修订。唯一执行入口为 https://github.com/icesword007/NightWatch/issues/12 ，必须刷新正文/updatedAt；完整SHA、场次和停止条件以该正文为准。
+仓库当前构建`nightwatch-s2-integrated-r11`：包含R260诊断、R261寻路、R264基地储备及R269只读历史情景评估。唯一执行入口为 https://github.com/icesword007/NightWatch/issues/12 ，必须刷新正文/updatedAt；完整SHA、场次和停止条件以该正文为准。
 
-r10统一验收参考[送测说明](【codex】s2-integrated-r10-intranet-prompt.md)。r7/r8/r9参考仅保留历史与字段解释；#13经济性能、#14任务、#15防守及压力旁路；旧单迁移关闭不表示修复。
+r10[送测说明](【codex】s2-integrated-r10-intranet-prompt.md)仅作历史参考；r11验收以#12当前正文为准。r7/r8/r9参考仅保留历史与字段解释；#13经济性能、#14任务、#15防守及压力旁路；旧单迁移关闭不表示修复。
 
 以下旧条目保留协议和历史证据；其中旧版本、候选状态、旧issue号、已覆盖的阶段状态仅反映记录当时，不能替代#12当前指令，也不能重启旧批次。不按旧“S1未通过/未合入/r5”等措辞判断当前状态。
 

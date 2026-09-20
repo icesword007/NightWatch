@@ -10,6 +10,7 @@ from .protocol import DAY_ROUNDS, ROUNDS_PER_DAY, Turn, distance, station_footpr
 ALGORITHM_VERSION = "shadow_v2"
 ID_LIMIT = 512
 SIDES = ("challenger", "defender")
+BASE_MAX_HEALTH = (1500, 3000, 4500)
 
 
 def _night_metrics() -> dict[str, Any]:
@@ -55,6 +56,11 @@ class NightRecord:
     metrics: dict[str, dict[str, Any]] = field(
         default_factory=lambda: {side: _night_metrics() for side in SIDES}
     )
+    investment_start_base: tuple[int, int, int] | None = None
+    investment_start_defense: dict[str, Any] | None = None
+    investment_end_defense: dict[str, Any] | None = None
+    investment_unknowns: set[str] = field(default_factory=set)
+    investment_defense_changes: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -76,6 +82,7 @@ class ShadowState:
     )
     current: dict[str, Any] | None = None
     current_pressure: dict[str, Any] | None = None
+    previous_our_defense: dict[str, Any] | None = None
 
 
 def _night_number(round_no: int) -> int:
@@ -89,6 +96,54 @@ def _base(roles: tuple) -> Any:
 def _side_roles(turn: Turn) -> tuple[tuple[str, tuple], tuple[str, tuple]]:
     enemy = "defender" if turn.team_type == "challenger" else "challenger"
     return ((turn.team_type, turn.ours), (enemy, turn.enemies))
+
+
+def _our_defense_snapshot(
+    turn: Turn, task_role_ids: frozenset[int] | None,
+) -> dict[str, Any]:
+    return {
+        "towers": tuple(sorted(
+            (unit.unit_id, unit.kind, unit.level, unit.pos.x, unit.pos.y)
+            for unit in turn.weapons()
+        )),
+        "availableRoles": tuple(sorted(
+            unit.unit_id for unit in turn.controllable() if unit.health > 0
+        )),
+        "taskReservedRoles": (
+            tuple(sorted(task_role_ids)) if task_role_ids is not None else None
+        ),
+    }
+
+
+def _defense_changes(old: dict[str, Any] | None,
+                     new: dict[str, Any] | None) -> set[str]:
+    if old is None or new is None:
+        return {"defense_snapshot_missing"}
+    changes = set()
+    for field, reason in (
+        ("towers", "towers_changed"),
+        ("availableRoles", "role_availability_changed"),
+        ("taskReservedRoles", "task_occupancy_changed"),
+    ):
+        if old[field] is None or new[field] is None:
+            changes.add(f"{field}_unknown")
+        elif old[field] != new[field]:
+            changes.add(reason)
+    return changes
+
+
+def _observe_investment_base(
+    record: NightRecord, previous: tuple[int, int, int] | None,
+    current: tuple[int, int, int] | None,
+) -> None:
+    if previous is None or current is None:
+        record.investment_unknowns.add("base_missing")
+    elif previous[0] != current[0]:
+        record.investment_unknowns.add("base_identity_changed")
+    elif previous[1] != current[1]:
+        record.investment_unknowns.add("base_level_changed")
+    elif current[2] > previous[2]:
+        record.investment_unknowns.add("base_hp_increased")
 
 
 def _wall_map(roles: tuple) -> tuple[dict[int, tuple[int, int]], bool]:
@@ -250,7 +305,10 @@ def _verification(
     }
 
 
-def _finish_night(state: ShadowState, our_team: str, boundary_round: int) -> None:
+def _finish_night(
+    state: ShadowState, our_team: str, boundary_round: int,
+    collect_investment_history: bool,
+) -> None:
     record = state.active_night
     if record is None:
         return
@@ -262,22 +320,72 @@ def _finish_night(state: ShadowState, our_team: str, boundary_round: int) -> Non
     verification = _verification(
         record, our_team, status="final", complete=complete,
     )
+    if collect_investment_history:
+        unknowns = set(record.investment_unknowns)
+        if not complete:
+            unknowns.add("night_or_dawn_sequence_incomplete")
+        if record.investment_start_base is None:
+            unknowns.add("dusk_base_missing")
+        if record.investment_end_defense is None:
+            unknowns.add("dawn_defense_missing")
+        verification["investmentHistory"] = {
+            "night": record.night,
+            "damage": (
+                record.metrics[our_team]["base"]["cumulativeHpLoss"]
+                if not unknowns else None
+            ),
+            "observedPositiveHpDrops": record.metrics[our_team]["base"][
+                "cumulativeHpLoss"
+            ],
+            "baseId": (
+                record.investment_start_base[0]
+                if record.investment_start_base else None
+            ),
+            "baseLevel": (
+                record.investment_start_base[1]
+                if record.investment_start_base else None
+            ),
+            "unknowns": sorted(unknowns),
+            "defenseAtDusk": record.investment_start_defense,
+            "defenseAtDawn": record.investment_end_defense,
+            "nightDefenseChanges": sorted(record.investment_defense_changes),
+            "nightWallChanges": copy.deepcopy(record.metrics[our_team]["walls"]),
+        }
     state.last_verification = verification
     state.recent_nights.append(verification)
     del state.recent_nights[:-3]
     state.active_night = None
 
 
-def observe_shadow(turn: Turn, state: ShadowState) -> None:
+def observe_shadow(
+    turn: Turn, state: ShadowState,
+    task_role_ids: frozenset[int] | None = None,
+    *, collect_investment_history: bool = True,
+) -> None:
     """Observe one new round without changing Turn or decision state."""
     if state.last_round is not None and turn.round_no <= state.last_round:
         return
     night = _night_number(turn.round_no)
     first_night_round = (night - 1) * ROUNDS_PER_DAY + DAY_ROUNDS + 1
     consecutive = state.last_round == turn.round_no - 1
+    our_defense = (
+        _our_defense_snapshot(turn, task_role_ids)
+        if collect_investment_history else None
+    )
     if turn.is_day and state.active_night is not None:
         record = state.active_night
         if turn.round_no == record.night * ROUNDS_PER_DAY + 1:
+            if collect_investment_history:
+                current_base = _base(turn.ours)
+                _observe_investment_base(
+                    record, state.previous_bases.get(turn.team_type),
+                    (current_base.unit_id, current_base.level, current_base.health)
+                    if current_base is not None else None,
+                )
+                record.investment_end_defense = our_defense
+                record.investment_defense_changes.update(_defense_changes(
+                    state.previous_our_defense, our_defense,
+                ))
             for side, roles in _side_roles(turn):
                 base = _base(roles)
                 previous = state.previous_bases.get(side)
@@ -298,10 +406,14 @@ def observe_shadow(turn: Turn, state: ShadowState) -> None:
                 )
                 for name, count in changes.items():
                     record.metrics[side]["walls"][name] += count
-        _finish_night(state, turn.team_type, turn.round_no)
+        _finish_night(
+            state, turn.team_type, turn.round_no, collect_investment_history,
+        )
         state.changed_defense = {side: False for side in SIDES}
     elif state.active_night is not None and state.active_night.night != night:
-        _finish_night(state, turn.team_type, turn.round_no)
+        _finish_night(
+            state, turn.team_type, turn.round_no, collect_investment_history,
+        )
         state.changed_defense = {side: False for side in SIDES}
     if (turn.is_day and (state.pending_prediction is None
                          or state.pending_prediction["night"] != night)):
@@ -319,6 +431,16 @@ def observe_shadow(turn: Turn, state: ShadowState) -> None:
                 frozen["sides"][side]["risk"] = "unknown"
                 frozen["sides"][side]["reasons"].append("no_daytime_prediction")
         state.active_night = NightRecord(night, frozen)
+        if collect_investment_history and consecutive:
+            state.active_night.investment_start_base = (
+                state.previous_bases.get(turn.team_type)
+            )
+            state.active_night.investment_start_defense = (
+                state.previous_our_defense
+            )
+        if (collect_investment_history
+                and state.active_night.investment_start_defense is None):
+            state.active_night.investment_unknowns.add("dusk_defense_missing")
         if turn.round_no != first_night_round:
             state.active_night.complete = False
             state.active_night.unknowns.add("night_started_late")
@@ -430,6 +552,11 @@ def observe_shadow(turn: Turn, state: ShadowState) -> None:
             )
         if state.active_night is not None and not turn.is_day:
             record = state.active_night
+            if collect_investment_history and side == turn.team_type:
+                _observe_investment_base(record, previous_base, base)
+                record.investment_defense_changes.update(_defense_changes(
+                    state.previous_our_defense, our_defense,
+                ))
             if not same_base:
                 record.base_comparable[side] = False
                 record.metrics[side]["completeness"]["base"] = False
@@ -530,6 +657,8 @@ def observe_shadow(turn: Turn, state: ShadowState) -> None:
         }
     state.current_pressure = {"sides": pressure_sides}
     state.previous_bases = bases
+    if collect_investment_history:
+        state.previous_our_defense = our_defense
     state.previous_walls = walls
     state.previous_robots = (
         robot_hp if turn.robot_roles_observed and len(turn.robots) <= ID_LIMIT
@@ -558,3 +687,84 @@ def shadow_diagnostic(state: ShadowState) -> dict[str, Any]:
             "prediction": prediction, "verification": state.last_verification,
             "nightSummary": night_summary,
             "recentNights": list(state.recent_nights)}
+
+
+def historical_investment_assessment(
+    turn: Turn, state: ShadowState,
+    candidate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe one observed loss repeated arithmetically, without predicting."""
+    result: dict[str, Any] = {
+        "status": "unknown", "baselineNight": None,
+        "observedDamage": None, "currentHp": None,
+        "upgradeFullHp": None, "currentMargin": None,
+        "upgradeMargin": None, "defenseComparison": "unknown",
+        "defenseChanges": [], "defenseAtDusk": None,
+        "defenseAtDawn": None,
+        "defenseCurrent": None, "unknowns": [],
+        "candidate": candidate or {"status": "not_evaluated"},
+        "assumption": "repeat_observed_loss_arithmetic_only",
+    }
+    if not turn.is_day:
+        result["unknowns"] = ["current_night_in_progress"]
+        return result
+    previous_night = _night_number(turn.round_no) - 1
+    history = state.recent_nights[-1] if state.recent_nights else None
+    if history is None or history["night"] != previous_night:
+        result["unknowns"] = ["adjacent_complete_night_missing"]
+        return result
+    source = history.get("investmentHistory")
+    result["baselineNight"] = previous_night
+    if source is None:
+        result["unknowns"] = ["investment_history_missing"]
+        return result
+    station = turn.station()
+    if station is None:
+        result["unknowns"] = ["current_base_missing"]
+        return result
+    result["currentHp"] = station.health
+    result["defenseAtDusk"] = source["defenseAtDusk"]
+    result["defenseAtDawn"] = source["defenseAtDawn"]
+    result["defenseCurrent"] = state.previous_our_defense
+    if station.level in (1, 2):
+        result["upgradeFullHp"] = BASE_MAX_HEALTH[station.level]
+    unknowns = list(source["unknowns"])
+    if (station.unit_id, station.level) != (
+        source["baseId"], source["baseLevel"]
+    ):
+        unknowns.append("current_base_identity_or_level_changed")
+    if state.day_context[turn.team_type]["base"]["hpIncrease"]:
+        unknowns.append("day_base_hp_increased")
+    if state.day_observation_incomplete:
+        unknowns.append("day_observation_incomplete")
+    result["unknowns"] = sorted(set(unknowns))
+    if unknowns:
+        return result
+    damage = source["damage"]
+    result["observedDamage"] = damage
+    result["currentMargin"] = station.health - damage
+    if result["upgradeFullHp"] is not None:
+        result["upgradeMargin"] = result["upgradeFullHp"] - damage
+    changes = set(source["nightDefenseChanges"])
+    changes.update(_defense_changes(
+        source["defenseAtDawn"], state.previous_our_defense,
+    ))
+    if any(source["nightWallChanges"].values()):
+        changes.add("night_walls_changed")
+    if any(state.day_context[turn.team_type]["walls"].values()):
+        changes.add("day_walls_changed")
+    if state.day_context[turn.team_type]["base"]["hpDecrease"]:
+        changes.add("day_base_hp_decreased")
+    result["defenseChanges"] = sorted(changes)
+    result["defenseComparison"] = (
+        "unknown" if any(reason.endswith("_unknown") or reason.endswith("_missing")
+                         for reason in changes)
+        else "changed_unquantified" if changes
+        else "approximately_comparable"
+    )
+    result["status"] = (
+        "no_upgrade_candidate" if result["upgradeFullHp"] is None
+        else "no_observed_damage" if damage == 0
+        else "assessed"
+    )
+    return result

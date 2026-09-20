@@ -11,7 +11,7 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s2-integrated-r10"
+BUILD_ID = "nightwatch-s2-integrated-r11"
 MAX_TASK_DETAIL_CHARS = 131_072
 MAX_NEWS_DETAIL_CHARS = 4_096
 MAX_LOG_ITEMS = 16
@@ -225,6 +225,13 @@ def _news_event_detail(raw: dict[str, Any]) -> dict[str, Any]:
         )
         if name in raw
     }
+    rejection = raw.get("rejectionDetail")
+    if isinstance(rejection, dict):
+        detail["rejectionDetail"] = {
+            name: rejection[name]
+            for name in ("candidateIndex", "field", "code")
+            if name in rejection
+        }
     for name in ("sourceIds", "newSourceIds", "contextSourceIds"):
         source_ids = raw.get(name)
         if isinstance(source_ids, list):
