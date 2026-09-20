@@ -30,6 +30,7 @@ def next_step(
     clock: Callable[[], float] = time.monotonic,
     deadline: float | None = None,
     max_expansions: int = 256,
+    prefer_deep_ties: bool = False,
 ) -> PathResult:
     if moving.pos == goal:
         return PathResult("already_there", None, 0, 0)
@@ -50,7 +51,8 @@ def next_step(
             return PathResult("deadline", None, expansions, None)
         if expansions >= max_expansions:
             return PathResult("expansion_limit", None, expansions, None)
-        _, cost, _, current = heappop(frontier)
+        _, priority_cost, _, current = heappop(frontier)
+        cost = -priority_cost if prefer_deep_ties else priority_cost
         if current in seen:
             continue
         if current == goal:
@@ -75,7 +77,7 @@ def next_step(
                 frontier,
                 (
                     new_cost + distance(step, goal),
-                    new_cost,
+                    -new_cost if prefer_deep_ties else new_cost,
                     next(order),
                     step,
                 ),

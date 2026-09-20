@@ -15,6 +15,7 @@ from .fortification import (
 from .grid import PathResult, next_step
 from .layout import ensure_defense_layout
 from .protocol import (
+    DUSK_POSITIONING_ROUNDS,
     PIONEER,
     ROUNDS_PER_DAY,
     STATION,
@@ -31,7 +32,7 @@ from .protocol import (
     sell_command,
     use_command,
 )
-from .state import SessionState
+from .state import BaseReserve, SessionState
 
 MINERALS = ("stone", "iron", "copper")
 MAX_WEAPONS = 3
@@ -536,6 +537,10 @@ def _propose_economy(
         else:
             context.tower_status = "no_complete_route_or_window"
 
+    reserve = state.base_reserve
+    if context is not None and reserve is not None:
+        context.investment_owners[reserve.station_id] = reserve.holder_id
+        context.investment_targets.add(reserve.station_id)
     for role in sorted(turn.controllable(), key=lambda entry: entry.unit_id):
         if clock() >= deadline:
             break
@@ -550,10 +555,17 @@ def _propose_economy(
             candidate = urgent_purchase
         if candidate is None:
             candidate = tower_candidates.get(role.unit_id)
+        reserve = state.base_reserve
+        reserved_item = (
+            reserve.item if reserve is not None
+            and role.unit_id == reserve.holder_id
+            and reserve.item in role.backpack else None
+        )
         if candidate is None:
             candidate = _maintenance_action(
                 turn, role, clock, deadline, max_expansions,
                 preferred_use_target_id=_plan_use_target_id(plan),
+                skip_item=reserved_item,
             )
             if plan is not None and plan.reason.startswith(("fund:", "batch:")):
                 self_care = (
@@ -749,7 +761,232 @@ def _propose_economy(
             elif action == "buy":
                 name = candidate.proposal.command["name"]
                 claimed_gold += turn.weapon_prices[name]
+    if state.base_blocked_day == current_day:
+        station = turn.station()
+        if station is not None and station.level in (1, 2):
+            item = f"StationUpgradeVoucher{station.level}"
+            candidates = [
+                candidate for candidate in candidates
+                if candidate.proposal.actor_id != state.base_blocked_holder_id
+                or not (
+                    candidate.plan_reason is not None
+                    and candidate.plan_reason.startswith((
+                        f"fund:{item}:", f"use:{item}:",
+                    ))
+                    or candidate.proposal.command.get("name") == item
+                )
+            ]
     return tuple(candidates)
+
+
+def prepare_base_reserve(
+    turn: Turn, state: SessionState,
+    unavailable_role_ids: frozenset[int],
+    clock: Callable[[], float], deadline: float, max_expansions: int,
+) -> None:
+    station = turn.station()
+    reserve = state.base_reserve
+    if reserve is not None:
+        holder = turn.unit(reserve.holder_id)
+        if reserve.holder_id in unavailable_role_ids:
+            state.base_reserve = None
+            state.base_reserve_event = "holder_task_reserved"
+            return
+        plan = state.plans.get(reserve.holder_id)
+        if (
+            holder is not None and reserve.item in holder.backpack
+            and plan is not None
+            and plan.reason.startswith(f"fund:{reserve.item}:")
+        ):
+            state.plans.pop(reserve.holder_id)
+        return
+    if (
+        station is None or station.level not in (1, 2)
+        or len(turn.weapons()) < MAX_WEAPONS or not turn.is_day
+        or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
+    ):
+        return
+    item = f"StationUpgradeVoucher{station.level}"
+    holders = tuple(
+        worker for worker in turn.workers()
+        if worker.unit_id not in unavailable_role_ids
+        and not (
+            state.base_blocked_day == (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+            and worker.unit_id == state.base_blocked_holder_id
+        )
+        and worker.unit_id not in state.plans
+        and item in worker.backpack
+        and (
+            station.health == _max_building_health(station)
+                and not any(
+                    robot.target_team == turn.team_type
+                    and min(distance(robot.pos, cell)
+                            for cell in turn.footprint(station)) <= ROBOT_ATTACK_RANGE
+                    for robot in turn.robots
+                )
+                and (route := _held_item_route(
+                    turn, worker, item, clock, deadline, max_expansions,
+                    preferred_use_target_id=station.unit_id,
+                )) is not None
+                and route.rounds <= turn.rounds_until_night
+        )
+    )
+    if holders:
+        holder = min(holders, key=lambda role: (
+            distance(role.pos, station.pos), role.unit_id,
+        ))
+        state.base_reserve = BaseReserve(
+            holder.unit_id, station.unit_id, station.level, item,
+        )
+        state.base_reserve_event = "held"
+        state.base_reserve_reason = "existing_voucher"
+
+
+def reserve_purchase_candidate(turn: Turn, state: SessionState,
+                               candidates: tuple[PlannedAction, ...],
+                               unavailable_role_ids: frozenset[int]) -> tuple[PlannedAction, ...]:
+    station = turn.station()
+    if (
+        not turn.is_day
+        or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
+        or station is None or station.level not in (1, 2)
+        or len(turn.weapons()) < MAX_WEAPONS
+        or station.health != _max_building_health(station)
+        or state.base_reserve is not None
+        or any(min(distance(robot.pos, cell)
+                   for cell in turn.footprint(station)) <= ROBOT_ATTACK_RANGE
+               and robot.target_team == turn.team_type for robot in turn.robots)
+        or any(
+            candidate.plan_reason and candidate.plan_reason.startswith("fund:")
+            and not candidate.plan_reason.startswith(
+                f"fund:StationUpgradeVoucher{station.level}:"
+            ) for candidate in candidates
+        )
+    ):
+        state.base_reserve_reason = (
+            "held_for_night" if state.base_reserve is not None
+            else "reserve_ineligible"
+        )
+        return candidates
+    item = f"StationUpgradeVoucher{station.level}"
+    price = turn.weapon_prices.get(item)
+    if price is None or turn.gold < price:
+        state.base_reserve_reason = "cash_insufficient"
+        return candidates
+    result = list(candidates)
+    for index, candidate in enumerate(result):
+        if (
+            candidate.proposal.actor_id not in unavailable_role_ids
+            and not (
+                state.base_blocked_day == (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+                and candidate.proposal.actor_id == state.base_blocked_holder_id
+            )
+            and candidate.plan_reason is not None
+            and candidate.plan_reason.startswith(f"fund:{item}:")
+            and candidate.estimated_rounds is not None
+            and candidate.estimated_rounds <= turn.rounds_until_night
+        ):
+            diagnostic = dict(candidate.diagnostic or {})
+            diagnostic.update({
+                "kind": "baseReserve", "phase": "preparing",
+                "stationId": str(station.unit_id), "level": station.level,
+            })
+            result[index] = replace(candidate, diagnostic=diagnostic)
+            state.base_reserve_reason = "preparing"
+            break
+    else:
+        state.base_reserve_reason = "route_or_priority_unavailable"
+    return tuple(result)
+
+
+def propose_base_upgrade(
+    turn: Turn, state: SessionState, *,
+    unavailable_role_ids: frozenset[int],
+    protected_role_ids: frozenset[int],
+    clock: Callable[[], float], deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    reserve = state.base_reserve
+    station = turn.station()
+    if turn.is_day:
+        return None
+    state.base_reserve_reason = "not_reserved"
+    if reserve is None or station is None:
+        return None
+    if clock() >= deadline:
+        state.base_reserve_reason = "planning_deadline"
+        return None
+    holder = turn.unit(reserve.holder_id)
+    if station.unit_id != reserve.station_id or station.level != reserve.station_level:
+        state.base_reserve_reason = "station_changed"
+        return None
+    if holder is None or holder.unit_id in unavailable_role_ids:
+        state.base_reserve_reason = "holder_unavailable"
+        return None
+    if reserve.item not in holder.backpack:
+        state.base_reserve_reason = "voucher_not_held"
+        return None
+    if "Medicine" in holder.backpack and holder.health < _max_role_health(holder):
+        state.base_reserve_reason = "medicine_first"
+        return None
+    adjacent = distance(holder.pos, station.pos) == 1
+    route = (holder.pos, 0) if adjacent else _best_adjacent_route(
+        turn, holder, station.pos, clock, deadline, max_expansions,
+    )
+    if route is None:
+        state.base_reserve_reason = "no_legal_route"
+        return None
+    stand, travel = route
+    rounds = travel + 1
+    visible_rate = sum(
+        robot.attack_power for robot in turn.robots
+        if robot.target_team == turn.team_type
+        and min(distance(robot.pos, cell)
+                for cell in turn.footprint(station)) <= ROBOT_ATTACK_RANGE
+    )
+    observed_rate = max(state.base_recent_drops, default=0)
+    rate = max(visible_rate, observed_rate)
+    uncertain_damage = (
+        rate <= 0 and adjacent
+        and station.health < _max_building_health(station)
+    )
+    if rate <= 0:
+        if not uncertain_damage:
+            state.base_reserve_reason = "no_damage_estimate"
+            return None
+    elif station.health > rate * (rounds + 2):
+        state.base_reserve_reason = "margin_sufficient"
+        return None
+    if not adjacent and holder.unit_id in protected_role_ids:
+        state.base_reserve_reason = "gunner_hold"
+        return None
+    if not adjacent and station.health <= rate * rounds:
+        state.base_reserve_reason = "too_late_to_approach"
+        return None
+    proposal = (
+        ActionProposal(
+            holder.unit_id, holder.unit_id,
+            use_command(reserve.item, station.pos),
+            item_costs=(reserve.item,),
+        ) if adjacent else _move_to_stand(
+            turn, holder, stand, clock, deadline, max_expansions,
+        )
+    )
+    if proposal is None:
+        state.base_reserve_reason = "move_unavailable"
+        return None
+    state.base_reserve_reason = (
+        "use_under_uncertainty" if uncertain_damage
+        else "use_now" if adjacent else "approach_now"
+    )
+    return PlannedAction(
+        proposal, station.pos,
+        f"use:{reserve.item}:{station.unit_id}", None, rounds,
+        {"kind": "baseUpgrade", "holderId": str(holder.unit_id),
+         "observedDrop": observed_rate, "visibleThreat": visible_rate,
+         "estimatedRounds": rounds, "safetyRounds": 2,
+         "phase": "use" if adjacent else "approach"},
+    )
 
 
 def weapon_build_positions(turn: Turn) -> tuple[Pos, ...]:
@@ -795,6 +1032,7 @@ def _maintenance_action(
     max_expansions: int,
     *,
     preferred_use_target_id: int | None = None,
+    skip_item: str | None = None,
 ) -> PlannedAction | None:
     items = Counter(worker.backpack)
     if items["Medicine"] and worker.health < _max_role_health(worker):
@@ -803,6 +1041,8 @@ def _maintenance_action(
         ))
 
     for item in worker.backpack:
+        if item == skip_item:
+            continue
         targets = _item_targets(turn, item)
         context = _ROUTE_SEARCH_CONTEXT.get()
         if context is not None:

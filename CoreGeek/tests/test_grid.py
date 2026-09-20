@@ -1,4 +1,5 @@
 import copy
+import inspect
 import json
 import unittest
 from pathlib import Path
@@ -20,6 +21,27 @@ def turn_and_worker(payload=None):
 
 
 class GridTests(unittest.TestCase):
+    def test_long_open_route_fits_default_expansion_budget(self):
+        # An open 26-step return route should not exhaust 256 A* expansions.
+        payload = load_fixture()
+        payload["mapInfo"].update({"width": 41, "height": 32, "zones": []})
+        worker = payload["teamOur"]["roles"][0]
+        worker["pos"] = {"x": 33, "y": 14}
+        payload["teamOur"]["roles"] = [worker]
+        payload["teamEnemy"]["roles"] = []
+        payload["robot"]["roles"] = []
+        turn, moving = turn_and_worker(payload)
+        self.assertIn("prefer_deep_ties", inspect.signature(grid.next_step).parameters)
+
+        route = grid.next_step(
+            turn, moving, Pos(7, 19), clock=lambda: 0,
+            deadline=1, max_expansions=256, prefer_deep_ties=True,
+        )
+
+        self.assertEqual(route.status, "found")
+        self.assertEqual(route.cost, 26)
+        self.assertIsNotNone(route.step)
+
     def test_current_position_is_already_there_not_path_failure(self):
         # Break caught: start==goal enters backtracking without a predecessor.
         turn, worker = turn_and_worker()

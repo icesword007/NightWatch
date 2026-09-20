@@ -93,7 +93,8 @@ class PressureShadowTests(unittest.TestCase):
         scored = self.observe(state, 131, our_hp=90)
         self.assertEqual(scored["verification"]["actualBaseDamage"], True)
         self.assertEqual(scored["verification"]["result"], "unscorable")
-        self.assertEqual(scored["prediction"]["risk"], "elevated")
+        self.assertEqual(scored["prediction"]["persistenceBaseline"]["risk"], "elevated")
+        self.assertEqual(scored["prediction"]["risk"], "unknown")
         self.assertEqual(scored["prediction"]["basedOnNight"], 1)
 
     def test_dusk_and_dawn_base_losses_belong_to_that_night(self):
@@ -120,7 +121,7 @@ class PressureShadowTests(unittest.TestCase):
         for r in range(1, 132):
             self.observe(state, r)
         self.assertEqual(shadow_diagnostic(state)["verification"]["actualBaseDamage"], False)
-        self.assertEqual(shadow_diagnostic(state)["prediction"]["risk"], "low")
+        self.assertEqual(shadow_diagnostic(state)["prediction"]["persistenceBaseline"]["risk"], "low")
         changed = self.observe(state, 132, our_walls=[wall(11)])
         self.assertEqual(changed["prediction"]["risk"], "unknown")
         self.assertTrue(changed["prediction"]["changedDefense"])
@@ -143,10 +144,10 @@ class PressureShadowTests(unittest.TestCase):
         state = ShadowState()
         for round_no in range(1, 132):
             self.observe(state, round_no)
-        self.assertEqual(shadow_diagnostic(state)["prediction"]["risk"], "low")
+        self.assertEqual(shadow_diagnostic(state)["prediction"]["persistenceBaseline"]["risk"], "low")
         self.observe(state, 133)
         later = self.observe(state, 134)
-        self.assertEqual(later["prediction"]["baselineRisk"], "low")
+        self.assertEqual(later["prediction"]["persistenceBaseline"]["risk"], "low")
         self.assertEqual(later["prediction"]["risk"], "unknown")
         self.assertIn("day_observation_incomplete", later["prediction"]["unknowns"])
 
@@ -173,7 +174,7 @@ class PressureShadowTests(unittest.TestCase):
         for round_no in range(1, 652):
             result = self.observe(state, round_no, our_hp=health(round_no))
             if round_no in (261, 391, 521, 651):
-                results[round_no] = result["verification"]["result"]
+                results[round_no] = result["verification"]["baselineResult"]
         self.assertEqual(results, {
             261: "hit", 391: "false_positive",
             521: "correct_negative", 651: "false_negative",
@@ -261,6 +262,166 @@ class PressureShadowTests(unittest.TestCase):
                     self.assertIn(name, [
                         action["domain"] for action in traces[0]["actions"]
                     ])
+
+    def test_third_night_baseline_miss_is_visible_before_sunrise(self):
+        state = ShadowState()
+        for round_no in range(1, 341):
+            hp = 90 if round_no >= 340 else 100
+            result = self.observe(state, round_no, our_hp=hp)
+        prediction = result["prediction"]["sides"]["challenger"]
+        self.assertEqual(prediction["persistenceBaseline"]["risk"], "low")
+        self.assertEqual(prediction["assessment"]["risk"], "unknown")
+        verification = result["verification"]
+        self.assertEqual(verification["night"], 3)
+        self.assertEqual(verification["status"], "event_observed")
+        self.assertFalse(verification["complete"])
+        self.assertEqual(verification["firstDamageRound"], 340)
+        self.assertEqual(verification["sides"]["challenger"]["baselineResult"], "false_negative")
+        self.assertEqual(verification["sides"]["challenger"]["result"], "unscorable")
+
+    def test_daytime_repair_keeps_baseline_and_explicit_context(self):
+        state = ShadowState()
+        for round_no in range(1, 131):
+            self.observe(state, round_no, our_walls=[wall(11, 80)])
+        self.observe(state, 131, our_walls=[wall(11, 80)])
+        day = self.observe(state, 132, our_hp=110,
+                           our_walls=[wall(11, 100, 2)])
+        side = day["prediction"]["sides"]["challenger"]
+        self.assertEqual(side["persistenceBaseline"]["risk"], "low")
+        self.assertEqual(side["assessment"]["risk"], "unknown")
+        self.assertEqual(side["contextChanges"]["base"]["hpIncrease"], 10)
+        self.assertEqual(side["contextChanges"]["walls"]["upgraded"], 1)
+        for round_no in range(133, 206):
+            hp = 100 if round_no >= 205 else 110
+            result = self.observe(state, round_no, our_hp=hp,
+                                  our_walls=[wall(11, 100, 2)])
+        self.assertEqual(result["verification"]["sides"]["challenger"]["baselineResult"], "false_negative")
+
+    def test_enemy_base_missing_and_robot_id_limit_do_not_erase_our_base_evidence(self):
+        state = ShadowState()
+        for round_no in range(1, 131):
+            value = payload(round_no)
+            value["teamEnemy"]["roles"] = []
+            observe_shadow(Turn.load(value), state)
+        next_day = payload(131)
+        next_day["teamEnemy"]["roles"] = []
+        observe_shadow(Turn.load(next_day), state)
+        self.assertEqual(shadow_diagnostic(state)["prediction"]["sides"]["challenger"]["persistenceBaseline"]["risk"], "low")
+        for round_no in range(132, 202):
+            value = payload(round_no)
+            value["teamEnemy"]["roles"] = []
+            observe_shadow(Turn.load(value), state)
+        many = [robot(i, "challenger") for i in range(600)]
+        damaged = payload(202, our_hp=90, robots=many)
+        damaged["teamEnemy"]["roles"] = []
+        observe_shadow(Turn.load(damaged), state)
+        result = shadow_diagnostic(state)
+        self.assertTrue(result["verification"]["sides"]["challenger"]["actualBaseDamage"])
+        self.assertEqual(result["verification"]["sides"]["challenger"]["baselineResult"], "false_negative")
+
+    def test_night_summary_accumulates_losses_despite_healing(self):
+        state = ShadowState()
+        self.observe(state, 70)
+        for round_no in range(71, 131):
+            hp = 90 if round_no == 72 else 100 if round_no < 80 else 80
+            robots = [robot(1, "challenger", health=40 if round_no >= 73 else 50)]
+            self.observe(state, round_no, our_hp=hp, robots=robots,
+                         our_walls=[wall(11, 90 if round_no >= 74 else 100)])
+        final = self.observe(state, 131, our_hp=80, robots=[])
+        metrics = final["recentNights"][-1]["sides"]["challenger"]["metrics"]
+        self.assertEqual(metrics["base"]["firstDamageRound"], 72)
+        self.assertEqual(metrics["base"]["cumulativeHpLoss"], 30)
+        self.assertEqual(metrics["robots"]["peakCount"], 1)
+        self.assertEqual(metrics["robots"]["cumulativeObservedHpLoss"], 10)
+        self.assertEqual(metrics["walls"]["damaged"], 1)
+
+    def test_current_pressure_distinguishes_damage_near_and_unknown(self):
+        state = ShadowState()
+        self.observe(state, 70)
+        near = self.observe(state, 71, robots=[robot(1, "challenger", x=3, y=3)])
+        self.assertEqual(near["currentPressure"]["sides"]["challenger"]["classification"], "threats_near_base")
+        self.assertEqual(near["nightSummary"]["observedRange"]["lastRound"], 71)
+        self.assertEqual(near["nightSummary"]["sides"]["challenger"]["robots"]["peakCount"], 1)
+        damaged = self.observe(state, 72, our_hp=90)
+        self.assertEqual(damaged["currentPressure"]["sides"]["challenger"]["classification"], "base_damage_observed")
+        unknown = ShadowState()
+        self.observe(unknown, 70)
+        missing = self.observe(unknown, 71, robots_observed=False)
+        self.assertEqual(missing["currentPressure"]["sides"]["challenger"]["classification"], "unknown")
+        far = self.observe(unknown, 72, robots=[robot(2, "challenger", x=15, y=15)])
+        self.assertEqual(far["currentPressure"]["sides"]["challenger"]["classification"], "no_near_threat_observed")
+
+    def test_observed_positive_survives_gap_and_incomplete_final(self):
+        state = ShadowState()
+        for round_no in range(1, 81):
+            self.observe(state, round_no, our_hp=90 if round_no >= 80 else 100)
+        self.assertEqual(shadow_diagnostic(state)["verification"]["status"], "event_observed")
+        self.observe(state, 82, our_hp=90)
+        self.assertTrue(shadow_diagnostic(state)["verification"]["actualBaseDamage"])
+        missing_base = payload(83)
+        missing_base["teamOur"]["roles"] = []
+        observe_shadow(Turn.load(missing_base), state)
+        self.assertEqual(shadow_diagnostic(state)["currentPressure"]["sides"]["challenger"]["classification"], "base_damage_observed")
+        final = self.observe(state, 131, our_hp=90)
+        self.assertFalse(final["verification"]["complete"])
+        self.assertTrue(final["verification"]["actualBaseDamage"])
+        self.assertEqual(len(final["recentNights"]), 1)
+
+    def test_robot_history_limit_does_not_erase_complete_base_negative(self):
+        state = ShadowState()
+        many = [robot(i, "challenger") for i in range(600)]
+        self.observe(state, 70)
+        for round_no in range(71, 131):
+            self.observe(state, round_no, robots=many)
+        final = self.observe(state, 131)
+        ours = final["verification"]["sides"]["challenger"]
+        self.assertIs(ours["actualBaseDamage"], False)
+        self.assertFalse(ours["metrics"]["completeness"]["robots"])
+        self.assertTrue(ours["metrics"]["completeness"]["base"])
+
+    def test_missing_base_never_means_destroyed(self):
+        state = ShadowState()
+        self.observe(state, 70)
+        for round_no in range(71, 131):
+            value = payload(round_no)
+            if round_no == 80:
+                value["teamOur"]["roles"] = []
+            observe_shadow(Turn.load(value), state)
+        final = self.observe(state, 131)
+        self.assertIsNone(final["verification"]["actualBaseDamage"])
+        self.assertFalse(final["verification"]["sides"]["challenger"]["metrics"]["completeness"]["base"])
+
+    def test_summary_tracks_threat_range_damage_streak_and_wall_events(self):
+        state = ShadowState()
+        self.observe(state, 70, our_walls=[wall(11, 100)])
+        for round_no in range(71, 131):
+            hp = (90 if round_no == 72 else 80 if round_no in (73, 74)
+                  else 70 if round_no >= 75 else 100)
+            robots = ([robot(1, "challenger", 50, x=3, y=3)] if round_no == 72
+                      else [robot(1, "challenger", 30, x=3, y=3)] if round_no == 73
+                      else [robot(2, "challenger", 100, x=15, y=15)] if round_no == 76
+                      else [])
+            walls = ([wall(11, 100)] if round_no == 71
+                     else [wall(11, 90)] if round_no == 72
+                     else [wall(11, 100)] if round_no == 73
+                     else [] if round_no == 75
+                     else [wall(11, 100, 2)])
+            self.observe(state, round_no, our_hp=hp, robots=robots,
+                         our_walls=walls)
+        final = self.observe(state, 131, our_hp=70,
+                             our_walls=[wall(11, 100, 2)])
+        metrics = final["recentNights"][-1]["sides"]["challenger"]["metrics"]
+        self.assertEqual(metrics["base"]["cumulativeHpLoss"], 30)
+        self.assertEqual(metrics["base"]["longestConsecutiveDamageRounds"], 2)
+        self.assertEqual(metrics["robots"]["firstThreat"]["roundNo"], 72)
+        self.assertEqual(metrics["robots"]["lastThreat"]["roundNo"], 76)
+        self.assertEqual(metrics["robots"]["peakHp"], 100)
+        self.assertEqual(metrics["robots"]["nearestBaseChebyshev"], 1)
+        self.assertEqual(metrics["robots"]["cumulativeObservedHpLoss"], 20)
+        self.assertEqual({name: metrics["walls"][name] for name in (
+            "damaged", "repairedSameLevel", "upgraded", "disappeared", "new",
+        )}, dict(damaged=1, repairedSameLevel=1, upgraded=1,
+                 disappeared=1, new=1))
 
 
 if __name__ == "__main__":

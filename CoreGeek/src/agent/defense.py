@@ -37,9 +37,20 @@ def daytime_post_assignments(
     max_expansions: int,
     unavailable_role_ids: frozenset[int] = frozenset(),
     reserved_weapon_ids: frozenset[int] = frozenset(),
+    diagnostic_sink: Callable[[dict], None] | None = None,
 ) -> dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]] | None:
     """Return one bounded, deterministic role/stand assignment per weapon."""
     if not turn.is_day or clock() >= deadline:
+        if diagnostic_sink is not None:
+            diagnostic_sink({
+                "status": "night" if not turn.is_day else "deadline",
+                "assigned": 0,
+                "required": sum(
+                    weapon.unit_id not in reserved_weapon_ids
+                    for weapon in turn.weapons()
+                ) if turn.is_day else 0,
+                "routeResults": {},
+            })
         return None
     day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
     if state.day_return_day != day:
@@ -55,6 +66,7 @@ def daytime_post_assignments(
         weapon for weapon in turn.weapons()
         if weapon.unit_id not in reserved_weapon_ids
     ]
+    route_results: dict[str, int] = {}
     result = _route_assignments(
         turn,
         state,
@@ -64,9 +76,24 @@ def daytime_post_assignments(
         deadline,
         max_expansions,
         respect_positioning_window=False,
+        route_results=route_results,
     )
     if clock() >= deadline:
+        if diagnostic_sink is not None:
+            diagnostic_sink({
+                "status": "deadline", "assigned": len(result),
+                "required": len(weapons), "routeResults": route_results,
+            })
         return None
+    if diagnostic_sink is not None:
+        diagnostic_sink({
+            "status": (
+                "complete" if len(result) == len(weapons)
+                else "partial" if result else "empty"
+            ),
+            "assigned": len(result), "required": len(weapons),
+            "routeResults": route_results,
+        })
     state.day_return_weapons = {
         role.unit_id: weapon_id
         for weapon_id, (role, _) in result.items()
@@ -1093,6 +1120,7 @@ def _route_assignments(
     max_expansions: int,
     *,
     respect_positioning_window: bool = True,
+    route_results: dict[str, int] | None = None,
 ) -> dict[int, tuple[Unit, tuple[Pos, Pos | None, int]]]:
     routes: dict[tuple[int, int], tuple[Pos, Pos | None, int]] = {}
     positioning_window = DUSK_POSITIONING_ROUNDS + max(len(weapons) - 1, 0)
@@ -1100,7 +1128,7 @@ def _route_assignments(
         for weapon in weapons:
             route = _gunner_route(
                 turn, role, weapon, clock, deadline, max_expansions,
-                state=state,
+                state=state, route_results=route_results,
             )
             if route is None:
                 continue
@@ -1188,6 +1216,7 @@ def _gunner_route(
     deadline: float,
     max_expansions: int,
     state: SessionState | None = None,
+    route_results: dict[str, int] | None = None,
 ) -> tuple[Pos, Pos | None, int] | None:
     blocked = turn.blocked(role)
     choices = [
@@ -1221,7 +1250,10 @@ def _gunner_route(
             clock=clock,
             deadline=deadline,
             max_expansions=max_expansions,
+            prefer_deep_ties=True,
         )
+        if route_results is not None:
+            route_results[path.status] = route_results.get(path.status, 0) + 1
         if path.status == "already_there":
             candidate = (stand, None, 0)
             if not turn.is_day or stable is None or stand == stable:

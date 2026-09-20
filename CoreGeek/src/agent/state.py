@@ -128,12 +128,27 @@ class NewsObservation:
     observed_day: int
 
 
+@dataclass(frozen=True, slots=True)
+class BaseReserve:
+    holder_id: int
+    station_id: int
+    station_level: int
+    item: str
+
+
 @dataclass(slots=True)
 class SessionState:
     team_id: str
     team_type: str
     session_index: int = 1
     pressure_shadow: ShadowState = field(default_factory=ShadowState)
+    base_reserve: BaseReserve | None = None
+    base_last_sample: tuple[int, int, int, int] | None = None
+    base_recent_drops: tuple[int, ...] = ()
+    base_reserve_event: str | None = None
+    base_blocked_day: int | None = None
+    base_blocked_holder_id: int | None = None
+    base_reserve_reason: str | None = None
     last_round_no: int | None = None
     last_fingerprint: str | None = None
     last_response: dict[str, Any] | None = None
@@ -249,6 +264,7 @@ class StateStore:
         self._apply_feedback(turn, payload)
         self._release_dead_roles(turn)
         self._release_invalid_plans(turn)
+        self._observe_base_upgrade(turn)
         self._observe_fortification(turn)
         observe_pressure(turn, state)
         self._update_task(
@@ -479,6 +495,26 @@ class StateStore:
                 success = feedback.get(owner_id)
             state.pending_actions.pop(owner_id)
             state.action_history.append(CompletedAction(pending, success))
+            reserve = state.base_reserve
+            if (
+                reserve is not None
+                and pending.actor_id == reserve.holder_id
+                and pending.name == reserve.item
+                and pending.action in ("buy", "use")
+                and success is False
+            ):
+                state.base_reserve = None
+                state.base_reserve_event = f"{pending.action}_failed"
+                state.base_blocked_day = self._day(turn.round_no)
+                state.base_blocked_holder_id = pending.actor_id
+            elif (
+                reserve is not None
+                and pending.actor_id == reserve.holder_id
+                and pending.name == reserve.item
+                and pending.action in ("buy", "use")
+                and success is True
+            ):
+                state.base_reserve_event = f"{pending.action}_reported"
             if (
                 pending.action == "build"
                 and pending.name == "wall"
@@ -539,6 +575,59 @@ class StateStore:
                 state.pending_actions.pop(owner_id)
                 state.action_history.append(CompletedAction(pending, None))
         del state.action_history[:-MAX_ACTION_HISTORY]
+
+    def _observe_base_upgrade(self, turn: Turn) -> None:
+        state = self._require_state()
+        station = turn.station()
+        previous = state.base_last_sample
+        if station is None:
+            state.base_last_sample = None
+            state.base_recent_drops = ()
+            state.base_reserve = None
+            return
+        if (
+            previous is not None
+            and previous[:2] == (station.unit_id, station.level)
+            and previous[2] == turn.round_no - 1
+        ):
+            state.base_recent_drops = (
+                *state.base_recent_drops[-2:],
+                max(0, previous[3] - station.health),
+            )
+        else:
+            state.base_recent_drops = ()
+        state.base_last_sample = (
+            station.unit_id, station.level, turn.round_no, station.health,
+        )
+        reserve = state.base_reserve
+        if reserve is None:
+            return
+        holder = turn.unit(reserve.holder_id)
+        if station.unit_id != reserve.station_id or station.level != reserve.station_level:
+            state.base_reserve = None
+            state.base_reserve_event = "upgrade_observed"
+        elif holder is None:
+            state.base_reserve = None
+            state.base_reserve_event = "holder_lost"
+        elif state.base_reserve_event == "use_reported":
+            state.base_reserve = None
+            state.base_reserve_event = "use_unconfirmed"
+            state.base_blocked_day = self._day(turn.round_no)
+            state.base_blocked_holder_id = reserve.holder_id
+        elif state.base_reserve_event == "buy_reported" and reserve.item not in holder.backpack:
+            state.base_reserve = None
+            state.base_reserve_event = "buy_unconfirmed"
+            state.base_blocked_day = self._day(turn.round_no)
+            state.base_blocked_holder_id = reserve.holder_id
+        elif reserve.item not in holder.backpack and not any(
+            plan.role_id == reserve.holder_id
+            and plan.reason.startswith(f"fund:{reserve.item}:")
+            for plan in state.plans.values()
+        ):
+            state.base_reserve = None
+            state.base_reserve_event = "voucher_missing"
+        elif reserve.item in holder.backpack and state.base_reserve_event == "buy_reported":
+            state.base_reserve_event = "held"
 
     def _release_invalid_plans(self, turn: Turn) -> None:
         state = self._require_state()
