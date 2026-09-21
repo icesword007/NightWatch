@@ -4,6 +4,7 @@
 
 - 中文沟通，称呼用户喵总。仓库CoreGeek是改造后的参赛程序，不能当赛方原始SDK或规则；外层正式资料只读。
 - `CoreGeek/src/agent/`存参赛模块；`CoreGeek/main3.py`入口，`CoreGeek/run.sh`启动。`CoreGeek/tests/test_*.py`及fixtures存受控测试；不提交真实日志、题面答案、凭据、.DS_Store或缓存。
+- `CoreGeek/analyze_logs.py`只读分析本地服务端逐轮日志，`CoreGeek/tests/test_log_analysis.py`用合成记录验收；`【codex】offline-log-analysis.md`记录用法与字段边界。分析结果只向stdout输出脱敏JSON，不在仓库保存输入或原始内容。
 - 仓库生成Markdown使用【codex】前缀；AGENTS.md例外。新目录先约定用途。临时材料用系统临时目录，不混入仓库。
 
 ## 分工与操作边界
