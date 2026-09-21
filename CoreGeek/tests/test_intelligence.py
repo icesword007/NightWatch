@@ -95,6 +95,62 @@ def task_payload(round_no=1, *, phase=""):
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_citation_prompt_explains_contiguous_source_excerpts(self):
+        first = payload(team_id="intelligence-citation-prompt")
+        first["worldNews"]["officialNews"] = "North ... south; gate opens."
+        store = StateStore()
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        prompt = request.prompt
+        self.assertIn("top-level and field citations", prompt)
+        self.assertIn("contiguous substring", prompt)
+        self.assertIn("JSON decoding", prompt)
+        self.assertIn("Do not insert ellipses or join separated passages", prompt)
+        self.assertIn("separate citations", prompt)
+        self.assertIn("Literal ellipses already in the source", prompt)
+        self.assertIn("citation excerpts at most 512 characters", prompt)
+        self.assertLessEqual(len(prompt), intelligence.MAX_NEWS_PROMPT_CHARS)
+
+        claim = treasure_candidate(request, conditions={
+            "location": cited(source, {"x": 4, "y": 5}, "North ... south"),
+            "window": None, "items": None,
+        })
+        claim["citations"] = [
+            {"sourceId": source.source_id, "excerpt": "North ... south"},
+            {"sourceId": source.source_id, "excerpt": "gate opens"},
+        ]
+        good = intelligence.parse_news_response(
+            request, valid_response(request, candidates=[claim]))
+        self.assertIsNone(good.rejection_reason)
+        bad_top = {**claim, "citations": [
+            {"sourceId": source.source_id, "excerpt": "North ... gate opens"}]}
+        self.assertEqual(intelligence.parse_news_response(
+            request, valid_response(request, candidates=[bad_top])
+        ).rejection_reason, "invalid_candidate")
+        bad_field = {**claim, "treasureConditions": {
+            **claim["treasureConditions"], "location": cited(
+                source, {"x": 4, "y": 5}, "North ... gate opens")}}
+        self.assertEqual(intelligence.parse_news_response(
+            request, valid_response(request, candidates=[bad_field])
+        ).rejection_reason, "invalid_candidate")
+
+    def test_citation_prompt_keeps_source_selection_within_hard_limit(self):
+        from types import SimpleNamespace
+
+        sources = [SimpleNamespace(
+            category=f"synthetic{i}", value="x" * 1024,
+            value_fingerprint=f"{i:064x}", source_session=1,
+            source_round=1, source_day=1, value_truncated=False,
+        ) for i in range(8)]
+        request = intelligence.build_news_request(
+            sources, session=1, round_no=1, day=1,
+        )
+        self.assertEqual(len(request.sources), 7)
+        self.assertTrue(all(len(source.text) == 1024 for source in request.sources))
+        self.assertLessEqual(len(request.prompt), intelligence.MAX_NEWS_PROMPT_CHARS)
+
     def test_news_rejection_detail_identifies_first_invalid_candidate(self):
         # Break caught: one malformed candidate hides which field rejected the batch.
         store = StateStore()

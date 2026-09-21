@@ -7,7 +7,9 @@ from pathlib import Path
 from agent.actions import ActionAllocator, ActionProposal, PlannedAction
 from agent.brain import DecisionEngine
 from agent.defense import daytime_post_assignments, daytime_work_can_return
-from agent.protocol import sell_command
+from agent.economy import propose_economy
+from agent.grid import next_step
+from agent.protocol import move_command, sell_command
 from agent.protocol import Pos, Turn
 from agent.state import StateStore, request_fingerprint
 
@@ -71,6 +73,27 @@ def defense_payload(*, round_no=71):
     return payload
 
 
+def long_day_work_payload(*, round_no=10, vendor=(34, 14)):
+    payload = defense_payload(round_no=round_no)
+    payload["mapInfo"].update({
+        "width": 41, "height": 32,
+        "zones": [{"pos": {"x": vendor[0], "y": vendor[1]},
+                   "neutralType": "vendor"}],
+    })
+    worker = unit(10010, "worker", 33, 14)
+    worker["backpack"] = ["copper"]
+    payload["teamOur"]["roles"] = [
+        worker, unit(10013, "station", 9, 22, health=1500),
+        unit(10020, "rocket", 7, 20, health=1000),
+        unit(10021, "rocket", 8, 21, health=1000),
+        unit(10022, "rocket", 9, 21, health=1000),
+    ]
+    payload["teamEnemy"]["roles"] = []
+    payload["robot"]["roles"] = []
+    payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+    return payload
+
+
 def state_for(payload):
     store = StateStore()
     turn = Turn.load(payload)
@@ -91,6 +114,80 @@ def proposals(payload):
 
 
 class DefenseTests(unittest.TestCase):
+    def test_long_legal_sale_keeps_exact_post_return_route(self):
+        payload = long_day_work_payload()
+        turn = Turn.load(payload)
+        worker = turn.unit(10010)
+        candidate = PlannedAction(ActionProposal(
+            10010, 10010, sell_command("copper", 1),
+        ))
+        route = (Pos(7, 19), None, 26)
+        assignments = {10020: (worker, route)}
+        kwargs = dict(clock=lambda: 0.0, deadline=1.0, max_expansions=256)
+        self.assertTrue(daytime_work_can_return(
+            turn, worker, candidate, route, assignments, **kwargs,
+        ))
+        economy_candidates = propose_economy(
+            turn, state_for(payload), **kwargs,
+        )
+        self.assertTrue(any(item.proposal.command["action"] == "sell"
+                            for item in economy_candidates))
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(payload)["roleCommandMap"]["10010"],
+            sell_command("copper", 1),
+        )
+        late = Turn.load(long_day_work_payload(round_no=43))
+        self.assertFalse(daytime_work_can_return(
+            late, late.unit(10010), candidate, route,
+            {10020: (late.unit(10010), route)}, **kwargs,
+        ))
+        blocked = long_day_work_payload()
+        blocked["teamOur"]["roles"].append(
+            unit(10023, "wall", 7, 19, health=1000),
+        )
+        blocked_turn = Turn.load(blocked)
+        self.assertFalse(daytime_work_can_return(
+            blocked_turn, blocked_turn.unit(10010), candidate, route,
+            {10020: (blocked_turn.unit(10010), route)}, **kwargs,
+        ))
+
+    def test_long_work_route_uses_same_first_step_as_deep_economy_path(self):
+        defense = importlib.import_module("agent.defense")
+        turn = Turn.load(long_day_work_payload(vendor=(7, 19)))
+        worker = turn.unit(10010)
+        target = Pos(7, 19)
+        kwargs = dict(clock=lambda: 0.0, deadline=1.0, max_expansions=256)
+        route = defense._day_work_route(turn, worker, target, **kwargs)
+        self.assertIsNotNone(route)
+        stand, cost, first_step = route
+        economic_path = next_step(
+            turn, worker, stand, prefer_deep_ties=True, **kwargs,
+        )
+        self.assertEqual((cost, first_step),
+                         (economic_path.cost, economic_path.step))
+        candidate = PlannedAction(ActionProposal(
+            10010, 10010, move_command(first_step), destination=first_step,
+        ), plan_target=target, plan_reason="vendor")
+        post = (Pos(6, 19), None, 27)
+        self.assertTrue(daytime_work_can_return(
+            turn, worker, candidate, post,
+            {10020: (worker, post)}, **kwargs,
+        ))
+        unreachable = long_day_work_payload(vendor=(7, 19))
+        unreachable["teamOur"]["roles"].extend(
+            unit(20000 + y, "wall", 20, y, health=1000)
+            for y in range(32)
+        )
+        cut_turn = Turn.load(unreachable)
+        cut_worker = cut_turn.unit(10010)
+        self.assertIsNone(defense._day_work_route(
+            cut_turn, cut_worker, target, **kwargs,
+        ))
+        self.assertFalse(daytime_work_can_return(
+            cut_turn, cut_worker, candidate, post,
+            {10020: (cut_worker, post)}, **kwargs,
+        ))
+
     def test_post_assignment_diagnostic_distinguishes_budget_partial_and_deadline(self):
         self.assertIn(
             "diagnostic_sink", inspect.signature(daytime_post_assignments).parameters,
