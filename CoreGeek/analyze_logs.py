@@ -113,20 +113,19 @@ def base_state(record):
         return None, "base_missing"
     base_id = base.get("id")
     hp = base.get("health", MISSING)
-    if base_id is None or classified(hp) != "known":
-        return None, "base_identity_or_hp_unknown"
     structures = value_at(record, "ourStructures")
-    if not isinstance(structures, dict) or structures.get("truncated") is True:
-        return None, "structures_missing_or_truncated"
-    items = structures.get("items")
+    items = structures.get("items") if isinstance(structures, dict) else None
     if not isinstance(items, list):
-        return None, "structures_missing_or_truncated"
+        items = []
     matching = [item for item in items if isinstance(item, dict)
                 and item.get("type") == "station" and item.get("id") == base_id]
-    if len(matching) != 1 or classified(matching[0].get("level", MISSING)) != "known":
-        return None, "base_level_unknown"
+    level = matching[0].get("level", MISSING) if len(matching) == 1 else MISSING
+    if type(level) is not int or level < 1:
+        level = MISSING
     defense = []
-    position_unknown = False
+    position_unknown = (not isinstance(structures, dict)
+                        or structures.get("truncated") is True
+                        or not isinstance(structures.get("items"), list))
     for item in items:
         if not isinstance(item, dict) or item.get("type") == "station":
             continue
@@ -141,7 +140,11 @@ def base_state(record):
         defense.append((str(item.get("id")), str(item.get("type")),
                         repr(item.get("level")), repr(item.get("health")), position))
     defense.sort(key=lambda item: (item[:4], repr(item[4])))
-    return (base_id, matching[0]["level"], hp, defense, position_unknown), None
+    error = (
+        "base_identity_or_hp_unknown" if base_id is None or classified(hp) != "known"
+        else "base_level_unknown" if level is MISSING else None
+    )
+    return (base_id, level, hp, defense, position_unknown), error
 
 
 def history_comparisons(by_round, sequence_complete, identity_unknown):
@@ -274,7 +277,9 @@ def summarize_group(key, records):
             continue
         previous, _ = base_state(left)
         current, _ = base_state(right)
-        if previous and current and previous[0] == current[0] and current[1] > previous[1]:
+        if (previous and current and previous[0] == current[0]
+            and type(previous[1]) is int and type(current[1]) is int
+            and current[1] > previous[1]):
             level_increases += 1
     upgrade_requests = 0
     truncated = Counter()

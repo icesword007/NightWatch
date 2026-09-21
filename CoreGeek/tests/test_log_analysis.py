@@ -129,8 +129,85 @@ class OfflineAnalysisTests(unittest.TestCase):
         self.assertEqual(result["base"]["observedLevelIncreases"], 1)
         self.assertEqual(result["base"]["requestedUpgradeUses"], 1)
         self.assertEqual(result["truncatedSections"]["ourStructures"], 1)
-        self.assertEqual(result["base"]["unknownReasons"],
-                         {"structures_missing_or_truncated": 1})
+        self.assertEqual(result["base"]["health"]["known"], 3)
+        self.assertEqual(result["base"]["level"]["known"], 3)
+        self.assertEqual(result["base"]["unknownReasons"], {})
+
+    def test_truncated_real_record_keeps_visible_base_hp_and_level(self):
+        roles = [{"id": "base-a", "roleType": "station", "health": 1480,
+                  "level": 2, "pos": {"x": 1, "y": 1}}]
+        roles += [{"id": f"wall-{i:02d}", "roleType": "wall",
+                   "health": 100, "level": 1, "pos": {"x": i + 2, "y": 2}}
+                  for i in range(20)]
+        record = turn_log_record({"roundNo": 330,
+            "teamOur": {"type": "challenger", "teamId": "team-a",
+                        "roles": roles}, "teamEnemy": {"roles": []}},
+            {"roleCommandMap": {}}, {"processing": 1, "decide": 1},
+            decision_trace={"newsEvidence": {"currentSession": 1}})
+        self.assertTrue(record["ourStructures"]["truncated"])
+        self.assertTrue(any(item["type"] == "station"
+                            for item in record["ourStructures"]["items"]))
+        result = self.run_rows(record)["groups"][0]["base"]
+        self.assertEqual(result["health"]["known"], 1)
+        self.assertEqual(result["health"]["min"], 1480)
+        self.assertEqual(result["level"]["min"], 2)
+
+    def test_truncated_record_without_visible_base_keeps_hp_only(self):
+        record = row(1, hp=1480, level=2)
+        record["ourStructures"] = {"truncated": True, "items": [
+            {"id": f"wall-{i:02d}", "type": "wall", "level": 1,
+             "health": 100, "pos": {"x": i, "y": 2}}
+            for i in range(16)]}
+        result = self.run_rows(record)["groups"][0]["base"]
+        self.assertEqual(result["health"]["known"], 1)
+        self.assertEqual(result["level"]["known"], 0)
+        self.assertEqual(result["unknownReasons"], {"base_level_unknown": 1})
+
+    def test_truncated_night_keeps_observed_hp_drop_but_not_defense_comparison(self):
+        history = {"historyInvestment": {"status": "assessed", "baselineNight": 1,
+                    "defenseComparison": "approximately_comparable"}}
+        records = [row(200, hp=100, decision=history)]
+        records += [row(n, hp=100 - (n - 200)) for n in range(201, 262)]
+        for record in records:
+            record["ourStructures"]["truncated"] = True
+        comparison = self.run_rows(*records)["groups"][0][
+            "historyInvestment"]["comparisons"][0]
+        self.assertEqual(comparison["actualObservedHpDrop"], 60)
+        self.assertEqual(comparison["defenseComparison"], "unknown")
+        self.assertEqual(comparison["status"], "observed")
+
+    def test_truncated_night_missing_level_remains_unknown(self):
+        history = {"historyInvestment": {"status": "assessed", "baselineNight": 1}}
+        records = [row(200, hp=100, decision=history)]
+        records += [row(n, hp=100 - (n - 200)) for n in range(201, 262)]
+        for record in records:
+            record["ourStructures"]["truncated"] = True
+        records[31]["ourStructures"]["items"] = []
+        comparison = self.run_rows(*records)["groups"][0][
+            "historyInvestment"]["comparisons"][0]
+        self.assertEqual(comparison["status"], "unknown")
+        self.assertIn("base_level_unknown", comparison["unknowns"])
+
+    def test_truncated_night_gap_heal_or_upgrade_still_unknown(self):
+        history = {"historyInvestment": {"status": "assessed", "baselineNight": 1}}
+        for case, reason in (("gap", "night_frames_missing"),
+                             ("heal", "base_healed"),
+                             ("upgrade", "base_identity_or_level_changed")):
+            with self.subTest(case=case):
+                records = [row(200, hp=100, decision=history)]
+                records += [row(n, hp=100 - (n - 200)) for n in range(201, 262)]
+                for record in records:
+                    record["ourStructures"]["truncated"] = True
+                if case == "gap":
+                    records = [record for record in records if record["roundNo"] != 230]
+                elif case == "heal":
+                    records[31]["bases"]["our"]["health"] = 200
+                else:
+                    records[31]["ourStructures"]["items"][0]["level"] = 2
+                comparison = self.run_rows(*records)["groups"][0][
+                    "historyInvestment"]["comparisons"][0]
+                self.assertEqual(comparison["status"], "unknown")
+                self.assertIn(reason, comparison["unknowns"])
 
     def test_unrecognized_lines_and_secret_error_never_echo(self):
         result = analyze_lines([

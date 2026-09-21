@@ -152,6 +152,7 @@ def daytime_work_can_return(
         clock=clock,
         deadline=deadline,
         max_expansions=max_expansions,
+        prefer_deep_ties=True,
     )
     if result.status == "already_there":
         return_rounds = 0
@@ -266,6 +267,7 @@ def _day_work_route(
             clock=clock,
             deadline=deadline,
             max_expansions=max_expansions,
+            prefer_deep_ties=True,
         )
         if path.status == "already_there":
             return stand, 0, None
