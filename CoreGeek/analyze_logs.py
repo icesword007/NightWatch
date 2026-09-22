@@ -11,6 +11,7 @@ import sys
 
 LOG_PREFIX = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3} \| ({.*)$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+TASK_INSTANCE = re.compile(r"^[0-9]{1,10}:[0-9]{1,10}$")
 DAY_ROUNDS = 70
 ROUNDS_PER_DAY = 130
 MISSING = object()
@@ -29,6 +30,20 @@ DEFENSE_CHANGES = frozenset({
     "taskReservedRoles_unknown", "task_occupancy_changed",
     "night_walls_changed", "day_walls_changed", "day_base_hp_decreased",
 })
+TASK_END_REASONS = frozenset({
+    "unknown", "timeout", "death", "left_point", "replaced",
+})
+SOLVER_STOP_REASONS = frozenset({
+    "invalid_envelope_after_correction", "command_after_envelope_correction",
+    "command_after_final_request", "command_result_at_deadline",
+    "deadline_after_failed_submission", "deadline_repeated_answer",
+    "deadline_without_answer", "repeated_cycle_at_deadline",
+    "repeated_failed_command", "repeated_identical_tool_result",
+    "solver_abandoned", "vacuous_partial_after_correction",
+    "vacuous_partial_at_deadline",
+})
+SIDES = ("challenger", "defender")
+RISK = frozenset({"unknown", "low", "elevated"})
 
 
 def number(value):
@@ -62,6 +77,203 @@ def safe_id(value):
         if SAFE_ID.fullmatch(value):
             return value
     return None
+
+
+def task_instance(value, session):
+    if session is None:
+        return None
+    if not isinstance(value, str) or not TASK_INSTANCE.fullmatch(value):
+        return None
+    if value.split(":", 1)[0] != str(session):
+        return None
+    return value
+
+
+def nonnegative_int(value):
+    return value if type(value) is int and value >= 0 else None
+
+
+def task_summary(records, session, sequence_complete):
+    instances = {}
+    unattributed = 0
+
+    def entry(instance_id):
+        return instances.setdefault(instance_id, {
+            "instanceId": instance_id, "firstObservedRound": None,
+            "lastObservedRound": None, "submitAnswerRequests": 0,
+            "end": None,
+            "successStatus": "unknown", "unknowns": [],
+        })
+
+    for record in records:
+        decision = record.get("decision")
+        decision = decision if isinstance(decision, dict) else {}
+        instance_id = task_instance(decision.get("taskInstanceId"), session)
+        if instance_id is not None:
+            item = entry(instance_id)
+            round_no = record["roundNo"]
+            if item["firstObservedRound"] is None:
+                item["firstObservedRound"] = round_no
+            item["firstObservedRound"] = min(item["firstObservedRound"], round_no)
+            item["lastObservedRound"] = max(item["lastObservedRound"] or 0, round_no)
+            commands = record.get("commands")
+            if isinstance(commands, dict):
+                rows = commands.get("items")
+                if isinstance(rows, list):
+                    item["submitAnswerRequests"] += sum(
+                        isinstance(command, dict)
+                        and command.get("action") == "submitAnswer"
+                        for command in rows)
+                else:
+                    item["unknowns"].append("commands_missing")
+                if commands.get("truncated") is True:
+                    item["unknowns"].append("commands_truncated")
+            else:
+                item["unknowns"].append("commands_missing")
+        elif value_at(record, "task", "active") is True:
+            unattributed += 1
+
+        ended = decision.get("taskEnd")
+        if not isinstance(ended, dict):
+            continue
+        ended_id = task_instance(ended.get("instanceId"), session)
+        if ended_id is None:
+            unattributed += 1
+            continue
+        item = entry(ended_id)
+        if ended.get("endRound") != record["roundNo"]:
+            item["unknowns"].append("end_round_mismatch")
+            continue
+        codes = ended.get("associatedErrorCodes")
+        codes = sorted({code for code in codes if type(code) is int and code in (1, 2)}) \
+            if isinstance(codes, list) else []
+        item["end"] = {
+            "acceptedRound": nonnegative_int(ended.get("acceptedRound")),
+            "timeoutRound": nonnegative_int(ended.get("timeoutRound")),
+            "endRound": nonnegative_int(ended.get("endRound")),
+            "endReason": ended.get("endReason")
+                if isinstance(ended.get("endReason"), str)
+                and ended.get("endReason") in TASK_END_REASONS else "unknown",
+            "submissionCount": nonnegative_int(ended.get("submissionCount")),
+            "associatedErrorCodes": codes,
+            "solverStoppedReason": ended.get("solverStoppedReason")
+                if isinstance(ended.get("solverStoppedReason"), str)
+                and ended.get("solverStoppedReason") in SOLVER_STOP_REASONS else None,
+            "observedTeamScoreDelta": ended.get("observedTeamScoreDelta")
+                if type(ended.get("observedTeamScoreDelta")) is int else None,
+            "observedGoldDelta": ended.get("observedGoldDelta")
+                if type(ended.get("observedGoldDelta")) is int else None,
+            "attribution": "unattributed", "successStatus": "unknown",
+        }
+
+    for item in instances.values():
+        if item["end"] is None:
+            item["unknowns"].append("end_not_observed")
+        if not sequence_complete:
+            item["unknowns"].append("sequence_ambiguous")
+        item["unknowns"] = sorted(set(item["unknowns"]))
+    return {"instances": [instances[key] for key in sorted(instances)],
+            "unattributedFrames": unattributed,
+            "source": "turn_commands_visible_only",
+            "successStatus": "unknown"}
+
+
+def pressure_summary(records, identity_unknown):
+    nights = {}
+    for record in records:
+        shadow = value_at(record, "decision", "pressureShadow")
+        if not isinstance(shadow, dict):
+            continue
+        prediction = shadow.get("prediction")
+        if isinstance(prediction, dict) and prediction.get("status") == "issued":
+            night = nonnegative_int(prediction.get("night"))
+            if night:
+                nights.setdefault(night, {})["prediction"] = prediction
+        verifications = [shadow.get("verification")]
+        recent = shadow.get("recentNights")
+        if isinstance(recent, list):
+            verifications.extend(recent[:3])
+        for verification in verifications:
+            if not isinstance(verification, dict):
+                continue
+            night = nonnegative_int(verification.get("night"))
+            status = verification.get("status")
+            if not night or status not in ("event_observed", "final"):
+                continue
+            item = nights.setdefault(night, {})
+            observed_round = nonnegative_int(value_at(
+                verification, "observedRange", "lastRound"))
+            if observed_round is None or observed_round > record["roundNo"]:
+                observed_round = record["roundNo"]
+            current = item.get("verification")
+            current_round = item.get("verificationRound", -1)
+            if (current is None
+                or status == "final" and current.get("status") != "final"
+                or status == current.get("status") and observed_round > current_round):
+                item["verification"] = verification
+                item["verificationRound"] = observed_round
+
+    scores = {name: Counter() for name in ("assessment", "persistenceBaseline")}
+    scores_by_side = {side: {name: Counter() for name in scores} for side in SIDES}
+    output = []
+    for night in sorted(nights):
+        item = nights[night]
+        prediction = item.get("prediction", {})
+        verification = item.get("verification", {})
+        predicted_sides = prediction.get("sides") if isinstance(prediction.get("sides"), dict) else {}
+        verified_sides = verification.get("sides") if isinstance(verification.get("sides"), dict) else {}
+        sides = {}
+        for side in SIDES:
+            predicted = predicted_sides.get(side, {})
+            verified = verified_sides.get(side, {})
+            predicted = predicted if isinstance(predicted, dict) else {}
+            verified = verified if isinstance(verified, dict) else {}
+            assessment = predicted.get("assessment")
+            baseline = predicted.get("persistenceBaseline")
+            risk_values = {
+                "assessment": assessment.get("risk") if isinstance(assessment, dict) else None,
+                "persistenceBaseline": baseline.get("risk") if isinstance(baseline, dict) else None,
+            }
+            actual = verified.get("actualBaseDamage")
+            if identity_unknown or (actual is not True and not (
+                actual is False and verification.get("status") == "final"
+                and verification.get("complete") is True
+            )):
+                actual = None
+            side_summary = {"actualBaseDamage": actual,
+                            "observation": verification.get("status")
+                                if verification else "missing"}
+            for name, risk in risk_values.items():
+                risk = risk if isinstance(risk, str) and risk in RISK else "unknown"
+                side_summary[name + "Risk"] = risk
+                result = (
+                    "unscorable" if actual is None or risk == "unknown" else
+                    "hit" if risk == "elevated" and actual else
+                    "falsePositive" if risk == "elevated" else
+                    "falseNegative" if actual else "correctNegative"
+                )
+                side_summary[name + "Result"] = result
+                scores[name][result] += 1
+                scores_by_side[side][name][result] += 1
+            sides[side] = side_summary
+        output.append({"night": night, "verificationStatus":
+                       verification.get("status") if verification else "missing",
+                       "sides": sides})
+    score_keys = ("hit", "falseNegative", "falsePositive",
+                  "correctNegative", "unscorable")
+    return {"nights": output, "identityUnknown": identity_unknown,
+            "coverage": {
+        "nights": len(output),
+        "predictionNights": sum("prediction" in value for value in nights.values()),
+        "finalNights": sum(value.get("verification", {}).get("status") == "final"
+                           for value in nights.values()),
+        "eventOnlyNights": sum(value.get("verification", {}).get("status") == "event_observed"
+                               for value in nights.values()),
+    }, "scores": {name: {key: counter[key] for key in score_keys}
+        for name, counter in scores.items()},
+        "scoresBySide": {side: {name: {key: counter[key] for key in score_keys}
+            for name, counter in by_name.items()}
+            for side, by_name in scores_by_side.items()}}
 
 
 def numeric_summary(values):
@@ -360,6 +572,8 @@ def summarize_group(key, records):
         "errors": {"count": numeric_summary([value_at(record, "errorCount")
                                              for record in unique_records])},
         "historyInvestment": history_comparisons(by_round, sequence_complete, identity_unknown),
+        "tasks": task_summary(unique_records, session, sequence_complete),
+        "pressure": pressure_summary(unique_records, identity_unknown),
     }
 
 

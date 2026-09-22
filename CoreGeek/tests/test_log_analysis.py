@@ -1,8 +1,15 @@
+import copy
 import json
 import unittest
+from pathlib import Path
 
+from agent.pressure_shadow import ShadowState, observe_shadow, shadow_diagnostic
+from agent.protocol import Turn
 from agent.server import turn_log_record
 from analyze_logs import analyze_lines
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
 
 
 def row(round_no, *, session=1, build="r-test", hp=100, level=1,
@@ -43,6 +50,235 @@ class OfflineAnalysisTests(unittest.TestCase):
         self.assertEqual(result["groups"][0]["frames"], 1)
         self.assertEqual(result["groups"][0]["economy"]["gold"]["zero"], 1)
         self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(result))
+
+    def test_tasks_end_event_uses_ended_instance_and_never_infers_success(self):
+        first = row(1, decision={"taskInstanceId": "1:1"})
+        first["commands"] = {"items": [{"action": "submitAnswer"}],
+                             "truncated": False}
+        ended = row(2, decision={"taskInstanceId": "1:2", "taskEnd": {
+            "instanceId": "1:1", "endRound": 2, "endReason": "unknown",
+            "submissionCount": 1, "associatedErrorCodes": [],
+            "solverStoppedReason": None, "observedTeamScoreDelta": 10,
+            "observedGoldDelta": 5, "attribution": "unattributed",
+            "successStatus": "unknown", "acceptedRound": 1,
+            "timeoutRound": 20, "answer": "SENSITIVE_SENTINEL",
+        }})
+        result = self.run_rows(first, ended)["groups"][0]["tasks"]
+        by_id = {item["instanceId"]: item for item in result["instances"]}
+        self.assertEqual(by_id["1:1"]["submitAnswerRequests"], 1)
+        self.assertEqual(by_id["1:1"]["end"]["endRound"], 2)
+        self.assertEqual(by_id["1:1"]["successStatus"], "unknown")
+        self.assertIsNone(by_id["1:2"]["end"])
+        self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(result))
+
+    def test_task_end_retains_production_envelope_stop_reasons(self):
+        for reason in ("invalid_envelope_after_correction",
+                       "command_after_envelope_correction"):
+            with self.subTest(reason=reason):
+                record = row(2, decision={"taskEnd": {
+                    "instanceId": "1:1", "endRound": 2,
+                    "solverStoppedReason": reason}})
+                instance = self.run_rows(record)["groups"][0]
+                self.assertEqual(instance["tasks"]["instances"][0]
+                                 ["end"]["solverStoppedReason"], reason)
+
+    def test_task_detail_submitted_items_are_ignored_not_request_count(self):
+        turn = row(1, decision={"taskInstanceId": "1:1"})
+        turn["requestFingerprint"] = "f" * 64
+        detail = {"event": "task_detail", "roundNo": 1,
+                  "buildId": "r-test", "team": turn["team"],
+                  "requestFingerprint": "f" * 64, "taskInstanceId": "1:1",
+                  "submittedAnswers": {"items": [
+                      {"text": "SENSITIVE_SENTINEL"}], "truncated": True},
+                  "text": {"prompt": "SENSITIVE_SENTINEL"}}
+        output = self.run_rows(turn, detail)
+        result = output["groups"][0]["tasks"]
+        instance = result["instances"][0]
+        self.assertEqual(instance["submitAnswerRequests"], 0)
+        self.assertEqual(output["input"]["ignoredOtherEvents"], 1)
+        self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(result))
+
+    def test_pressure_scores_two_sides_once_per_night_with_event_final_priority(self):
+        prediction = {"status": "issued", "night": 1, "sides": {
+            "challenger": {"assessment": {"risk": "unknown"},
+                           "persistenceBaseline": {"risk": "elevated"}},
+            "defender": {"assessment": {"risk": "unknown"},
+                         "persistenceBaseline": {"risk": "low"}},
+        }}
+        event = {"status": "event_observed", "night": 1, "complete": False,
+                 "sides": {"challenger": {"actualBaseDamage": True},
+                           "defender": {"actualBaseDamage": None}}}
+        final = {"status": "final", "night": 1, "complete": True,
+                 "sides": {"challenger": {"actualBaseDamage": True},
+                           "defender": {"actualBaseDamage": False}}}
+        records = [row(71, decision={"pressureShadow": {
+            "prediction": prediction, "verification": event}}),
+            row(131, decision={"pressureShadow": {
+                "prediction": prediction, "verification": final,
+                "recentNights": [final]}}),
+            row(132, decision={"pressureShadow": {
+                "prediction": prediction, "verification": final,
+                "recentNights": [final]}})]
+        result = self.run_rows(*records)["groups"][0]["pressure"]
+        self.assertEqual(result["coverage"]["nights"], 1)
+        self.assertEqual(result["coverage"]["finalNights"], 1)
+        self.assertEqual(result["scores"]["assessment"]["unscorable"], 2)
+        self.assertEqual(result["scores"]["persistenceBaseline"]["hit"], 1)
+        self.assertEqual(result["scores"]["persistenceBaseline"]["correctNegative"], 1)
+        self.assertEqual(result["nights"][0]["sides"]["defender"]["actualBaseDamage"], False)
+
+    def test_pressure_event_only_and_missing_tail_do_not_create_no_damage(self):
+        prediction = {"status": "issued", "night": 1, "sides": {
+            "challenger": {"assessment": {"risk": "unknown"},
+                           "persistenceBaseline": {"risk": "low"}},
+            "defender": {"assessment": {"risk": "unknown"},
+                         "persistenceBaseline": {"risk": "low"}},
+        }}
+        event = {"status": "event_observed", "night": 1, "complete": False,
+                 "sides": {"challenger": {"actualBaseDamage": True},
+                           "defender": {"actualBaseDamage": False}}}
+        record = row(71, decision={"pressureShadow": {
+            "prediction": prediction, "verification": event}})
+        result = self.run_rows(record)["groups"][0]["pressure"]
+        self.assertEqual(result["coverage"]["eventOnlyNights"], 1)
+        self.assertIsNone(result["nights"][0]["sides"]["defender"]["actualBaseDamage"])
+        self.assertEqual(result["scores"]["persistenceBaseline"]["falseNegative"], 1)
+        self.assertEqual(result["scores"]["persistenceBaseline"]["unscorable"], 1)
+
+    def test_pressure_later_event_updates_both_sides_without_final(self):
+        prediction = {"status": "issued", "night": 1, "sides": {
+            side: {"assessment": {"risk": "unknown"},
+                   "persistenceBaseline": {"risk": "elevated"}}
+            for side in ("challenger", "defender")}}
+        earlier = {"status": "event_observed", "night": 1,
+            "observedRange": {"lastRound": 75}, "complete": False,
+            "sides": {"challenger": {"actualBaseDamage": True},
+                      "defender": {"actualBaseDamage": None}}}
+        later = {"status": "event_observed", "night": 1,
+            "observedRange": {"lastRound": 80}, "complete": False,
+            "sides": {"challenger": {"actualBaseDamage": True},
+                      "defender": {"actualBaseDamage": True}}}
+        first = row(75, decision={"pressureShadow": {
+            "prediction": prediction, "verification": earlier}})
+        second = row(80, decision={"pressureShadow": {
+            "prediction": prediction, "verification": later}})
+        for records in ((first, second), (second, first)):
+            with self.subTest(order=[item["roundNo"] for item in records]):
+                result = self.run_rows(*records)["groups"][0]["pressure"]
+                self.assertEqual(result["coverage"]["eventOnlyNights"], 1)
+                self.assertIs(result["nights"][0]["sides"]["defender"]
+                              ["actualBaseDamage"], True)
+                self.assertEqual(result["scores"]["persistenceBaseline"]["hit"], 2)
+
+    def test_three_nights_from_production_shadow_diagnostic(self):
+        template = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        state = ShadowState()
+        records = []
+        for round_no in range(1, 392):
+            payload = copy.deepcopy(template)
+            payload["roundNo"] = round_no
+            payload["teamOur"].update(type="challenger", teamId="team-a")
+            our_hp = 1000 if round_no < 75 else 900 if round_no < 335 else 850
+            enemy_hp = 1000 if round_no < 80 else 950 if round_no < 205 else 900
+            payload["teamOur"]["roles"] = [{"id": 10013,
+                "roleType": "station", "pos": {"x": 2, "y": 2},
+                "health": our_hp, "level": 1}]
+            payload["teamEnemy"]["roles"] = [{"id": 20013,
+                "roleType": "station", "pos": {"x": 18, "y": 18},
+                "health": enemy_hp, "level": 1}]
+            payload["robot"] = {"roles": []}
+            observe_shadow(Turn.load(payload), state, frozenset())
+            records.append(turn_log_record(payload, {"roleCommandMap": {}},
+                {"processing": 1}, decision_trace={"newsEvidence": {
+                    "currentSession": 1},
+                    "pressureShadow": shadow_diagnostic(state)}))
+        result = self.run_rows(*records)["groups"][0]["pressure"]
+        self.assertEqual(result["coverage"]["nights"], 4)
+        self.assertEqual(result["coverage"]["finalNights"], 3)
+        self.assertEqual(result["scores"]["assessment"]["unscorable"], 8)
+        self.assertEqual(result["scores"]["persistenceBaseline"]["hit"], 1)
+        self.assertEqual(result["scores"]["persistenceBaseline"]["falseNegative"], 1)
+        self.assertEqual(result["scores"]["persistenceBaseline"]["falsePositive"], 2)
+
+    def test_production_turn_record_task_and_pressure_fields(self):
+        payload = {"roundNo": 131, "teamOur": {"type": "challenger",
+            "teamId": "team-a", "roles": []}, "teamEnemy": {"roles": []}}
+        trace = {"newsEvidence": {"currentSession": 1},
+                 "taskInstanceId": "1:2", "taskEnd": {
+                     "instanceId": "1:1", "endRound": 131,
+                     "endReason": "unknown", "submissionCount": 1,
+                     "associatedErrorCodes": [2], "successStatus": "unknown",
+                     "attribution": "unattributed"},
+                 "pressureShadow": {"session": 1, "prediction": {
+                     "status": "issued", "night": 1, "sides": {
+                         "challenger": {"assessment": {"risk": "unknown"},
+                                        "persistenceBaseline": {"risk": "low"}},
+                         "defender": {"assessment": {"risk": "unknown"},
+                                      "persistenceBaseline": {"risk": "low"}}}},
+                     "verification": {"status": "final", "night": 1,
+                         "complete": True, "sides": {
+                             "challenger": {"actualBaseDamage": False},
+                             "defender": {"actualBaseDamage": True}}}}}
+        record = turn_log_record(payload, {"roleCommandMap": {}},
+                                 {"processing": 1}, decision_trace=trace)
+        group = self.run_rows(record)["groups"][0]
+        self.assertEqual(group["tasks"]["instances"][0]["instanceId"], "1:1")
+        self.assertEqual(group["tasks"]["instances"][0]["end"]["associatedErrorCodes"], [2])
+        self.assertEqual(group["pressure"]["scoresBySide"]["challenger"]
+                         ["persistenceBaseline"]["correctNegative"], 1)
+
+    def test_task_and_pressure_keep_unknown_on_legacy_duplicate_and_bad_fields(self):
+        legacy = row(1, decision={"taskInstanceId": "1:1"})
+        legacy["commands"] = {"items": [{"action": "submitAnswer"}],
+                              "truncated": True}
+        bad = row(3, decision={"taskInstanceId": "1:1", "taskEnd": {
+            "instanceId": "1:1", "endRound": 3,
+            "endReason": ["SENSITIVE_SENTINEL"],
+            "solverStoppedReason": ["SENSITIVE_SENTINEL"],
+            "associatedErrorCodes": [2, "SENSITIVE_SENTINEL"]},
+            "pressureShadow": {"prediction": {"status": "issued",
+                "night": 1, "sides": {"challenger": {
+                    "assessment": {"risk": ["SENSITIVE_SENTINEL"]}}}}}})
+        output = self.run_rows(legacy, bad, copy.deepcopy(bad))
+        group = output["groups"][0]
+        instance = group["tasks"]["instances"][0]
+        self.assertIsNone(instance["end"])
+        self.assertEqual(instance["submitAnswerRequests"], 1)
+        self.assertIn("commands_truncated", instance["unknowns"])
+        self.assertIn("sequence_ambiguous", instance["unknowns"])
+        self.assertEqual(group["pressure"]["nights"], [])
+        self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(output))
+
+    def test_malformed_pressure_risk_and_unknown_session_stay_unscorable(self):
+        record = row(71, decision={"taskInstanceId": "1:1",
+            "pressureShadow": {"prediction": {"status": "issued", "night": 1,
+                "sides": {"challenger": {
+                    "assessment": {"risk": ["SENSITIVE_SENTINEL"]},
+                    "persistenceBaseline": {"risk": "low"}}}},
+                "verification": {"status": "event_observed", "night": 1,
+                    "complete": False, "sides": {
+                        "challenger": {"actualBaseDamage": True}}}}})
+        record["decision"]["newsEvidence"].pop("currentSession")
+        output = self.run_rows(record)
+        group = output["groups"][0]
+        self.assertTrue(group["sequence"]["identityUnknown"])
+        self.assertEqual(group["tasks"]["instances"], [])
+        self.assertIsNone(group["pressure"]["nights"][0]
+                          ["sides"]["challenger"]["actualBaseDamage"])
+        self.assertEqual(group["pressure"]["scores"]["assessment"]["unscorable"], 2)
+        self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(output))
+
+    def test_task_instances_do_not_cross_session_or_build_groups(self):
+        first = row(1, session=1, decision={"taskInstanceId": "1:1"})
+        second = row(1, session=2, decision={"taskInstanceId": "2:1"})
+        third = row(1, session=1, build="r-next",
+                    decision={"taskInstanceId": "1:1"})
+        groups = self.run_rows(first, second, third)["groups"]
+        self.assertEqual(len(groups), 3)
+        self.assertEqual(sorted(group["tasks"]["instances"][0]["instanceId"]
+                                for group in groups), ["1:1", "1:1", "2:1"])
+        self.assertTrue(all(len(group["tasks"]["instances"]) == 1
+                            for group in groups))
 
     def test_groups_and_sequence_anomalies(self):
         result = self.run_rows(row(1), row(3), row(3), row(2),
