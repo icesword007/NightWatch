@@ -979,6 +979,13 @@ class DecisionEngine:
         trace = {
             "roundNo": turn.round_no,
             "taskInstanceId": task_instance_id,
+            "taskEnd": (
+                copy.deepcopy(state.task_end_this_round)
+                if state is not None
+                and state.task_end_this_round is not None
+                and state.task_end_this_round["endRound"] == turn.round_no
+                else None
+            ),
             "taskToolInputs": (
                 copy.deepcopy(task.tool_inputs_this_round)
                 if task is not None else []

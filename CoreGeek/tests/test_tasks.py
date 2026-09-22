@@ -284,7 +284,7 @@ class TaskTests(unittest.TestCase):
                 )
                 self.assertEqual(task.solver_stopped_reason, expected_reason)
 
-    def test_final_only_violation_with_one_round_left_is_not_corrected(self):
+    def test_final_only_violation_with_one_round_left_gets_one_correction(self):
         engine = DecisionEngine()
         active = task_payload(
             round_no=1, pioneer_pos=(3, 3), phase_task="solve from evidence",
@@ -300,8 +300,17 @@ class TaskTests(unittest.TestCase):
         response = engine.decide(violation)
 
         self.assertEqual(response["executeCmd"], "")
-        self.assertFalse(task.final_only_correction_requested)
-        self.assertEqual(task.solver_stopped_reason, "command_after_final_request")
+        self.assertTrue(task.final_only_correction_requested)
+        self.assertTrue(response["prompt"])
+        self.assertIsNone(task.solver_stopped_reason)
+        final = copy.deepcopy(active)
+        final["roundNo"] = 3
+        final["llmResp"] = (
+            '{"kind":"answer","content":"verified partial","complete":false}'
+        )
+        self.assertEqual(engine.decide(final)["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "verified partial",
+        })
 
     def test_automatic_read_duplicate_request_and_new_task_are_isolated(self):
         engine = DecisionEngine()
@@ -899,14 +908,279 @@ class TaskTests(unittest.TestCase):
         self.assertIsNotNone(abandon)
         self.assertEqual(abandon.kind, "abandon")
         self.assertEqual(abandon.content, "insufficient evidence")
+        fenced = (
+            '```json\n{"kind":"answer","content":"42",'
+            '"complete":true}\n```'
+        )
+        self.assertEqual(tasks.parse_llm_envelope(fenced),
+                         tasks.LlmEnvelope("answer", "42", True))
         for invalid in (
-            "```json\n{\"kind\":\"answer\",\"content\":\"42\",\"complete\":true}\n```",
+            "prose " + fenced,
+            fenced + " trailing prose",
+            "```python\n" + fenced.split("\n", 1)[1],
+            fenced + "\n" + fenced,
+            "```json\n" + fenced.split("\n", 1)[1].removesuffix("\n```"),
             '{"kind":"command","content":""}',
             '{"kind":"answer","content":"42","complete":true,"extra":1}',
             '{"kind":"abandon","reason":""}',
             "not json",
         ):
             self.assertIsNone(tasks.parse_llm_envelope(invalid))
+
+    def test_vacuous_partial_gets_one_correction_without_submission(self):
+        engine = DecisionEngine()
+        active = task_payload(
+            round_no=1, pioneer_pos=(3, 3), phase_task="synthetic task",
+        )
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 4
+        blank = copy.deepcopy(active)
+        blank["roundNo"] = 2
+        blank["llmResp"] = json.dumps({
+            "kind": "answer", "content": '{"a":"unknown","b":null}',
+            "complete": False,
+        })
+        correction = engine.decide(blank)
+        self.assertTrue(correction["prompt"])
+        self.assertNotIn("10011", correction["roleCommandMap"])
+        self.assertTrue(task.vacuous_partial_correction_requested)
+        usable = copy.deepcopy(active)
+        usable["roundNo"] = 3
+        usable["llmResp"] = json.dumps({
+            "kind": "answer", "content": '{"a":"unknown","b":0}',
+            "complete": False,
+        })
+        self.assertEqual(engine.decide(usable)["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": '{"a":"unknown","b":0}',
+        })
+
+    def test_vacuous_partial_boundary_and_repetition(self):
+        tasks = importlib.import_module("agent.tasks")
+        for text in (" ", "unknown", "NULL", '{"x":"unknown","y":null}'):
+            self.assertTrue(tasks._is_vacuous_partial_answer(text))
+        for text in ("0", "false", '{"x":"unknown","y":false}',
+                     '{"x":"unknown","y":"real"}'):
+            self.assertFalse(tasks._is_vacuous_partial_answer(text))
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3), phase_task="synthetic")
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 4
+        for round_no in (2, 3):
+            bad = copy.deepcopy(active)
+            bad["roundNo"] = round_no
+            bad["llmResp"] = json.dumps({
+                "kind": "answer", "content": "unknown", "complete": False,
+            })
+            result = engine.decide(bad)
+            self.assertFalse(any(
+                command["action"] == "submitAnswer"
+                for command in result["roleCommandMap"].values()
+            ))
+        self.assertEqual(task.solver_stopped_reason,
+                         "vacuous_partial_after_correction")
+
+    def test_task_end_trace_is_bounded_unattributed_and_action_neutral(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3), phase_task="synthetic")
+        active["teamOur"]["totalScore"] = 10
+        active["teamOur"]["goldNum"] = 5
+        engine.decide(active)
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 2
+        answer["llmResp"] = json.dumps({
+            "kind": "answer", "content": "SECRET_SYNTHETIC_ANSWER", "complete": True,
+        })
+        engine.decide(answer)
+        ended = copy.deepcopy(active)
+        ended["roundNo"] = 3
+        ended["phaseTask"] = ""
+        ended["teamOur"]["totalScore"] = 20
+        ended["teamOur"]["goldNum"] = 9
+        ended["lastRoundRoleActionResults"] = {"10011": True}
+        ended["errors"] = [{"errorCode": 2, "description": "PRIVATE_SYNTHETIC_ERROR"}]
+        without_trace = engine.decide(ended)
+        trace = []
+        with_trace = engine.decide(ended, trace_sink=trace.append)
+        self.assertEqual(without_trace, with_trace)
+        event = trace[0]["taskEnd"]
+        self.assertEqual(event["instanceId"], "1:1")
+        self.assertEqual(event["endRound"], 3)
+        self.assertEqual(event["submissionCount"], 1)
+        self.assertEqual(event["associatedErrorCodes"], [2])
+        self.assertEqual(event["observedTeamScoreDelta"], 10)
+        self.assertEqual(event["observedGoldDelta"], 4)
+        self.assertEqual(event["attribution"], "unattributed")
+        self.assertEqual(event["successStatus"], "unknown")
+        self.assertNotIn("SECRET_SYNTHETIC_ANSWER", json.dumps(trace))
+        self.assertNotIn("PRIVATE_SYNTHETIC_ERROR", json.dumps(event))
+        later = copy.deepcopy(ended)
+        later["roundNo"] = 4
+        next_trace = []
+        engine.decide(later, trace_sink=next_trace.append)
+        self.assertIsNone(next_trace[0]["taskEnd"])
+
+    def test_task_end_keeps_prior_submission_error_and_timeout_code(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                              phase_task="synthetic")
+        engine.decide(active)
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 2
+        answer["llmResp"] = json.dumps({
+            "kind": "answer", "content": "partial", "complete": False,
+        })
+        engine.decide(answer)
+        feedback = copy.deepcopy(active)
+        feedback["roundNo"] = 3
+        feedback["lastRoundRoleActionResults"] = {"10011": True}
+        feedback["errors"] = [{"errorCode": 2, "description": "synthetic"}]
+        engine.decide(feedback)
+        ended = copy.deepcopy(active)
+        ended["roundNo"] = 4
+        ended["phaseTask"] = ""
+        ended["errors"] = [{"errorCode": 1, "description": "timeout"}]
+        trace = []
+        engine.decide(ended, trace_sink=trace.append)
+        self.assertEqual(trace[0]["taskEnd"]["associatedErrorCodes"], [1, 2])
+
+    def test_crlf_hint_requires_current_task_evidence_and_is_once_only(self):
+        for result, expected in (
+            ("[exitCode:126]\n/bin/sh^M: bad interpreter", True),
+            ("[exitCode:126]\npermission denied", False),
+            ("[exitCode:126]\r\n./check: bad interpreter: No such file or directory\r\n", False),
+        ):
+            with self.subTest(result=result):
+                engine = DecisionEngine()
+                active = task_payload(
+                    round_no=1, pioneer_pos=(3, 3), phase_task="synthetic",
+                )
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = "./check"
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = result
+                response = engine.decide(received)
+                self.assertEqual("CRLF interpreter" in response["prompt"], expected)
+                self.assertEqual(response["executeCmd"], "")
+                if expected:
+                    self.assertTrue(task.crlf_hint_requested)
+                    task.pending_cmd_round = 2
+                    repeated = copy.deepcopy(received)
+                    repeated["roundNo"] = 3
+                    later = engine.decide(repeated)
+                    self.assertNotIn("CRLF interpreter", later["prompt"])
+
+    def test_prior_task_experience_is_structured_unverified_and_same_type_only(self):
+        engine = DecisionEngine()
+        first = task_payload(round_no=1, pioneer_pos=(3, 3), phase_task="first synthetic")
+        engine.decide(first)
+        answer = copy.deepcopy(first)
+        answer["roundNo"] = 2
+        answer["llmResp"] = json.dumps({
+            "kind": "answer", "content": "PRIVATE_SYNTHETIC_ANSWER", "complete": True,
+        })
+        engine.decide(answer)
+        ended = copy.deepcopy(first)
+        ended["roundNo"] = 3
+        ended["phaseTask"] = ""
+        engine.decide(ended)
+        next_task = copy.deepcopy(first)
+        next_task["roundNo"] = 4
+        next_task["phaseTask"] = "second synthetic"
+        prompt = engine.decide(next_task)["prompt"]
+        self.assertIn("Unverified prior same-type workflow", prompt)
+        self.assertIn("re-check this task", prompt)
+        self.assertNotIn("PRIVATE_SYNTHETIC_ANSWER", prompt)
+        self.assertNotIn("commands:", prompt)
+        other = DecisionEngine()
+        other.decide(first)
+        other.decide(answer)
+        other.decide(ended)
+        different = copy.deepcopy(next_task)
+        different["teamOur"]["playerTasks"][0]["taskType"] = "自进化类2"
+        self.assertNotIn("Unverified prior same-type workflow",
+                         other.decide(different)["prompt"])
+
+    def test_pagination_hint_requires_complete_consistent_result_and_budget(self):
+        valid = json.dumps({
+            "pagination": {"total_count": 5, "offset": 0, "limit": 2},
+            "data": [{"id": 1}, {"id": 2}],
+        })
+        cases = (
+            ("[exitCode:0]\n" + valid, True, None),
+            ("[exitCode:0]\n" + valid + "\n[TRUNCATED]", False, None),
+            ("[exitCode:1]\n" + valid, False, None),
+            ("[exitCode:0]\n" + json.dumps({
+                "pagination": {"total_count": 5, "offset": 0, "limit": 2},
+                "data": [{"id": 1}],
+            }), False, None),
+            ("[exitCode:0]\n" + json.dumps({
+                "error": "failed", "pagination": {"total_count": 5,
+                    "offset": 0, "limit": 2}, "data": [{"id": 1}, {"id": 2}],
+            }), False, None),
+            ("[exitCode:0]\n" + valid, False, 4),
+        )
+        for result, expected, timeout_round in cases:
+            with self.subTest(result=result, timeout=timeout_round):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="synthetic")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = "inspect current API"
+                task.timeout_round = timeout_round
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = result
+                response = engine.decide(received)
+                self.assertEqual("Pagination metadata" in response["prompt"],
+                                 expected)
+                self.assertEqual(response["executeCmd"], "")
+                if expected:
+                    self.assertTrue(task.pagination_checked)
+                    task.pending_cmd_round = 2
+                    repeated = copy.deepcopy(received)
+                    repeated["roundNo"] = 3
+                    self.assertNotIn("Pagination metadata",
+                                     engine.decide(repeated)["prompt"])
+
+    def test_long_tool_results_keep_detected_hints_in_final_prompt(self):
+        long_results = (
+            ("[exitCode:0]\n" + json.dumps({
+                "pagination": {"total_count": 3, "offset": 0, "limit": 2},
+                "data": [{"blob": "x" * 5000}, {"blob": "y" * 5000}],
+            }), "Pagination metadata"),
+            ("[exitCode:126]\n./check: /bin/sh^M: bad interpreter\n"
+             + "x" * 10000, "CRLF interpreter"),
+        )
+        for result, needle in long_results:
+            with self.subTest(needle=needle):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="synthetic long output")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = "synthetic inspect"
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = result
+                response = engine.decide(received)
+                self.assertIn(needle, response["prompt"])
+                self.assertIn("[TRUNCATED MIDDLE]", response["prompt"])
+                self.assertEqual(response["executeCmd"], "")
+                task.pending_cmd_round = 2
+                repeated = copy.deepcopy(received)
+                repeated["roundNo"] = 3
+                self.assertNotIn(needle, engine.decide(repeated)["prompt"])
 
     def test_oversized_json_integer_is_rejected_without_poisoning_next_response(self):
         # Break caught: Python's integer digit limit raises ValueError outside
