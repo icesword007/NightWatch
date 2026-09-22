@@ -116,6 +116,10 @@ class RouteSearchContext:
         tuple[int, int, Pos, Pos, int],
         tuple[tuple[Pos, int], ...],
     ]
+    incomplete_routes: dict[
+        tuple[int, int, Pos, Pos, int],
+        tuple[tuple[Pos, int], ...],
+    ] = field(default_factory=dict)
     paths: dict[tuple[int, int, Pos, Pos, int], PathResult] = field(
         default_factory=dict,
     )
@@ -4374,6 +4378,19 @@ def _routes_to_adjacent(
             return ()
         context.cache_hits += 1
         return context.routes[cache_key]
+    if context is not None and cache_key in context.incomplete_routes:
+        if clock() >= deadline:
+            context.truncated_reason = "deadline"
+            return ()
+        if context.path_searches >= MAX_ECONOMY_PATH_SEARCHES:
+            context.truncated_reason = "search_limit"
+            return ()
+        # Reusing a completed adjacent-stand enumeration with expansion_limit
+        # costs one logical work unit; path_searches is not an A* call count.
+        context.path_searches += 1
+        context.cache_hits += 1
+        context.truncated_reason = "expansion_limit"
+        return context.incomplete_routes[cache_key]
     routes = []
     complete = True
     for stand in _adjacent_stands(turn, worker, target):
@@ -4407,8 +4424,11 @@ def _routes_to_adjacent(
             complete = False
             continue
     result = tuple(routes)
-    if context is not None and complete:
-        context.routes[cache_key] = result
+    if context is not None:
+        if complete:
+            context.routes[cache_key] = result
+        else:
+            context.incomplete_routes[cache_key] = result
     return result
 
 

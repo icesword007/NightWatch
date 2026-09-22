@@ -10,6 +10,7 @@ from agent.actions import ActionAllocator, ActionProposal
 from agent.brain import DecisionEngine
 from agent.protocol import Pos, Turn
 from agent.state import StateStore, TaskMemory, request_fingerprint
+from agent.tasks import _prior_task_experience, _record_sop_step
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
@@ -914,10 +915,13 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(tasks.parse_llm_envelope(fenced),
                          tasks.LlmEnvelope("answer", "42", True))
+        for label in ("python", "jsonl"):
+            wrapped = fenced.replace("```json\n", f"```{label}\n", 1)
+            self.assertEqual(tasks.parse_llm_envelope(wrapped),
+                             tasks.LlmEnvelope("answer", "42", True))
         for invalid in (
             "prose " + fenced,
             fenced + " trailing prose",
-            "```python\n" + fenced.split("\n", 1)[1],
             fenced + "\n" + fenced,
             "```json\n" + fenced.split("\n", 1)[1].removesuffix("\n```"),
             '{"kind":"command","content":""}',
@@ -926,6 +930,20 @@ class TaskTests(unittest.TestCase):
             "not json",
         ):
             self.assertIsNone(tasks.parse_llm_envelope(invalid))
+
+    def test_complete_unknown_label_fence_at_deadline_submits_inner_answer(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                              phase_task="return synthetic result")
+        engine.decide(active)
+        engine.state.state.active_task.timeout_round = 2
+        final = copy.deepcopy(active)
+        final["roundNo"] = 2
+        final["llmResp"] = '```python\n{"kind":"answer","content":"{}","complete":true}\n```'
+        response = engine.decide(final)
+        self.assertEqual(response["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "{}",
+        })
 
     def test_vacuous_partial_gets_one_correction_without_submission(self):
         engine = DecisionEngine()
@@ -957,7 +975,9 @@ class TaskTests(unittest.TestCase):
 
     def test_vacuous_partial_boundary_and_repetition(self):
         tasks = importlib.import_module("agent.tasks")
-        for text in (" ", "unknown", "NULL", '{"x":"unknown","y":null}'):
+        for text in (" ", "unknown", "NULL", "none", "N/A", "not found",
+                     "[]", "{}", '{"x":"unknown","y":null}',
+                     '{"x":"N/A","y":[]}'):
             self.assertTrue(tasks._is_vacuous_partial_answer(text))
         for text in ("0", "false", '{"x":"unknown","y":false}',
                      '{"x":"unknown","y":"real"}'):
@@ -980,6 +1000,30 @@ class TaskTests(unittest.TestCase):
             ))
         self.assertEqual(task.solver_stopped_reason,
                          "vacuous_partial_after_correction")
+
+    def test_empty_result_can_be_confirmed_as_complete_after_one_correction(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                              phase_task="Return an empty JSON list if no matches")
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 3
+        partial = copy.deepcopy(active)
+        partial["roundNo"] = 2
+        partial["llmResp"] = json.dumps({
+            "kind": "answer", "content": "[]", "complete": False,
+        })
+        correction = engine.decide(partial)
+        self.assertNotIn("10011", correction["roleCommandMap"])
+        self.assertIn("complete:true", correction["prompt"])
+        confirmed = copy.deepcopy(active)
+        confirmed["roundNo"] = 3
+        confirmed["llmResp"] = json.dumps({
+            "kind": "answer", "content": "[]", "complete": True,
+        })
+        self.assertEqual(engine.decide(confirmed)["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "[]",
+        })
 
     def test_task_end_trace_is_bounded_unattributed_and_action_neutral(self):
         engine = DecisionEngine()
@@ -1075,6 +1119,61 @@ class TaskTests(unittest.TestCase):
                     later = engine.decide(repeated)
                     self.assertNotIn("CRLF interpreter", later["prompt"])
 
+    def test_crlf_auto_repair_targets_exact_script_and_preserves_cd(self):
+        for command, script in (
+            ("./check.sh", "./check.sh"),
+            ("cd '/tmp/work space' && './my check.sh'", "./my check.sh"),
+        ):
+            with self.subTest(command=command):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="repair current script")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.timeout_round = 8
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = command
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = (
+                    f"[exitCode:126]\nbash: {script}: /bin/sh^M: bad interpreter"
+                )
+                response = engine.decide(received)
+                self.assertEqual(response["prompt"], "")
+                self.assertIn("python3 -c", response["executeCmd"])
+                self.assertIn("check.sh", response["executeCmd"])
+                self.assertTrue(response["executeCmd"].endswith(
+                    " && " + ("'./my check.sh'" if "my check" in command else script)
+                ))
+                if command.startswith("cd "):
+                    self.assertTrue(response["executeCmd"].startswith(
+                        "cd '/tmp/work space' && "
+                    ))
+                self.assertNotIn("find .", response["executeCmd"])
+
+    def test_crlf_auto_repair_rejects_ambiguous_or_late_error(self):
+        for command, result, timeout in (
+            ("./check.sh", "[exitCode:126]\n./other.sh: /bin/sh^M: bad interpreter", 8),
+            ("./check.sh | cat", "[exitCode:126]\n./check.sh: /bin/sh^M: bad interpreter", 8),
+            ("./check.sh", "[exitCode:126]\n./check.sh: /bin/sh^M: bad interpreter", 4),
+        ):
+            with self.subTest(command=command, timeout=timeout):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="repair current script")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.timeout_round = timeout
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = command
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = result
+                response = engine.decide(received)
+                self.assertEqual(response["executeCmd"], "")
+
     def test_prior_task_experience_is_structured_unverified_and_same_type_only(self):
         engine = DecisionEngine()
         first = task_payload(round_no=1, pioneer_pos=(3, 3), phase_task="first synthetic")
@@ -1105,6 +1204,93 @@ class TaskTests(unittest.TestCase):
         different["teamOur"]["playerTasks"][0]["taskType"] = "自进化类2"
         self.assertNotIn("Unverified prior same-type workflow",
                          other.decide(different)["prompt"])
+
+    def test_prior_workflow_keeps_last_useful_steps_without_values(self):
+        state = state_for(task_payload(phase_task="synthetic"))
+        prior = TaskMemory("1:prior", "synthetic", task_type="自进化类1")
+        prior.end_reason = "unknown"
+        prior.submission_count = 1
+        for command, result in (
+            ("cat /tmp/old-input", "[exitCode:0]\nold data"),
+            ("curl -H 'X-API-Key: PRIVATE_KEY' 'https://example.test/a?city=SECRET'",
+             "[exitCode:0]\n" + json.dumps({"error": "bad city"})),
+            ("curl 'https://example.test/fail'",
+             "[exitCode:0]\n" + json.dumps({"status": 401})),
+            ("curl -X POST 'https://example.test/write'",
+             "[exitCode:0]\n" + json.dumps({"ok": True})),
+            ("curl -XPOST 'https://example.test/write'",
+             "[exitCode:0]\n" + json.dumps({"ok": True})),
+            ("curl --request=POST 'https://example.test/write'",
+             "[exitCode:0]\n" + json.dumps({"ok": True})),
+            ("curl -dsecret 'https://example.test/write'",
+             "[exitCode:0]\n" + json.dumps({"ok": True})),
+            ("cd /tmp && curl 'https://example.test/read'",
+             "[exitCode:0]\n" + json.dumps({"data": [1]})),
+            ("curl 'https://example.test/b?city=SECRET'",
+             "[exitCode:0]\n" + json.dumps({"data": [1]})),
+            ("python3 /tmp/old-parser.py", "[exitCode:0]\nparsed"),
+            ("./check", "[exitCode:0]\nCHECK PASS"),
+            ("cd '/tmp/current workspace' && ./check",
+             "[exitCode:0]\nCHECK PASS"),
+        ):
+            _record_sop_step(prior, command, result)
+        self.assertEqual(len(prior.sop_steps), 4)
+        state.ended_tasks.append(prior)
+        current = TaskMemory("1:current", "synthetic", task_type="自进化类1")
+        hint = _prior_task_experience(current, state)
+        self.assertIn("local check", hint)
+        self.assertIn("API read", hint)
+        for sensitive in ("PRIVATE_KEY", "SECRET", "/tmp/", "bad city", "old data"):
+            self.assertNotIn(sensitive, hint)
+        prior.submission_count = 0
+        self.assertEqual(_prior_task_experience(current, state), "")
+
+    def test_engine_sop_chain_keeps_last_four_safe_steps(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                              phase_task="synthetic work")
+        engine.decide(active)
+        engine.state.state.active_task.timeout_round = 30
+        round_no = 2
+        commands = (
+            ("cat /tmp/old-input", "[exitCode:0]\ninput"),
+            ("curl -XPOST 'https://example.test/write?secret=SECRET'",
+             "[exitCode:0]\n" + json.dumps({"ok": True})),
+            ("curl 'https://example.test/read?secret=SECRET'",
+             "[exitCode:0]\n" + json.dumps({"data": [1]})),
+            ("python3 /tmp/old-parser.py", "[exitCode:0]\nparsed"),
+            ("cd '/tmp/current workspace' && ./check", "[exitCode:0]\nPASS"),
+        )
+        for command, result in commands:
+            request = copy.deepcopy(active)
+            request["roundNo"] = round_no
+            request["llmResp"] = json.dumps({"kind": "command", "content": command})
+            self.assertEqual(engine.decide(request)["executeCmd"], command)
+            round_no += 1
+            received = copy.deepcopy(active)
+            received["roundNo"] = round_no
+            received["lastCmdResult"] = result
+            engine.decide(received)
+            round_no += 1
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = round_no
+        answer["llmResp"] = json.dumps({"kind": "answer", "content": "private result",
+                                         "complete": True})
+        engine.decide(answer)
+        ended = copy.deepcopy(active)
+        ended["roundNo"] = round_no + 1
+        ended["phaseTask"] = ""
+        engine.decide(ended)
+        next_task = copy.deepcopy(active)
+        next_task["roundNo"] = round_no + 2
+        next_task["phaseTask"] = "next synthetic work"
+        prompt = engine.decide(next_task)["prompt"]
+        self.assertIn("API read", prompt)
+        self.assertIn("local check", prompt)
+        self.assertIn("file inspection", prompt)
+        self.assertNotIn("SECRET", prompt)
+        self.assertNotIn("/tmp/current workspace", prompt)
+        self.assertNotIn("private result", prompt)
 
     def test_pagination_hint_requires_complete_consistent_result_and_budget(self):
         valid = json.dumps({
@@ -1150,6 +1336,189 @@ class TaskTests(unittest.TestCase):
                     repeated["roundNo"] = 3
                     self.assertNotIn("Pagination metadata",
                                      engine.decide(repeated)["prompt"])
+
+    def test_nested_pagination_hint_uses_real_result_chain_without_execution(self):
+        valid = {"code": 0, "data": {"records": [{"id": 1}, {"id": 2}],
+            "pagination": {"total_count": 5, "offset": 0, "limit": 2}}}
+        cases = (
+            (valid, True, None),
+            ({**valid, "code": 500}, False, None),
+            ({**valid, "code": 201}, True, None),
+            ({**valid, "success": False}, False, None),
+            ({**valid, "data": {**valid["data"], "error": "bad"}}, False, None),
+            ({**valid, "data": {**valid["data"], "status": "failed"}}, False, None),
+            ({**valid, "data": {**valid["data"], "records": [{"id": 1}]}}, False, None),
+            ({**valid, "pagination": {"total_count": 5, "offset": 0, "limit": 2}},
+             False, None),
+            (valid, False, 4),
+        )
+        for body, expected, timeout_round in cases:
+            with self.subTest(body=body, timeout=timeout_round):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="synthetic nested API")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = "inspect current API"
+                task.timeout_round = timeout_round
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = "[exitCode:0]\n" + json.dumps(body)
+                response = engine.decide(received)
+                self.assertEqual("Pagination metadata" in response["prompt"],
+                                 expected)
+                self.assertEqual(response["executeCmd"], "")
+                if expected:
+                    task.pending_cmd_round = 2
+                    repeated = copy.deepcopy(received)
+                    repeated["roundNo"] = 3
+                    self.assertNotIn("Pagination metadata",
+                                     engine.decide(repeated)["prompt"])
+
+    def test_nested_pagination_long_result_keeps_hint_and_rejects_truncation(self):
+        body = {"code": 0, "data": {"records": [
+            {"blob": "x" * 5000}, {"blob": "y" * 5000}],
+            "pagination": {"total_count": 3, "offset": 0, "limit": 2}}}
+        for suffix, expected in (("", True), ("\n[TRUNCATED]", False)):
+            with self.subTest(suffix=suffix):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="long nested API")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = "[exitCode:0]\n" + json.dumps(body) + suffix
+                response = engine.decide(received)
+                self.assertEqual("Pagination metadata" in response["prompt"],
+                                 expected)
+                self.assertEqual(response["executeCmd"], "")
+
+    def test_auto_pagination_get_preserves_auth_and_prior_page_evidence(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                              phase_task="synthetic paged API")
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 8
+        task.pending_llm_round = None
+        task.pending_cmd_round = 1
+        task.last_command = (
+            "curl -sS -H 'X-API-Key: SYNTHETIC_AUTH' "
+            "'https://example.test/records?city=New%20York&offset=0&limit=2'"
+        )
+        page0 = copy.deepcopy(active)
+        page0["roundNo"] = 2
+        page0["lastCmdResult"] = "[exitCode:0]\n" + json.dumps({
+            "code": 0, "data": {"records": [
+                {"id": "FIRST_PAGE_MARKER"}, {"id": 2}],
+                "pagination": {"total_count": 5, "offset": 0, "limit": 2}},
+        })
+        first = engine.decide(page0)
+        self.assertEqual(first["prompt"], "")
+        self.assertIn("offset=2", first["executeCmd"])
+        self.assertIn("limit=2", first["executeCmd"])
+        self.assertIn("city=New%20York", first["executeCmd"])
+        self.assertIn("SYNTHETIC_AUTH", first["executeCmd"])
+        page2 = copy.deepcopy(active)
+        page2["roundNo"] = 3
+        page2["lastCmdResult"] = "[exitCode:0]\n" + json.dumps({
+            "code": 0, "data": {"records": [{"id": 3}, {"id": 4}],
+                "pagination": {"total_count": 5, "offset": 2, "limit": 2}},
+        })
+        second = engine.decide(page2)
+        self.assertIn("offset=4", second["executeCmd"])
+        page4 = copy.deepcopy(active)
+        page4["roundNo"] = 4
+        page4["lastCmdResult"] = "[exitCode:0]\n" + json.dumps({
+            "code": 0, "data": {"records": [{"id": 5}],
+                "pagination": {"total_count": 5, "offset": 4, "limit": 2}},
+        })
+        final_prompt = engine.decide(page4)
+        self.assertEqual(final_prompt["executeCmd"], "")
+        self.assertIn("FIRST_PAGE_MARKER", final_prompt["prompt"])
+
+    def test_auto_pagination_updates_only_missing_cursor_parts(self):
+        body = "[exitCode:0]\n" + json.dumps({
+            "data": {"records": [{"id": 1}, {"id": 2}],
+                "pagination": {"total_count": 5, "offset": 0, "limit": 2}},
+        })
+        for query, expected in (
+            ("city=New%20York&offset=0", "city=New%20York&offset=2&limit=2"),
+            ("city=New%20York&limit=2", "city=New%20York&limit=2&offset=2"),
+        ):
+            with self.subTest(query=query):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="paged API")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.timeout_round = 8
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = f"curl 'https://example.test/data?{query}'"
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = body
+                response = engine.decide(received)
+                self.assertIn(expected, response["executeCmd"])
+
+    def test_auto_pagination_rejects_unsafe_commands_duplicate_and_deadline(self):
+        body = "[exitCode:0]\n" + json.dumps({
+            "data": {"records": [{"id": 1}, {"id": 2}],
+                "pagination": {"total_count": 5, "offset": 0, "limit": 2}},
+        })
+        commands = (
+            "curl -X POST 'https://example.test/data?offset=0&limit=2'",
+            "curl 'https://example.test/data?offset=0&limit=2' | cat",
+            "cd /tmp/ws && curl 'https://example.test/data?offset=0&limit=2'",
+            "curl 'https://example.test/data?page=1&limit=2'",
+            "curl 'https://example.test/data?offset=0&offset=0&limit=2'",
+            "curl 'https://example.test/data?signature=abc&offset=0&limit=2'",
+            "curl -H 'X-API-Key: $TOKEN' 'https://example.test/data?offset=0&limit=2'",
+            "curl 'https://example.test/data?Offset=0&limit=2'",
+            "curl 'https://example.test/data?%6fffset=0&limit=2'",
+            "curl 'https://[bad?offset=0&limit=2'",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="paged API")
+                engine.decide(active)
+                task = engine.state.state.active_task
+                task.timeout_round = 8
+                task.pending_llm_round = None
+                task.pending_cmd_round = 1
+                task.last_command = command
+                received = copy.deepcopy(active)
+                received["roundNo"] = 2
+                received["lastCmdResult"] = body
+                response = engine.decide(received)
+                self.assertEqual(response["executeCmd"], "")
+                self.assertIn("Pagination metadata", response["prompt"])
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                              phase_task="paged API")
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 6
+        task.pending_llm_round = None
+        task.pending_cmd_round = 1
+        task.last_command = "curl 'https://example.test/data?offset=0&limit=2'"
+        received = copy.deepcopy(active)
+        received["roundNo"] = 2
+        received["lastCmdResult"] = body
+        self.assertIn("offset=2", engine.decide(received)["executeCmd"])
+        task.pending_cmd_round = 2
+        duplicate = copy.deepcopy(received)
+        duplicate["roundNo"] = 3
+        repeated = engine.decide(duplicate)
+        self.assertEqual(repeated["executeCmd"], "")
 
     def test_long_tool_results_keep_detected_hints_in_final_prompt(self):
         long_results = (
@@ -2128,6 +2497,34 @@ class TaskTests(unittest.TestCase):
         self.assertNotIn("location=", prompt)
         self.assertIn("Observed environment path clues", prompt)
         self.assertNotIn("Previously verified environment paths", prompt)
+
+    def test_solver_contract_explains_raw_json_and_preserves_nested_answer(self):
+        nested_answer = '{"result":"synthetic","count":2}'
+        for corrected in (False, True):
+            with self.subTest(corrected=corrected):
+                engine = DecisionEngine()
+                active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                                      phase_task="return JSON")
+                prompt = engine.decide(active)["prompt"]
+                if corrected:
+                    invalid = copy.deepcopy(active)
+                    invalid["roundNo"] = 2
+                    invalid["llmResp"] = "not JSON"
+                    prompt = engine.decide(invalid)["prompt"]
+                self.assertIn("raw JSON", prompt)
+                self.assertIn("no markdown fences", prompt)
+                self.assertIn("no extra fields", prompt)
+                self.assertIn("escape", prompt)
+                answer = copy.deepcopy(active)
+                answer["roundNo"] = 3 if corrected else 2
+                answer["llmResp"] = json.dumps({
+                    "kind": "answer", "content": nested_answer,
+                    "complete": True,
+                })
+                response = engine.decide(answer)
+                self.assertEqual(response["roleCommandMap"]["10011"], {
+                    "action": "submitAnswer", "taskAnswer": nested_answer,
+                })
 
     def test_known_deadline_prompts_report_state_machine_tool_cycle_ceiling(self):
         # Break caught: the prompt reports raw rounds as if each were a usable

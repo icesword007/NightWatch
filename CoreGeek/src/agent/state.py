@@ -102,6 +102,7 @@ class TaskMemory:
     final_only_correction_requested: bool = False
     vacuous_partial_correction_requested: bool = False
     crlf_hint_requested: bool = False
+    crlf_auto_attempted: bool = False
     envelope_correction_requested: bool = False
     envelope_correction_pending: bool = False
     last_envelope_rejection: str | None = None
@@ -116,7 +117,9 @@ class TaskMemory:
     pagination_checked: bool = False
     pagination_pages_seen: list[tuple[int, int, int]] = field(default_factory=list)
     pagination_hint_count: int = 0
+    pagination_auto_count: int = 0
     sop_hint: str = ""
+    sop_steps: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
