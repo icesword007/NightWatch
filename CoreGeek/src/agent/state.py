@@ -64,6 +64,7 @@ class PlanState:
 class TaskMemory:
     instance_id: str
     prompt_fingerprint: str
+    task_type: str = ""
     phase: str = "solving"
     pending_llm_round: int | None = None
     pending_cmd_round: int | None = None
@@ -99,6 +100,8 @@ class TaskMemory:
     entry_read_attempted: bool = False
     final_answer_requested: bool = False
     final_only_correction_requested: bool = False
+    vacuous_partial_correction_requested: bool = False
+    crlf_hint_requested: bool = False
     envelope_correction_requested: bool = False
     envelope_correction_pending: bool = False
     last_envelope_rejection: str | None = None
@@ -106,6 +109,14 @@ class TaskMemory:
     coordination_deadline_round: int | None = None
     abandon_move_attempted: bool = False
     end_reason: str | None = None
+    submission_count: int = 0
+    start_total_score: int | None = None
+    start_gold: int | None = None
+    associated_error_codes: list[int] = field(default_factory=list)
+    pagination_checked: bool = False
+    pagination_pages_seen: list[tuple[int, int, int]] = field(default_factory=list)
+    pagination_hint_count: int = 0
+    sop_hint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +172,7 @@ class SessionState:
     action_history: list[CompletedAction] = field(default_factory=list)
     active_task: TaskMemory | None = None
     ended_tasks: list[TaskMemory] = field(default_factory=list)
+    task_end_this_round: dict[str, Any] | None = None
     history: list[HistoricalFact] = field(default_factory=list)
     news_observations: tuple[NewsObservation, ...] = ()
     pending_news_request: NewsRequest | None = None
@@ -256,6 +268,7 @@ class StateStore:
             )
 
         state.observation_count += 1
+        state.task_end_this_round = None
         state.news_events = []
         state.news_skip_reason = None
         news_response_claimed = self._consume_news_response(
@@ -340,6 +353,7 @@ class StateStore:
                 state.active_task is not None
                 and command.get("action") == "submitAnswer"
             ):
+                state.active_task.submission_count += 1
                 state.active_task.phase = "submit_pending"
                 state.active_task.last_submitted_answer = str(
                     command.get("taskAnswer") or ""
@@ -769,15 +783,10 @@ class StateStore:
 
         if not phase_task:
             if state.active_task is not None:
-                state.active_task.phase = "ended"
-                state.active_task.end_reason = self._task_end_reason(
-                    turn, state.active_task,
+                self._capture_task_end(
+                    turn, payload,
+                    self._task_end_reason(turn, state.active_task),
                 )
-                state.active_task.pending_llm_round = None
-                state.active_task.pending_cmd_round = None
-                state.ended_tasks.append(state.active_task)
-                del state.ended_tasks[:-MAX_ENDED_TASKS]
-                state.active_task = None
             state.late_tool_results += bool(llm_result) + bool(cmd_result)
             return
 
@@ -789,27 +798,42 @@ class StateStore:
             or state.active_task.prompt_fingerprint != task_fingerprint
         ):
             if state.active_task is not None:
-                state.active_task.phase = "ended"
-                state.active_task.end_reason = "replaced"
-                state.active_task.pending_llm_round = None
-                state.active_task.pending_cmd_round = None
-                state.ended_tasks.append(state.active_task)
-                del state.ended_tasks[:-MAX_ENDED_TASKS]
+                self._capture_task_end(turn, payload, "replaced")
             state.task_sequence += 1
-            owner_id, task_cells, accepted_round, timeout_round = (
+            owner_id, task_cells, accepted_round, timeout_round, task_type = (
                 self._active_task_context(turn)
             )
             state.active_task = TaskMemory(
                 instance_id=f"{state.session_index}:{state.task_sequence}",
                 prompt_fingerprint=task_fingerprint,
+                task_type=task_type,
                 owner_id=owner_id,
                 task_cells=task_cells,
                 accepted_round=accepted_round,
                 timeout_round=timeout_round,
                 environment_paths=tuple(state.task_environment_paths),
+                start_total_score=(
+                    payload.get("teamOur", {}).get("totalScore")
+                    if type(payload.get("teamOur", {}).get("totalScore")) is int
+                    else None
+                ),
+                start_gold=(
+                    payload.get("teamOur", {}).get("goldNum")
+                    if type(payload.get("teamOur", {}).get("goldNum")) is int
+                    else None
+                ),
             )
 
         task = state.active_task
+        prior_submit = any(
+            completed.pending.action == "submitAnswer"
+            and completed.pending.task_instance_id == task.instance_id
+            and completed.pending.round_no == round_no - 1
+            for completed in state.action_history
+        )
+        if prior_submit and any(error.code == 2 for error in turn.errors):
+            if 2 not in task.associated_error_codes:
+                task.associated_error_codes.append(2)
         task.tool_inputs_this_round = []
         self._apply_tool_result(
             task,
@@ -827,6 +851,59 @@ class StateStore:
             round_no=round_no,
             accept_result=accept_results,
         )
+
+    def _capture_task_end(
+        self, turn: Turn, payload: dict[str, Any], reason: str,
+    ) -> None:
+        state = self._require_state()
+        task = state.active_task
+        if task is None:
+            return
+        task.phase = "ended"
+        task.end_reason = reason
+        task.pending_llm_round = None
+        task.pending_cmd_round = None
+        prior_submit = any(
+            completed.pending.action == "submitAnswer"
+            and completed.pending.task_instance_id == task.instance_id
+            and completed.pending.round_no == turn.round_no - 1
+            for completed in state.action_history
+        )
+        if prior_submit and any(error.code == 2 for error in turn.errors):
+            if 2 not in task.associated_error_codes:
+                task.associated_error_codes.append(2)
+        if reason == "timeout" and any(error.code == 1 for error in turn.errors):
+            if 1 not in task.associated_error_codes:
+                task.associated_error_codes.append(1)
+        team = payload.get("teamOur")
+        team = team if isinstance(team, dict) else {}
+        score = team.get("totalScore")
+        gold = team.get("goldNum")
+        state.task_end_this_round = {
+            "instanceId": task.instance_id,
+            "acceptedRound": task.accepted_round,
+            "timeoutRound": task.timeout_round,
+            "endRound": turn.round_no,
+            "endReason": reason,
+            "submissionCount": task.submission_count,
+            "associatedErrorCodes": sorted(task.associated_error_codes),
+            "solverStoppedReason": task.solver_stopped_reason,
+            "successStatus": "unknown",
+            "observedTeamScoreDelta": (
+                score - task.start_total_score
+                if type(score) is int and task.start_total_score is not None
+                else None
+            ),
+            "observedGoldDelta": (
+                gold - task.start_gold
+                if type(gold) is int and task.start_gold is not None
+                else None
+            ),
+            "attribution": "unattributed",
+        }
+        state.ended_tasks.append(task)
+        del state.ended_tasks[:-MAX_ENDED_TASKS]
+        state.active_task = None
 
     def _consume_news_response(
         self,
@@ -1004,7 +1081,7 @@ class StateStore:
     def _active_task_context(
         self,
         turn: Turn,
-    ) -> tuple[int | None, tuple[Pos, ...], int | None, int | None]:
+    ) -> tuple[int | None, tuple[Pos, ...], int | None, int | None, str]:
         state = self._require_state()
         accepted = next((
             completed.pending
@@ -1032,7 +1109,10 @@ class StateStore:
             and matched.timeout_rounds is not None
         ):
             timeout_round = accepted_round + matched.timeout_rounds
-        return owner_id, task_cells, accepted_round, timeout_round
+        return (
+            owner_id, task_cells, accepted_round, timeout_round,
+            matched.task_type if matched is not None else "",
+        )
 
     @staticmethod
     def _task_end_reason(turn: Turn, task: TaskMemory) -> str:

@@ -49,6 +49,7 @@ _STANDALONE_PATH = re.compile(r"/[^\s\"'<>|：]{1,511}")
 _PATH_REFERENCE = re.compile(
     r"(?<![A-Za-z0-9_.-])(/[^\s\"'<>|：]{1,511})"
 )
+_JSON_FENCE = re.compile(r"\A```(?:json)?\r?\n(.+?)\r?\n```\Z", re.DOTALL | re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +67,19 @@ class TaskTurnProposal:
     start_skip_reason: str | None = None
 
 
+def _outer_json_text(raw: str) -> str | None:
+    stripped = raw.strip()
+    if stripped.startswith("```") or stripped.endswith("```"):
+        match = _JSON_FENCE.fullmatch(stripped)
+        return match.group(1) if match is not None else None
+    return raw
+
+
 def parse_llm_envelope(raw: str) -> LlmEnvelope | None:
     if not isinstance(raw, str) or not raw or len(raw) > MAX_LLM_RESPONSE_CHARS:
+        return None
+    raw = _outer_json_text(raw)
+    if raw is None:
         return None
     try:
         value = json.loads(raw)
@@ -110,6 +122,9 @@ def _llm_envelope_rejection(raw: str) -> str:
         return "empty"
     if len(raw) > MAX_LLM_RESPONSE_CHARS:
         return "oversized"
+    raw = _outer_json_text(raw)
+    if raw is None:
+        return "invalid_json"
     try:
         value = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
@@ -145,6 +160,95 @@ def command_result_nonzero(result: str) -> bool:
         return False
 
 
+def _has_crlf_interpreter_evidence(result: str) -> bool:
+    if not result or len(result) > 65_536 or "[TRUNCATED]" in result:
+        return False
+    lines = result.splitlines()
+    if not lines or lines[0] != "[exitCode:126]":
+        return False
+    lowered = result.casefold()
+    return "bad interpreter" in lowered and (
+        "^m" in lowered
+        or "\\r" in lowered
+        or "\r" in result.replace("\r\n", "\n")
+        or "crlf" in lowered
+    )
+
+
+def _pagination_hint(result: str, task: TaskMemory, remaining: int | None) -> str:
+    if (
+        not result.startswith("[exitCode:0]\n")
+        or len(result) > 65_536
+        or "[TRUNCATED]" in result
+        or task.pagination_hint_count >= 2
+        or _remaining_tool_cycles(task, remaining) < 1
+    ):
+        return ""
+    try:
+        value = json.loads(result.partition("\n")[2])
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(value, dict) or any(
+        key in value for key in ("error", "errors")
+    ) or value.get("success") is False:
+        return ""
+    pagination = value.get("pagination")
+    if not isinstance(pagination, dict):
+        return ""
+    total = pagination.get("total_count")
+    offset = pagination.get("offset")
+    limit = pagination.get("limit")
+    if not all(type(number) is int for number in (total, offset, limit)):
+        return ""
+    if total < 0 or offset < 0 or limit <= 0 or offset >= total:
+        return ""
+    record_keys = [key for key in ("data", "items", "results")
+                   if isinstance(value.get(key), list)]
+    if len(record_keys) != 1:
+        return ""
+    count = len(value[record_keys[0]])
+    if count != min(limit, total - offset) or offset + count >= total:
+        return ""
+    page = (total, offset, limit)
+    if page in task.pagination_pages_seen:
+        return ""
+    task.pagination_pages_seen.append(page)
+    task.pagination_hint_count += 1
+    task.pagination_checked = True
+    return (
+        " Pagination metadata and record count show more records. "
+        f"The next offset would be {offset + count}; verify the current API "
+        "documentation and response before requesting that page, then combine "
+        "and deduplicate the results. Do not reuse an old URL or credential."
+    )
+
+
+def _is_vacuous_partial_answer(content: str) -> bool:
+    text = content.strip()
+    if not text or text.casefold() in ("unknown", "null"):
+        return True
+    try:
+        value = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    pending = [value]
+    leaves = 0
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        else:
+            leaves += 1
+            if item is not None and not (
+                isinstance(item, str)
+                and item.strip().casefold() in ("", "unknown", "null")
+            ):
+                return False
+    return leaves > 0
+
+
 def propose_tasks(
     turn: Turn,
     state: SessionState,
@@ -156,6 +260,8 @@ def propose_tasks(
 ) -> TaskTurnProposal:
     task = state.active_task
     if task is not None and turn.phase_task:
+        if not task.sop_hint:
+            task.sop_hint = _prior_task_experience(task, state)
         return _continue_active_task(turn, state, task)
     if turn.phase_task:
         return TaskTurnProposal()
@@ -190,6 +296,37 @@ def propose_tasks(
         task_spec.pos,
         reason,
     ),))
+
+
+def _prior_task_experience(task: TaskMemory, state: SessionState) -> str:
+    if not task.task_type:
+        return ""
+    source_session = task.instance_id.split(":", 1)[0]
+    for prior in reversed(state.ended_tasks):
+        if (
+            prior.task_type != task.task_type
+            or prior.instance_id.split(":", 1)[0] != source_session
+            or prior.end_reason != "unknown"
+            or prior.submission_count == 0
+            or prior.associated_error_codes
+            or prior.solver_stopped_reason is not None
+        ):
+            continue
+        steps = []
+        if prior.entry_read_attempted:
+            steps.append("bounded input inspection")
+        if prior.command_count:
+            steps.append("sandbox evidence inspection")
+        if prior.pagination_checked:
+            steps.append("pagination metadata check")
+        steps.append("answer submission")
+        return (
+            "Unverified prior same-type workflow: "
+            + ", ".join(steps)
+            + "; re-check this task's documentation, paths, authentication and input; "
+            "prior submission does not prove task success.\n"
+        )
+    return ""
 
 
 def _continue_active_task(
@@ -272,7 +409,7 @@ def _continue_active_task(
                 ):
                     if (
                         remaining is not None
-                        and remaining >= 2
+                        and remaining >= 1
                         and not task.final_only_correction_requested
                     ):
                         task.final_only_correction_requested = True
@@ -325,6 +462,22 @@ def _continue_active_task(
                 _remember(task, "Solver abandoned task", envelope.content)
                 task.solver_stopped_reason = "solver_abandoned"
                 return _leave_task(turn, task, owner)
+            if (envelope.complete is False
+                and _is_vacuous_partial_answer(envelope.content)):
+                if remaining == 0:
+                    task.solver_stopped_reason = "vacuous_partial_at_deadline"
+                    return _leave_task(turn, task, owner)
+                if task.vacuous_partial_correction_requested:
+                    task.solver_stopped_reason = "vacuous_partial_after_correction"
+                    return _leave_task(turn, task, owner)
+                task.vacuous_partial_correction_requested = True
+                task.final_answer_requested = True
+                return TaskTurnProposal(prompt=_solver_prompt(
+                    turn, task,
+                    "This partial answer contains no usable information. "
+                    "Return a reliable complete or partial answer from existing "
+                    "evidence, or abandon; do not request another command.",
+                ))
             if envelope.content == task.last_submitted_answer:
                 if remaining == 0:
                     task.solver_stopped_reason = "deadline_repeated_answer"
@@ -402,10 +555,20 @@ def _continue_active_task(
                 "No more command exploration. Return an evidence-based complete "
                 "or partial answer now, or abandon the task.",
             ))
-        return TaskTurnProposal(prompt=_solver_prompt(
-            turn, task,
-            _tool_result_context(status, result),
-        ))
+        hints = _pagination_hint(result, task, remaining)
+        if (not task.crlf_hint_requested
+            and _has_crlf_interpreter_evidence(result)):
+            task.crlf_hint_requested = True
+            hints += (
+                " The current task's tool result shows a CRLF interpreter "
+                "problem. Confirm the working directory and failing script, "
+                "repair only that script's line endings, then rerun its check. "
+                "Do not alter other files."
+            )
+        context = hints + ("\n" if hints else "") + _tool_result_context(
+            status, result, MAX_TOOL_CONTEXT_CHARS - len(hints) - bool(hints),
+        )
+        return TaskTurnProposal(prompt=_solver_prompt(turn, task, context))
 
     previous_submit = next((
         completed
@@ -549,7 +712,7 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         )
     return (
         contract
-        + f"{context_text}\nObserved environment path clues from successful "
+        + f"{context_text}\n{task.sop_hint}Observed environment path clues from successful "
         "sandbox output; re-check for this task:\n"
         f"{environment_text}\nCritical tool evidence:\n{evidence_text}\n"
         "Recent failed or incomplete command observations (not verified facts):\n"
@@ -857,8 +1020,10 @@ def _bounded(value: str, limit: int) -> str:
     return f"{value[:limit - len(marker)]}{marker}"
 
 
-def _tool_result_context(status: str, result: str) -> str:
-    if len(status) + len("\nPlatform result:\n") + len(result) > MAX_TOOL_CONTEXT_CHARS:
+def _tool_result_context(
+    status: str, result: str, limit: int = MAX_TOOL_CONTEXT_CHARS,
+) -> str:
+    if len(status) + len("\nPlatform result:\n") + len(result) > limit:
         status += (
             " The bounded view omits part of the middle; absence from this "
             "view is not evidence of absence. If another command is allowed, "
@@ -866,7 +1031,7 @@ def _tool_result_context(status: str, result: str) -> str:
         )
     return _bounded_middle(
         f"{status}\nPlatform result:\n{result}",
-        MAX_TOOL_CONTEXT_CHARS,
+        limit,
     )
 
 
