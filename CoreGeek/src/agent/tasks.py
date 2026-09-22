@@ -1,9 +1,11 @@
 import hashlib
 import json
 import re
+import shlex
 import time
 from dataclasses import dataclass
 from typing import Callable
+from urllib.parse import urlsplit, urlunsplit
 
 from .actions import ActionProposal, PlannedAction
 from .grid import next_step
@@ -49,7 +51,10 @@ _STANDALONE_PATH = re.compile(r"/[^\s\"'<>|：]{1,511}")
 _PATH_REFERENCE = re.compile(
     r"(?<![A-Za-z0-9_.-])(/[^\s\"'<>|：]{1,511})"
 )
-_JSON_FENCE = re.compile(r"\A```(?:json)?\r?\n(.+?)\r?\n```\Z", re.DOTALL | re.IGNORECASE)
+_JSON_FENCE = re.compile(
+    r"\A```(?:[A-Za-z][A-Za-z0-9_-]{0,15})?\r?\n(.+?)\r?\n```\Z",
+    re.DOTALL,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,43 +180,106 @@ def _has_crlf_interpreter_evidence(result: str) -> bool:
     )
 
 
-def _pagination_hint(result: str, task: TaskMemory, remaining: int | None) -> str:
+def _crlf_repair_command(command: str, result: str) -> str | None:
+    if (not _has_crlf_interpreter_evidence(result)
+        or len(command) > MAX_COMMAND_CHARS
+        or any(char in command for char in "`\n\r$*?[]")):
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        args = list(lexer)
+    except ValueError:
+        return None
+    prefix = []
+    if len(args) >= 4 and args[0] == "cd" and args[2] == "&&":
+        if not args[1] or args[1].startswith("-"):
+            return None
+        prefix = args[:3]
+        args = args[3:]
+    if len(args) != 1 or not args[0].startswith("./") or ".." in args[0].split("/"):
+        return None
+    script = args[0]
+    lines = result.splitlines()[1:]
+    if not any(
+        (line.startswith(script + ":")
+         or re.match(r"^(?:bash|sh|zsh): " + re.escape(script) + r":", line))
+        and "bad interpreter" in line.casefold()
+        and ("^M" in line or "\\r" in line or "CRLF" in line.upper())
+        for line in lines
+    ):
+        return None
+    python_code = (
+        "import pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+        "b=p.read_bytes(); p.write_bytes(b.replace(bytes([13,10]),bytes([10])))"
+    )
+    repair = shlex.join(["python3", "-c", python_code, script])
+    retry = shlex.join(args)
+    combined = (shlex.join(prefix[:2]) + " && " if prefix else "") + repair + " && " + retry
+    return combined if len(combined) <= MAX_COMMAND_CHARS else None
+
+
+def _pagination_gap(result: str, task: TaskMemory) -> tuple[int, int, int, int] | None:
     if (
         not result.startswith("[exitCode:0]\n")
         or len(result) > 65_536
         or "[TRUNCATED]" in result
-        or task.pagination_hint_count >= 2
-        or _remaining_tool_cycles(task, remaining) < 1
     ):
-        return ""
+        return None
     try:
         value = json.loads(result.partition("\n")[2])
     except (json.JSONDecodeError, ValueError):
-        return ""
-    if not isinstance(value, dict) or any(
-        key in value for key in ("error", "errors")
-    ) or value.get("success") is False:
-        return ""
-    pagination = value.get("pagination")
+        return None
+    if not isinstance(value, dict) or _explicit_business_error(value):
+        return None
+    data = value.get("data")
+    has_root = "pagination" in value
+    has_nested = isinstance(data, dict) and "pagination" in data
+    if has_root == has_nested:
+        return None
+    if has_root:
+        pagination = value.get("pagination")
+        record_keys = [key for key in ("data", "items", "results")
+                       if isinstance(value.get(key), list)]
+        if len(record_keys) != 1:
+            return None
+        records = value[record_keys[0]]
+    else:
+        if _explicit_business_error(data) or any(
+            isinstance(value.get(key), list) for key in ("items", "results")
+        ):
+            return None
+        pagination = data.get("pagination")
+        records = data.get("records")
+        if not isinstance(records, list):
+            return None
     if not isinstance(pagination, dict):
-        return ""
+        return None
     total = pagination.get("total_count")
     offset = pagination.get("offset")
     limit = pagination.get("limit")
     if not all(type(number) is int for number in (total, offset, limit)):
-        return ""
+        return None
     if total < 0 or offset < 0 or limit <= 0 or offset >= total:
-        return ""
-    record_keys = [key for key in ("data", "items", "results")
-                   if isinstance(value.get(key), list)]
-    if len(record_keys) != 1:
-        return ""
-    count = len(value[record_keys[0]])
+        return None
+    count = len(records)
     if count != min(limit, total - offset) or offset + count >= total:
-        return ""
+        return None
     page = (total, offset, limit)
     if page in task.pagination_pages_seen:
+        return None
+    return total, offset, limit, count
+
+
+def _pagination_hint(result: str, task: TaskMemory, remaining: int | None) -> str:
+    if task.pagination_hint_count >= 2 or _remaining_tool_cycles(task, remaining) < 1:
         return ""
+    gap = _pagination_gap(result, task)
+    if gap is None:
+        return ""
+    total, offset, limit, count = gap
+    page = (total, offset, limit)
     task.pagination_pages_seen.append(page)
     task.pagination_hint_count += 1
     task.pagination_checked = True
@@ -219,20 +287,112 @@ def _pagination_hint(result: str, task: TaskMemory, remaining: int | None) -> st
         " Pagination metadata and record count show more records. "
         f"The next offset would be {offset + count}; verify the current API "
         "documentation and response before requesting that page, then combine "
-        "and deduplicate the results. Do not reuse an old URL or credential."
+        "and deduplicate the results. This does not establish API success. "
+        "Do not reuse an old URL or credential."
+    )
+
+
+def _next_page_command(command: str, offset: int, limit: int,
+                       next_offset: int) -> str | None:
+    if len(command) > MAX_COMMAND_CHARS or any(char in command for char in "`\n\r$"):
+        return None
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        args = list(lexer)
+    except ValueError:
+        return None
+    if not args or args[0] != "curl" or any(
+        token in (";", "&&", "||", "|", "&", "<", ">", ">>")
+        for token in args
+    ):
+        return None
+    urls = []
+    index = 1
+    while index < len(args):
+        token = args[index]
+        if token in ("-s", "-S", "-sS", "-Ss", "-f", "-L", "--silent",
+                     "--show-error", "--fail", "--location"):
+            index += 1
+        elif token in ("-H", "--header", "-X", "--request", "--url"):
+            if index + 1 >= len(args):
+                return None
+            if token in ("-X", "--request") and args[index + 1] != "GET":
+                return None
+            if token == "--url":
+                urls.append(index + 1)
+            index += 2
+        elif token.startswith("-"):
+            return None
+        else:
+            urls.append(index)
+            index += 1
+    if len(urls) != 1:
+        return None
+    url_index = urls[0]
+    try:
+        parsed = urlsplit(args[url_index])
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.fragment:
+        return None
+    parts = parsed.query.split("&") if parsed.query else []
+    raw_keys = [part.partition("=")[0] for part in parts]
+    if any("%" in key for key in raw_keys):
+        return None
+    keys = [key.casefold() for key in raw_keys]
+    if any(key in ("offset", "limit") and raw != key
+           for raw, key in zip(raw_keys, keys)):
+        return None
+    if any(key in keys for key in ("page", "page_size", "pagesize", "signature",
+                                   "sig", "x-amz-signature", "token")):
+        return None
+    if keys.count("offset") > 1 or keys.count("limit") > 1:
+        return None
+    for key, expected in (("offset", offset), ("limit", limit)):
+        if key in keys:
+            raw = parts[keys.index(key)].partition("=")[2]
+            if raw != str(expected):
+                return None
+            parts[keys.index(key)] = f"{key}={next_offset if key == 'offset' else limit}"
+        else:
+            parts.append(f"{key}={next_offset if key == 'offset' else limit}")
+    args[url_index] = urlunsplit(parsed._replace(query="&".join(parts)))
+    next_command = shlex.join(args)
+    return next_command if len(next_command) <= MAX_COMMAND_CHARS else None
+
+
+def _explicit_business_error(value: dict) -> bool:
+    if any(key in value for key in ("error", "errors")):
+        return True
+    if value.get("success") is False or value.get("ok") is False:
+        return True
+    code = value.get("code")
+    status = value.get("status")
+    return (
+        (type(code) is int and (code < 0 or 400 <= code <= 599))
+        or code is False
+        or (isinstance(code, str)
+            and code.casefold() in ("error", "failed", "failure"))
+        or (type(status) is int and 400 <= status <= 599)
+        or (isinstance(status, str)
+            and status.casefold() in ("error", "failed", "failure"))
     )
 
 
 def _is_vacuous_partial_answer(content: str) -> bool:
     text = content.strip()
-    if not text or text.casefold() in ("unknown", "null"):
+    placeholders = ("", "unknown", "null", "none", "n/a", "undefined",
+                    "not found", "notfound", "no value", "novalue",
+                    "unavailable")
+    if text.casefold() in placeholders:
         return True
     try:
         value = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return False
     pending = [value]
-    leaves = 0
     while pending:
         item = pending.pop()
         if isinstance(item, dict):
@@ -240,13 +400,12 @@ def _is_vacuous_partial_answer(content: str) -> bool:
         elif isinstance(item, list):
             pending.extend(item)
         else:
-            leaves += 1
             if item is not None and not (
                 isinstance(item, str)
-                and item.strip().casefold() in ("", "unknown", "null")
+                and item.strip().casefold() in placeholders
             ):
                 return False
-    return leaves > 0
+    return True
 
 
 def propose_tasks(
@@ -312,12 +471,12 @@ def _prior_task_experience(task: TaskMemory, state: SessionState) -> str:
             or prior.solver_stopped_reason is not None
         ):
             continue
-        steps = []
-        if prior.entry_read_attempted:
+        steps = prior.sop_steps[-4:]
+        if not steps and prior.entry_read_attempted:
             steps.append("bounded input inspection")
-        if prior.command_count:
+        if not steps and prior.command_count:
             steps.append("sandbox evidence inspection")
-        if prior.pagination_checked:
+        if prior.pagination_checked and "pagination metadata check" not in steps:
             steps.append("pagination metadata check")
         steps.append("answer submission")
         return (
@@ -327,6 +486,82 @@ def _prior_task_experience(task: TaskMemory, state: SessionState) -> str:
             "prior submission does not prove task success.\n"
         )
     return ""
+
+
+def _record_sop_step(task: TaskMemory, command: str, result: str) -> None:
+    if not command_result_complete(result):
+        return
+    body = result.partition("\n")[2]
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    if isinstance(parsed, dict) and (
+        _explicit_business_error(parsed)
+        or (isinstance(parsed.get("data"), dict)
+            and _explicit_business_error(parsed["data"]))
+    ):
+        return
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        args = list(lexer)
+    except ValueError:
+        return
+    had_cd = len(args) >= 4 and args[:1] == ["cd"] and args[2] == "&&"
+    if had_cd:
+        if not args[1] or args[1].startswith("-"):
+            return
+        args = args[3:]
+    if not args:
+        return
+    if (task.crlf_auto_attempted and len(args) == 6
+        and args[:2] == ["python3", "-c"] and args[4] == "&&"
+        and args[3] == args[5] and args[3].startswith("./")):
+        step = "local check after script line-ending repair"
+    elif not had_cd and args[0] == "curl" and _sop_is_simple_curl_get(args):
+        step = "API read with exit-0 response"
+    elif len(args) == 2 and args[0] == "cat":
+        step = "file inspection with exit-0 response"
+    elif len(args) == 2 and args[0] in ("python", "python3"):
+        step = "script execution with exit-0 response"
+    elif len(args) == 1 and args[0].startswith("./"):
+        step = "local check with exit-0 response"
+    else:
+        return
+    task.sop_steps.append(step)
+    del task.sop_steps[:-4]
+
+
+def _sop_is_simple_curl_get(args: list[str]) -> bool:
+    urls = 0
+    index = 1
+    while index < len(args):
+        token = args[index]
+        if token in ("-s", "-S", "-sS", "-Ss", "-f", "-L", "--silent",
+                     "--show-error", "--fail", "--location"):
+            index += 1
+        elif token in ("-H", "--header", "-X", "--request", "--url"):
+            if index + 1 >= len(args):
+                return False
+            if token in ("-X", "--request") and args[index + 1] != "GET":
+                return False
+            if token == "--url":
+                if not args[index + 1].startswith(("http://", "https://")):
+                    return False
+                urls += 1
+            index += 2
+        elif token in ("-XGET", "--request=GET"):
+            index += 1
+        elif token.startswith("-") or token in ("&&", "||", ";", "|", "&", "<", ">", ">>"):
+            return False
+        elif token.startswith(("http://", "https://")):
+            urls += 1
+            index += 1
+        else:
+            return False
+    return urls == 1
 
 
 def _continue_active_task(
@@ -475,8 +710,10 @@ def _continue_active_task(
                 return TaskTurnProposal(prompt=_solver_prompt(
                     turn, task,
                     "This partial answer contains no usable information. "
-                    "Return a reliable complete or partial answer from existing "
-                    "evidence, or abandon; do not request another command.",
+                    "If the task explicitly requires an empty or negative result "
+                    "and the evidence supports it, return the exact result with "
+                    "complete:true. Otherwise return a reliable substantive "
+                    "partial answer or abandon; do not request another command.",
                 ))
             if envelope.content == task.last_submitted_answer:
                 if remaining == 0:
@@ -501,6 +738,7 @@ def _continue_active_task(
         )
         _remember_tool_result(task, "Platform command result", result)
         if command_result_complete(result):
+            _record_sop_step(task, task.last_command or "", result)
             evidence_label = "Complete tool output or observation"
             if (
                 len(evidence_label) + 2 + len(result)
@@ -555,6 +793,34 @@ def _continue_active_task(
                 "No more command exploration. Return an evidence-based complete "
                 "or partial answer now, or abandon the task.",
             ))
+        if (task.last_command and not task.crlf_auto_attempted
+            and _remaining_tool_cycles(task, remaining) >= 1
+            and (remaining is None or remaining >= 4)):
+            repair_command = _crlf_repair_command(task.last_command, result)
+            if repair_command is not None:
+                task.crlf_auto_attempted = True
+                task.crlf_hint_requested = True
+                task.last_command = repair_command
+                task.command_count += 1
+                _remember(task, "Platform command requested", repair_command)
+                return TaskTurnProposal(execute_cmd=repair_command)
+        if (task.last_command and task.pagination_auto_count < 2
+            and _remaining_tool_cycles(task, remaining) >= 1
+            and (remaining is None or remaining >= 4)):
+            gap = _pagination_gap(result, task)
+            if gap is not None:
+                total, offset, limit, count = gap
+                next_command = _next_page_command(
+                    task.last_command, offset, limit, offset + count,
+                )
+                if next_command is not None:
+                    task.pagination_pages_seen.append((total, offset, limit))
+                    task.pagination_checked = True
+                    task.pagination_auto_count += 1
+                    task.last_command = next_command
+                    task.command_count += 1
+                    _remember(task, "Platform command requested", next_command)
+                    return TaskTurnProposal(execute_cmd=next_command)
         hints = _pagination_hint(result, task, remaining)
         if (not task.crlf_hint_requested
             and _has_crlf_interpreter_evidence(result)):
@@ -663,6 +929,9 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         contract = (
             "Reformat the previous response using only the stated task and retained "
             "platform evidence. Return exactly one JSON object and no markdown. "
+            "Output only raw JSON: no markdown fences, no text before or after, "
+            "no extra fields. When the answer itself is JSON, escape it as the "
+            "answer.content string value. "
             f"{budget_text} {command_text} Maximum remaining tool cycles: 0. "
             "No further task exploration is available. Use "
             '{"kind":"answer","content":"<submit-ready answer>","complete":true} '
@@ -677,6 +946,9 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         contract = (
             "Solve the following competition task using only the stated task and "
             "platform sandbox evidence. Return exactly one JSON object and no markdown. "
+            "Output only raw JSON: no markdown fences, no text before or after, "
+            "no extra fields. When the answer itself is JSON, escape it as the "
+            "answer.content string value. "
             f"{budget_text} {command_text} Maximum remaining tool cycles: "
             f"{tool_cycles}. This is an upper bound, not a target to exhaust. "
             'Use {"kind":"command","content":"<sandbox command>"} only when another '

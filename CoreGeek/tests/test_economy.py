@@ -1291,8 +1291,188 @@ class EconomyTests(unittest.TestCase):
         ))
         self.assertEqual(second, first)
         self.assertEqual(context.truncated_reason, "expansion_limit")
-        self.assertEqual(context.cache_hits, 0)
-        self.assertGreater(context.path_searches, searches_after_first)
+        self.assertEqual(context.cache_hits, 1)
+        self.assertEqual(context.path_searches, searches_after_first + 1)
+
+    def test_natural_candidate_flow_reuses_incomplete_adjacent_evaluation(self):
+        payload = economy_payload(
+            round_no=30, worker_pos=(2, 1), items=("copper",) * 10,
+        )
+        payload["teamOur"]["teamId"] = "incomplete-adjacent-natural"
+        payload["mapInfo"].update(width=41, height=32)
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 2, 3, items=("copper",) * 10),
+        )
+        payload["mapInfo"]["zones"] = [
+            *({"pos": {"x": x, "y": 5}, "neutralType": "vendor"}
+              for x in range(10, 18)),
+            *({"pos": {"x": x, "y": 15}, "neutralType": "weaponShop"}
+              for x in range(20, 28)),
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 5}]
+        payload["weaponShopList"] = [
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        payload["worldNews"] = {}
+        original = economy._routes_to_adjacent
+        seen_incomplete = set()
+        repeated_costs = []
+
+        def measured(turn, worker, target, clock, deadline, max_expansions):
+            context = economy._ROUTE_SEARCH_CONTEXT.get()
+            key = (id(turn), worker.unit_id, worker.pos, target, max_expansions)
+            before = context.path_searches
+            result = original(turn, worker, target, clock, deadline,
+                              max_expansions)
+            if key in seen_incomplete and before < economy.MAX_ECONOMY_PATH_SEARCHES:
+                repeated_costs.append(context.path_searches - before)
+            if context.truncated_reason == "expansion_limit":
+                seen_incomplete.add(key)
+            return result
+
+        diagnostics = []
+        with patch.object(economy, "_routes_to_adjacent", measured):
+            candidates = economy.propose_economy(
+                Turn.load(payload), state_for(payload), clock=lambda: 0.0,
+                deadline=1.0, max_expansions=16,
+                diagnostic_sink=diagnostics.append,
+            )
+
+        self.assertTrue(repeated_costs)
+        self.assertLessEqual(max(repeated_costs), 1)
+        self.assertLessEqual(diagnostics[0]["pathSearches"], 1600)
+        self.assertTrue(all(candidate.proposal.command["action"] in {
+            "move", "sell", "buy", "use", "collect",
+        } for candidate in candidates))
+
+    def test_incomplete_adjacent_reuse_preserves_partial_and_guards(self):
+        payload = economy_payload(worker_pos=(0, 0))
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": 1, "y": 1}, "neutralType": "stone"},
+        ]
+        payload["teamOur"]["roles"] = [payload["teamOur"]["roles"][0]]
+        turn = Turn.load(payload)
+        worker = turn.workers()[0]
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            first = economy._routes_to_adjacent(
+                turn, worker, Pos(6, 6), lambda: 0.0, 1.0, 7,
+            )
+            before = context.path_searches
+            second = economy._routes_to_adjacent(
+                turn, worker, Pos(6, 6), lambda: 0.0, 1.0, 7,
+            )
+            self.assertTrue(first)
+            self.assertEqual(second, first)
+            self.assertEqual(context.path_searches, before + 1)
+            self.assertEqual(context.truncated_reason, "expansion_limit")
+            cache_hits = context.cache_hits
+            self.assertEqual(economy._routes_to_adjacent(
+                turn, worker, Pos(6, 6), lambda: 1.0, 1.0, 7,
+            ), ())
+            self.assertEqual(context.path_searches, before + 1)
+            self.assertEqual(context.cache_hits, cache_hits)
+            self.assertEqual(context.truncated_reason, "deadline")
+            context.path_searches = economy.MAX_ECONOMY_PATH_SEARCHES - 1
+            self.assertEqual(economy._routes_to_adjacent(
+                turn, worker, Pos(6, 6), lambda: 0.0, 1.0, 7,
+            ), first)
+            self.assertEqual(context.path_searches,
+                             economy.MAX_ECONOMY_PATH_SEARCHES)
+            self.assertEqual(economy._routes_to_adjacent(
+                turn, worker, Pos(6, 6), lambda: 0.0, 1.0, 7,
+            ), ())
+            self.assertEqual(context.truncated_reason, "search_limit")
+            self.assertEqual(context.cache_hits, cache_hits + 1)
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+    def test_empty_incomplete_adjacent_result_is_not_complete_unreachable(self):
+        turn = Turn.load(economy_payload(worker_pos=(0, 0)))
+        worker = turn.workers()[0]
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            first = economy._routes_to_adjacent(
+                turn, worker, Pos(11, 11), lambda: 0.0, 1.0, 3,
+            )
+            before = context.path_searches
+            second = economy._routes_to_adjacent(
+                turn, worker, Pos(11, 11), lambda: 0.0, 1.0, 3,
+            )
+            self.assertEqual(first, ())
+            self.assertEqual(second, ())
+            self.assertEqual(context.path_searches, before + 1)
+            self.assertEqual(context.truncated_reason, "expansion_limit")
+            self.assertEqual(context.routes, {})
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+    def test_incomplete_adjacent_cache_isolates_role_position_projection_budget_and_request(self):
+        from dataclasses import replace
+
+        turn = Turn.load(economy_payload(worker_pos=(0, 0)))
+        worker = turn.workers()[0]
+        other = replace(worker, unit_id=10011)
+        moved = replace(worker, pos=Pos(1, 0))
+        projected = replace(turn, zones={Pos(1, 1): "stone"})
+        target = Pos(11, 11)
+        context = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            for source, moving, budget in (
+                (turn, worker, 3), (turn, worker, 3),
+                (turn, other, 3), (turn, moved, 3),
+                (turn, worker, 4), (projected, worker, 3),
+            ):
+                economy._routes_to_adjacent(
+                    source, moving, target, lambda: 0.0, 1.0, budget,
+                )
+            self.assertEqual(len(context.incomplete_routes), 5)
+            self.assertEqual(context.cache_hits, 1)
+            first_request_searches = context.path_searches
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        fresh = economy.RouteSearchContext({})
+        token = economy._ROUTE_SEARCH_CONTEXT.set(fresh)
+        try:
+            economy._routes_to_adjacent(
+                turn, worker, target, lambda: 0.0, 1.0, 3,
+            )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+        self.assertGreater(first_request_searches, fresh.path_searches)
+        self.assertGreater(fresh.path_searches, 1)
+        self.assertEqual(fresh.cache_hits, 0)
+
+    def test_interrupted_adjacent_enumeration_is_never_cached_as_partial(self):
+        turn = Turn.load(economy_payload(worker_pos=(0, 0)))
+        worker = turn.workers()[0]
+        target = Pos(11, 11)
+        for starting_searches, results, expected in (
+            (0, [PathResult("expansion_limit", None, 3, None),
+                 PathResult("deadline", None, 0, None)], "deadline"),
+            (economy.MAX_ECONOMY_PATH_SEARCHES - 1,
+             [PathResult("expansion_limit", None, 3, None)], "search_limit"),
+        ):
+            with self.subTest(expected=expected):
+                context = economy.RouteSearchContext({})
+                context.path_searches = starting_searches
+                token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+                try:
+                    with patch.object(economy, "_search_path",
+                                      side_effect=results):
+                        result = economy._routes_to_adjacent(
+                            turn, worker, target, lambda: 0.0, 1.0, 3,
+                        )
+                    self.assertEqual(result, ())
+                    self.assertEqual(context.truncated_reason, expected)
+                    self.assertEqual(context.incomplete_routes, {})
+                finally:
+                    economy._ROUTE_SEARCH_CONTEXT.reset(token)
 
     def test_joint_planning_reuses_paths_and_keeps_real_actions(self):
         # Break caught: equivalent joint subroutes repeat thousands of searches.
@@ -2364,24 +2544,28 @@ class EconomyTests(unittest.TestCase):
                     calls.append(path)
                     return path
 
+                traces = []
                 with patch.object(economy, "next_step", counted):
                     if use_cache:
-                        response = engine.decide(current)
+                        response = engine.decide(current, trace_sink=traces.append)
                     else:
                         with patch.object(economy, "_search_path", uncached):
-                            response = engine.decide(current)
+                            response = engine.decide(current, trace_sink=traces.append)
                 plan = engine.state.state.plans[10010]
                 observed.append((
                     response["roleCommandMap"]["10010"],
                     plan.reason, plan.deadline_round,
                     len(calls), sum(path.expansions for path in calls),
+                    traces[0]["economyPlanning"]["pathCacheHits"],
                 ))
             return observed
 
         baseline, optimized = run(False), run(True)
         for before, after in zip(baseline, optimized):
             self.assertEqual(before[:3], after[:3])
-            self.assertLess(after[3], before[3])
+            # Reused incomplete evaluations may free logical budget for more
+            # candidates, so A* call count need not fall on every round.
+            self.assertGreater(after[5], 0)
             self.assertLess(after[4], before[4])
         self.assertEqual([entry[0]["action"] for entry in optimized], [
             "collect", "collect",
