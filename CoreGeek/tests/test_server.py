@@ -1,4 +1,5 @@
 import io
+import copy
 import hashlib
 import json
 import socket
@@ -239,7 +240,7 @@ class ServerTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(record["buildId"], "nightwatch-s2-integrated-r14")
+        self.assertEqual(record["buildId"], "nightwatch-s2-integrated-r17")
         self.assertEqual(
             record["team"], {"type": "challenger", "id": "s0-our"}
         )
@@ -815,16 +816,12 @@ class ServerTests(unittest.TestCase):
         with mock.patch.object(server_module.LOGGER, "info", side_effect=slow_log):
             server_module.Handler.do_POST(handler)
 
-        self.assertEqual([event for event, _ in events], [
-            "send",
-            "log_start",
-            "log_end",
-            "log_start",
-            "log_end",
-        ])
-        self.assertEqual(
-            [record["event"] for record in records], ["turn", "news_detail"],
-        )
+        self.assertEqual(events[0][0], "send")
+        self.assertEqual([event for event, _ in events[1:]],
+                         [value for _ in records for value in ("log_start", "log_end")])
+        event_names = [record["event"] for record in records]
+        self.assertEqual(event_names[0], "turn")
+        self.assertTrue(set(event_names).issubset({"turn", "task", "news_detail"}))
         self.assertGreaterEqual(
             records[0]["timingMs"]["serverWriteComplete"],
             records[0]["timingMs"]["processing"],
@@ -841,6 +838,125 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 400)
         body = json.loads(caught.exception.read().decode("utf-8"))
         self.assertEqual(body, {"error": "invalid request"})
+
+    def test_task_log_keeps_end_event_and_bounded_correlated_inputs(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["roundNo"] = 9
+        payload["phaseTask"] = "x" * (server_module.MAX_PHASE_TASK_CHARS + 3)
+        payload["lastCmdResult"] = "[exitCode:0]\nvalue\n[TRUNCATED]"
+        payload["errors"] = [{"errorCode": 2, "description": "wrong answer"}]
+        trace = {
+            "taskInstanceId": "new-task",
+            "solverState": "solving",
+            "taskEnd": {"instanceId": "old-task", "associatedErrorCodes": [2]},
+            "taskToolInputs": [None, "bad", {
+                "kind": "cmd", "receivedRound": 9,
+            }],
+            "newsEvidence": {"currentSession": 2},
+        }
+        record = server_module.task_log_record(
+            payload, {"roleCommandMap": {}, "prompt": "", "executeCmd": ""},
+            decision_trace=trace,
+        )
+        self.assertEqual(record["event"], "task")
+        self.assertEqual(record["endedTaskInfo"]["instanceId"], "old-task")
+        self.assertEqual(record["solverInternals"]["toolInputs"], [{
+            "kind": "cmd", "receivedRound": 9,
+        }])
+        self.assertTrue(record["input"]["phaseTask"]["truncated"])
+        self.assertTrue(record["input"]["cmdResult"]["platformTruncated"])
+        self.assertEqual(record["input"]["cmdResult"]["originalLength"],
+                         len(payload["lastCmdResult"]))
+        self.assertEqual(record["input"]["answerResult"]["class"], "wrong")
+
+    def test_task_log_economy_isolated_by_team_session_and_ended_instance(self):
+        server_module._task_economy_snapshots.clear()
+        base = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        response = {"roleCommandMap": {}, "prompt": "", "executeCmd": ""}
+        for team_id, score in (("team-a", 10), ("team-b", 100)):
+            payload = copy.deepcopy(base)
+            payload["teamOur"]["teamId"] = team_id
+            payload["teamOur"]["totalScore"] = score
+            server_module.task_log_record(payload, response, decision_trace={
+                "taskInstanceId": "same-id", "solverState": "solving",
+                "newsEvidence": {"currentSession": 1},
+            })
+        ended = copy.deepcopy(base)
+        ended["roundNo"] = 3
+        ended["teamOur"]["teamId"] = "team-a"
+        ended["teamOur"]["totalScore"] = 17
+        record = server_module.task_log_record(ended, response, decision_trace={
+            "taskInstanceId": "new-id", "solverState": "solving",
+            "taskEnd": {"instanceId": "same-id", "associatedErrorCodes": []},
+            "newsEvidence": {"currentSession": 1},
+        })
+        self.assertEqual(record["scoreDelta"]["scoreDelta"], 7)
+        self.assertEqual(record["scoreDelta"]["attribution"], "team_observation")
+        self.assertEqual(len(server_module._task_economy_snapshots), 2)
+        for index in range(40):
+            server_module.task_log_record(base, response, decision_trace={
+                "taskInstanceId": f"bounded-{index}", "solverState": "solving",
+                "newsEvidence": {"currentSession": 1},
+            })
+        self.assertLessEqual(len(server_module._task_economy_snapshots), 32)
+        server_module.task_log_record(base, response, decision_trace={
+            "taskInstanceId": None, "solverState": "idle",
+            "taskEnd": {"instanceId": "bounded-39", "associatedErrorCodes": []},
+            "newsEvidence": {"currentSession": 1},
+        })
+        self.assertFalse(any(key[-1] == "bounded-39"
+                             for key in server_module._task_economy_snapshots))
+
+    def test_task_log_does_not_infer_answer_success_or_unrelated_error(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        response = {"roleCommandMap": {}, "prompt": "", "executeCmd": ""}
+        payload["errors"] = [{"errorCode": 2, "description": "other role"}]
+        record = server_module.task_log_record(payload, response, decision_trace={
+            "taskInstanceId": "task", "solverState": "solving",
+            "taskToolInputs": [],
+        })
+        self.assertNotIn("answerResult", record.get("input", {}))
+        payload["teamOur"]["roles"].append({
+            "id": 10011, "roleType": "pioneer", "pos": {"x": 1, "y": 1},
+            "backpack": [],
+        })
+        pioneer_id = "10011"
+        payload["lastRoundRoleActionResults"] = {pioneer_id: False}
+        record = server_module.task_log_record(payload, response, decision_trace={
+            "taskInstanceId": "task", "solverState": "solving",
+        })
+        self.assertEqual(record["input"]["answerResult"], {
+            "class": "wrong", "errorCodes": [2],
+            "association": "current_task_action_feedback",
+        })
+        payload["lastRoundRoleActionResults"] = {"99999": False}
+        record = server_module.task_log_record(payload, response, decision_trace={
+            "taskInstanceId": "task", "solverState": "solving",
+        })
+        self.assertNotIn("answerResult", record.get("input", {}))
+        payload["errors"] = []
+        record = server_module.task_log_record(payload, response, decision_trace={
+            "taskInstanceId": "task", "solverState": "solving",
+        })
+        self.assertNotIn("answerResult", record.get("input", {}))
+
+    def test_handler_emits_new_task_event_and_keeps_turn_log(self):
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        payload["phaseTask"] = "synthetic task"
+        payload["worldNews"] = {}
+        body = json.dumps(payload).encode("utf-8")
+        handler = object.__new__(server_module.Handler)
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler._send_body = lambda status, response_body: None
+        records = []
+        with mock.patch.object(
+            server_module.LOGGER, "info",
+            side_effect=lambda *args, **kwargs: records.append(json.loads(args[1])),
+        ):
+            server_module.Handler.do_POST(handler)
+        self.assertEqual([record["event"] for record in records], ["turn", "task"])
+        self.assertFalse(any(record["event"] == "task_detail" for record in records))
 
 
 if __name__ == "__main__":

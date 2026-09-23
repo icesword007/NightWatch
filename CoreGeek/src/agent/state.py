@@ -91,6 +91,8 @@ class TaskMemory:
     last_accepted_cmd_result_round: int | None = None
     repeated_tool_result_count: int = 0
     last_command: str | None = None
+    last_command_preprocessed: bool = False
+    last_command_is_entry_read: bool = False
     consecutive_nonzero_command: str | None = None
     consecutive_nonzero_count: int = 0
     repeated_command_correction_requested: bool = False
@@ -98,6 +100,7 @@ class TaskMemory:
     repeated_cycle_count: int = 0
     command_count: int = 0
     entry_read_attempted: bool = False
+    api_docs_read_attempted: bool = False
     final_answer_requested: bool = False
     final_only_correction_requested: bool = False
     vacuous_partial_correction_requested: bool = False
@@ -118,6 +121,7 @@ class TaskMemory:
     pagination_pages_seen: list[tuple[int, int, int]] = field(default_factory=list)
     pagination_hint_count: int = 0
     pagination_auto_count: int = 0
+    pagination_evidence: list[str] = field(default_factory=list)
     sop_hint: str = ""
     sop_steps: list[str] = field(default_factory=list)
 

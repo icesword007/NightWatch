@@ -5,17 +5,32 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock
 from typing import Any
 
 from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s2-integrated-r14"
+BUILD_ID = "nightwatch-s2-integrated-r17"
 MAX_TASK_DETAIL_CHARS = 131_072
 MAX_NEWS_DETAIL_CHARS = 4_096
 MAX_LOG_ITEMS = 16
 MAX_LOG_TARGETS = 3
+
+# --- Task diagnostic logging constants ---
+MAX_PROMPT_CHARS = 32_768
+MAX_LLM_RESP_CHARS = 20_000
+MAX_CMD_RESULT_CHARS = 32_768
+MAX_EXECUTE_CMD_CHARS = 4_096
+MAX_ANSWER_CHARS = 16_384
+MAX_PHASE_TASK_CHARS = 32_768
+
+# Task economy snapshot cache — per taskInstanceId, records economy state
+# when the task first appears, used to compute scoreDelta / goldDelta on end.
+_task_economy_snapshots: dict[tuple[Any, ...], dict[str, Any]] = {}
+_task_economy_lock = Lock()
+MAX_TASK_ECONOMY_SNAPSHOTS = 32
 LOG_INVENTORY_ITEMS = (
     "stone",
     "iron",
@@ -32,6 +47,478 @@ LOG_INVENTORY_ITEMS = (
     "WallUpgradeVoucher2",
 )
 LOG_STRUCTURE_TYPES = frozenset(("station", "gatling", "railgun", "rocket", "wall"))
+
+
+def _trace_session_index(trace: dict[str, Any]) -> Any:
+    evidence = trace.get("newsEvidence")
+    return evidence.get("currentSession") if isinstance(evidence, dict) else None
+
+
+def _valid_task_tool_inputs(trace: dict[str, Any], round_no: Any) -> list[dict[str, Any]]:
+    values = trace.get("taskToolInputs")
+    if not isinstance(values, list):
+        return []
+    return [
+        value for value in values[:MAX_LOG_ITEMS]
+        if isinstance(value, dict)
+        and value.get("kind") in ("llm", "cmd")
+        and value.get("receivedRound") == round_no
+    ]
+
+
+def task_log_record(
+    payload: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    decision_trace: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build a task-focused diagnostic log record.
+
+    Returns None if no task-relevant activity occurred this round.
+    Includes endedTaskInfo, answerResult, scoreDelta, and solverInternals
+    for task debugging and post-game analysis.
+    """
+    trace = decision_trace if isinstance(decision_trace, dict) else {}
+    team = payload.get("teamOur")
+    team = team if isinstance(team, dict) else {}
+    round_no = payload.get("roundNo")
+
+    task_instance_id = trace.get("taskInstanceId")
+    ended_task_info = trace.get("taskEnd")
+    if not isinstance(ended_task_info, dict):
+        ended_task_info = trace.get("endedTaskInfo")
+    if not isinstance(ended_task_info, dict):
+        ended_task_info = None
+    phase_task = payload.get("phaseTask")
+    phase_task = phase_task if isinstance(phase_task, str) else ""
+    has_phase_task = bool(phase_task)
+    solver_state = trace.get("solverState", "idle")
+    solver_reason = trace.get("solverReason")
+    task_start_skip = trace.get("taskStartSkipReason")
+    coordination_reason = trace.get("coordinationReason")
+
+    commands = response.get("roleCommandMap")
+    commands = commands if isinstance(commands, dict) else {}
+    task_actions = _extract_task_commands(commands)
+    prompt_sent = response.get("prompt")
+    prompt_sent = prompt_sent if isinstance(prompt_sent, str) else ""
+    execute_cmd = response.get("executeCmd")
+    execute_cmd = execute_cmd if isinstance(execute_cmd, str) else ""
+
+    llm_resp = payload.get("llmResp")
+    llm_resp = llm_resp if isinstance(llm_resp, str) else ""
+    cmd_result = payload.get("lastCmdResult")
+    cmd_result = cmd_result if isinstance(cmd_result, str) else ""
+
+    raw_feedback = payload.get("lastRoundRoleActionResults")
+    raw_feedback = raw_feedback if isinstance(raw_feedback, dict) else {}
+    raw_errors = payload.get("errors")
+    raw_errors = raw_errors if isinstance(raw_errors, list) else []
+    task_role_ids = _task_related_role_ids(commands, trace, team)
+
+    task_points = _task_point_states(team)
+
+    task_prompt = bool(prompt_sent) and (
+        has_phase_task or task_instance_id is not None
+    )
+    task_cmd = bool(execute_cmd) and (
+        has_phase_task or task_instance_id is not None
+    )
+    is_task_relevant = (
+        task_instance_id is not None
+        or ended_task_info is not None
+        or has_phase_task
+        or task_actions
+        or task_prompt
+        or task_cmd
+        or task_start_skip is not None
+        or solver_state not in ("idle",)
+        or (
+            coordination_reason is not None
+            and coordination_reason != "normal"
+        )
+        or _has_task_accept(commands)
+    )
+    if not is_task_relevant:
+        return None
+
+    # Filter out idle move-only rounds (noise reduction)
+    if (
+        task_instance_id is None
+        and not has_phase_task
+        and solver_state == "idle"
+        and task_start_skip is None
+        and not _has_task_accept(commands)
+        and not task_prompt
+        and not task_cmd
+        and task_actions
+        and all(a["action"] == "move" for a in task_actions)
+    ):
+        return None
+
+    record: dict[str, Any] = {
+        "event": "task",
+        "buildId": BUILD_ID,
+        "timestampUtc": datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds",
+        ),
+        "roundNo": round_no,
+        "team": {
+            "type": team.get("type"),
+            "id": team.get("teamId"),
+        },
+        "sessionIndex": _trace_session_index(trace),
+        "taskInstanceId": task_instance_id,
+        "solverState": solver_state,
+        "solverReason": solver_reason,
+        "taskRemainingRounds": trace.get("taskRemainingRounds"),
+        "leaveReason": trace.get("leaveReason"),
+        "coordinationReason": coordination_reason,
+        "taskStartSkipReason": task_start_skip,
+        "taskPoints": task_points,
+    }
+
+    if ended_task_info is not None:
+        record["endedTaskInfo"] = ended_task_info
+
+    # Solver internal state from trace
+    solver_internals = {
+        "taskEntryReadAttempted": trace.get("taskEntryReadAttempted"),
+        "finalOnlyCorrectionRequested": trace.get(
+            "taskFinalOnlyCorrectionRequested",
+        ),
+        "repeatedCommandCorrectionRequested": trace.get(
+            "taskRepeatedCommandCorrectionRequested",
+        ),
+        "envelopeCorrectionRequested": trace.get(
+            "taskEnvelopeCorrectionRequested",
+        ),
+        "envelopeCorrectionPending": trace.get(
+            "taskEnvelopeCorrectionPending",
+        ),
+        "envelopeRejectionClass": trace.get("taskEnvelopeRejectionClass"),
+        "consecutiveNonzeroFailures": trace.get(
+            "taskConsecutiveNonzeroFailures",
+        ),
+        "cycleFingerprint": trace.get("cycleFingerprint"),
+        "commandFingerprint": trace.get("commandFingerprint"),
+        "resultFingerprint": trace.get("resultFingerprint"),
+        "toolInputs": _valid_task_tool_inputs(trace, round_no),
+    }
+    solver_internals = {
+        key: value for key, value in solver_internals.items()
+        if value is not None
+    }
+    if solver_internals:
+        record["solverInternals"] = solver_internals
+
+    # Input from judger
+    input_section: dict[str, Any] = {}
+    if has_phase_task:
+        input_section["phaseTask"] = _bounded_text(
+            phase_task, MAX_PHASE_TASK_CHARS,
+        )
+    if llm_resp:
+        envelope = parse_llm_envelope(llm_resp)
+        input_section["llmResp"] = _bounded_text(llm_resp, MAX_LLM_RESP_CHARS)
+        if envelope is not None:
+            input_section["llmEnvelope"] = {
+                "kind": envelope.kind,
+                "content": _bounded_text(
+                    envelope.content, MAX_ANSWER_CHARS,
+                ),
+                "complete": envelope.complete,
+            }
+        elif llm_resp:
+            input_section["llmEnvelopeParseFailed"] = True
+    if cmd_result:
+        input_section["cmdResult"] = {
+            "class": _command_result_class(cmd_result),
+            "truncated": "[TRUNCATED]" in cmd_result,
+            **_bounded_text(cmd_result, MAX_CMD_RESULT_CHARS),
+        }
+    if raw_errors:
+        input_section["errors"] = [
+            {
+                "code": error.get("errorCode"),
+                "description": _bounded_text(
+                    error.get("description"), 1024,
+                )["value"],
+            }
+            for error in raw_errors[:16]
+            if isinstance(error, dict)
+        ]
+        associated_codes = (
+            ended_task_info.get("associatedErrorCodes")
+            if ended_task_info is not None else None
+        )
+        answer_result = _classify_answer_result(
+            associated_codes if isinstance(associated_codes, list) else [],
+        )
+        association = "ended_task"
+        if answer_result is None and any(
+            result is False and str(role_id) in task_role_ids
+            for role_id, result in raw_feedback.items()
+        ):
+            answer_result = _classify_answer_result([
+                error for error in raw_errors
+                if isinstance(error, dict)
+                and str(error.get("errorCode")) in ("1", "2")
+            ])
+            association = "current_task_action_feedback"
+        if answer_result is not None:
+            answer_result["association"] = association
+            input_section["answerResult"] = answer_result
+    if input_section:
+        record["input"] = input_section
+
+    # Output to judger
+    output_section: dict[str, Any] = {}
+    if prompt_sent:
+        output_section["prompt"] = _bounded_text(
+            prompt_sent, MAX_PROMPT_CHARS,
+        )
+    if execute_cmd:
+        output_section["executeCmd"] = _bounded_text(
+            execute_cmd, MAX_EXECUTE_CMD_CHARS,
+        )
+    if task_actions:
+        output_section["taskActions"] = task_actions
+    if output_section:
+        record["output"] = output_section
+
+    # Action feedback
+    relevant_feedback = {
+        str(role_id): result
+        for role_id, result in raw_feedback.items()
+        if str(role_id) in task_role_ids
+    }
+    if relevant_feedback:
+        record["actionFeedback"] = {
+            str(role_id): result
+            for role_id, result in relevant_feedback.items()
+        }
+
+    # Economy context with scoreDelta attribution
+    current_gold = team.get("goldNum")
+    current_score = team.get("totalScore")
+    record["economy"] = {
+        "gold": current_gold,
+        "score": current_score,
+    }
+
+    session_index = _trace_session_index(trace)
+    team_key = (team.get("type"), team.get("teamId"), session_index)
+    snapshot = None
+    with _task_economy_lock:
+        if task_instance_id is not None and solver_state != "ended":
+            key = (*team_key, task_instance_id)
+            if key not in _task_economy_snapshots:
+                _task_economy_snapshots[key] = {
+                    "startRound": round_no,
+                    "gold": current_gold,
+                    "score": current_score,
+                }
+                while len(_task_economy_snapshots) > MAX_TASK_ECONOMY_SNAPSHOTS:
+                    _task_economy_snapshots.pop(next(iter(_task_economy_snapshots)))
+        if ended_task_info is not None:
+            ended_id = ended_task_info.get("instanceId") or task_instance_id
+            if ended_id is not None:
+                snapshot = _task_economy_snapshots.pop((*team_key, ended_id), None)
+    if ended_task_info is not None:
+        if snapshot is not None:
+            record["scoreDelta"] = {
+                "startRound": snapshot["startRound"],
+                "endRound": round_no,
+                "goldStart": snapshot["gold"],
+                "goldEnd": current_gold,
+                "goldDelta": (
+                    current_gold - snapshot["gold"]
+                    if isinstance(current_gold, int)
+                    and isinstance(snapshot["gold"], int)
+                    else None
+                ),
+                "scoreStart": snapshot["score"],
+                "scoreEnd": current_score,
+                "scoreDelta": (
+                    current_score - snapshot["score"]
+                    if isinstance(current_score, int)
+                    and isinstance(snapshot["score"], int)
+                    else None
+                ),
+                "attribution": "team_observation",
+            }
+
+    legacy = task_detail_log_record(
+        payload, response, decision_trace=trace,
+    )
+    if legacy is not None:
+        record["requestFingerprint"] = legacy.get("requestFingerprint")
+        record["inputAssociation"] = legacy.get("inputAssociation")
+        record["acceptedToolInputs"] = legacy.get("acceptedToolInputs", [])
+
+    record["pioneer"] = _pioneer_state(team)
+
+    return record
+
+
+def _extract_task_commands(
+    commands: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Extract task-related commands from the response."""
+    result = []
+    for role_id, command in sorted(
+        commands.items(), key=lambda item: str(item[0]),
+    ):
+        if not isinstance(command, dict):
+            continue
+        action = command.get("action")
+        if action not in ("acceptTask", "submitAnswer", "move"):
+            continue
+        entry: dict[str, Any] = {
+            "roleId": str(role_id),
+            "action": action,
+        }
+        if action == "submitAnswer":
+            entry["taskAnswer"] = _bounded_text(
+                command.get("taskAnswer"), MAX_ANSWER_CHARS,
+            )
+        targets = command.get("targetPos")
+        if isinstance(targets, list) and targets:
+            entry["targetPos"] = {
+                "x": targets[0].get("x") if isinstance(targets[0], dict) else None,
+                "y": targets[0].get("y") if isinstance(targets[0], dict) else None,
+            }
+        result.append(entry)
+    return result
+
+
+def _has_task_accept(commands: dict[str, Any]) -> bool:
+    return any(
+        isinstance(cmd, dict) and cmd.get("action") == "acceptTask"
+        for cmd in commands.values()
+    )
+
+
+def _task_related_role_ids(
+    commands: dict[str, Any],
+    trace: dict[str, Any],
+    team: dict[str, Any],
+) -> set[str]:
+    """Identify role IDs involved in task actions."""
+    ids = set()
+    roles = team.get("roles")
+    if isinstance(roles, list):
+        for role in roles:
+            if isinstance(role, dict) and role.get("roleType") == "pioneer":
+                ids.add(str(role.get("id")))
+    for role_id, command in commands.items():
+        if isinstance(command, dict) and command.get("action") in (
+            "acceptTask", "submitAnswer",
+        ):
+            ids.add(str(role_id))
+    return ids
+
+
+def _task_point_states(team: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = team.get("playerTasks")
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for task in raw:
+        if not isinstance(task, dict):
+            continue
+        result.append({
+            "type": task.get("taskType"),
+            "pos": {
+                "x": task.get("taskPosition", {}).get("x")
+                if isinstance(task.get("taskPosition"), dict)
+                else None,
+                "y": task.get("taskPosition", {}).get("y")
+                if isinstance(task.get("taskPosition"), dict)
+                else None,
+            },
+            "cooldownRounds": task.get("coldDownRounds"),
+            "scoreReward": task.get("scoreReward"),
+            "goldReward": task.get("goldReward"),
+            "valid": task.get("isValid"),
+            "timeoutRounds": task.get("timeoutRounds"),
+        })
+    return result
+
+
+def _pioneer_state(team: dict[str, Any]) -> dict[str, Any] | None:
+    roles = team.get("roles")
+    if not isinstance(roles, list):
+        return None
+    for role in roles:
+        if not isinstance(role, dict) or role.get("roleType") != "pioneer":
+            continue
+        pos = role.get("pos")
+        return {
+            "id": str(role.get("id")),
+            "pos": {
+                "x": pos.get("x") if isinstance(pos, dict) else None,
+                "y": pos.get("y") if isinstance(pos, dict) else None,
+            },
+            "health": role.get("health"),
+            "backpackSize": len(role.get("backpack", []))
+            if isinstance(role.get("backpack"), list)
+            else 0,
+        }
+    return None
+
+
+def _bounded_text(raw: Any, limit: int) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        return {
+            "value": None,
+            "originalLength": None,
+            "truncated": False,
+            "platformTruncated": False,
+            "fingerprint": None,
+        }
+    return {
+        "value": raw[:limit],
+        "originalLength": len(raw),
+        "truncated": len(raw) > limit,
+        "platformTruncated": "[TRUNCATED]" in raw,
+        "fingerprint": hashlib.sha256(
+            raw.encode("utf-8"),
+        ).hexdigest()[:16],
+    }
+
+
+def _classify_answer_result(
+    raw_errors: list[Any],
+) -> dict[str, Any] | None:
+    """Infer answer result from error codes.
+
+    error code=1 -> timeout, code=2 -> wrong, other -> error.
+    """
+    if not raw_errors:
+        return None
+    codes: list[int] = []
+    for error in raw_errors:
+        code = error.get("errorCode") if isinstance(error, dict) else error
+        try:
+            code_int = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code_int = None
+        if code_int is not None:
+            codes.append(code_int)
+    if not codes:
+        return None
+    if 1 in codes:
+        result_class = "timeout"
+    elif 2 in codes:
+        result_class = "wrong"
+    else:
+        result_class = "error"
+    return {
+        "class": result_class,
+        "errorCodes": codes,
+    }
 
 
 def task_detail_log_record(
@@ -412,7 +899,6 @@ def _summary_decision_trace(
     summary["newsInterpretation"] = news
     return summary
 
-
 def _controlled_role_states(team: dict[str, Any]) -> dict[str, Any]:
     roles = team.get("roles")
     if not isinstance(roles, list):
@@ -657,14 +1143,14 @@ class Handler(BaseHTTPRequestHandler):
                 "%s",
                 json.dumps(record, ensure_ascii=False, separators=(",", ":")),
             )
-            detail = task_detail_log_record(
+            task_record = task_log_record(
                 payload, response, decision_trace=decision_trace,
             )
-            if detail is not None:
+            if task_record is not None:
                 LOGGER.info(
                     "%s",
                     json.dumps(
-                        detail, ensure_ascii=False, separators=(",", ":"),
+                        task_record, ensure_ascii=False, separators=(",", ":"),
                     ),
                 )
             news_detail = news_detail_log_record(

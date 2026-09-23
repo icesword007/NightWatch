@@ -4,6 +4,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -55,6 +56,88 @@ _JSON_FENCE = re.compile(
     r"\A```(?:[A-Za-z][A-Za-z0-9_-]{0,15})?\r?\n(.+?)\r?\n```\Z",
     re.DOTALL,
 )
+
+_CRLF_NORMALIZE = (
+    "find . -maxdepth 2 -type f -exec sed -i 's/\\r$//' {} + 2>/dev/null"
+)
+
+
+def _preprocess_execute_command(command: str) -> str:
+    """Normalize nearby scripts/configs before a local executable is invoked."""
+    if not command or len(command) > MAX_COMMAND_CHARS or "\n" in command:
+        return command
+    operators = _shell_operator_spans(command)
+    if operators is None or not _invokes_local_executable(command, operators):
+        return command
+    first_start, first_end, first_op = operators[0] if operators else (
+        len(command), len(command), "",
+    )
+    first_segment = command[:first_start]
+    try:
+        first_args = shlex.split(first_segment)
+    except ValueError:
+        return command
+    if first_args[:1] == ["cd"]:
+        if len(first_args) != 2 or not first_args[1] or first_args[1].startswith("-"):
+            return command
+        if first_op not in ("&&", ";"):
+            return command
+        prefix = command[:first_start].rstrip()
+        suffix = command[first_end:].lstrip()
+        if first_op == "&&":
+            processed = f"{prefix} && {{ {_CRLF_NORMALIZE} || true; }} && {suffix}"
+        else:
+            processed = (
+                f"{prefix}; if [ $? -eq 0 ]; then {_CRLF_NORMALIZE} || true; fi; {suffix}"
+            )
+    else:
+        processed = f"{{ {_CRLF_NORMALIZE} || true; }}; {command}"
+    return processed if len(processed) <= MAX_COMMAND_CHARS else command
+
+
+def _shell_operator_spans(command: str) -> list[tuple[int, int, str]] | None:
+    spans = []
+    quote = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char in ";|&<>":
+            end = index + 1
+            if end < len(command) and command[end] == char and char in "|&<>":
+                end += 1
+            spans.append((index, end, command[index:end]))
+            index = end - 1
+        index += 1
+    return None if quote or escaped else spans
+
+
+def _invokes_local_executable(
+    command: str, operators: list[tuple[int, int, str]],
+) -> bool:
+    separators = [span for span in operators if span[2] not in ("<", ">", ">>")]
+    segment_starts = [0] + [end for _, end, _ in separators]
+    segment_ends = [start for start, _, _ in separators] + [len(command)]
+    for start, end in zip(segment_starts, segment_ends):
+        segment = command[start:end].strip()
+        if not segment:
+            continue
+        try:
+            args = shlex.split(segment)
+        except ValueError:
+            return False
+        if args and args[0].startswith("./"):
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -509,6 +592,12 @@ def _record_sop_step(task: TaskMemory, command: str, result: str) -> None:
         args = list(lexer)
     except ValueError:
         return
+    if task.last_command_preprocessed:
+        if args and args[-1].startswith("./"):
+            step = "local check after bounded line-ending preprocessing"
+            task.sop_steps.append(step)
+            del task.sop_steps[:-4]
+        return
     had_cd = len(args) >= 4 and args[:1] == ["cd"] and args[2] == "&&"
     if had_cd:
         if not args[1] or args[1].startswith("-"):
@@ -588,6 +677,9 @@ def _continue_active_task(
     if task.consumed_tool_results < len(task.tool_results):
         kind, result = task.tool_results[task.consumed_tool_results]
         task.consumed_tool_results += 1
+        result_is_entry_read = kind == "cmd" and task.last_command_is_entry_read
+        if kind == "cmd":
+            task.last_command_is_entry_read = False
         result_fingerprint = hashlib.sha256(
             f"{kind}\0{result}".encode("utf-8")
         ).hexdigest()
@@ -639,6 +731,7 @@ def _continue_active_task(
                     )
                     return _leave_task(turn, task, owner)
             if envelope.kind == "command":
+                execute_command = _preprocess_execute_command(envelope.content)
                 if _final_answer_required(task) or (
                     remaining is not None and remaining < 2
                 ):
@@ -664,7 +757,7 @@ def _continue_active_task(
                     task.solver_stopped_reason = "command_after_final_request"
                     return _leave_task(turn, task, owner)
                 if (
-                    envelope.content == task.consecutive_nonzero_command
+                    execute_command == task.consecutive_nonzero_command
                     and task.consecutive_nonzero_count >= 2
                 ):
                     if not task.repeated_command_correction_requested:
@@ -685,14 +778,16 @@ def _continue_active_task(
                         ))
                     task.solver_stopped_reason = "repeated_failed_command"
                     return _leave_task(turn, task, owner)
-                if envelope.content != task.consecutive_nonzero_command:
+                if execute_command != task.consecutive_nonzero_command:
                     task.consecutive_nonzero_command = None
                     task.consecutive_nonzero_count = 0
                     task.repeated_command_correction_requested = False
-                _remember(task, "Platform command requested", envelope.content)
-                task.last_command = envelope.content
+                _remember(task, "Platform command requested", execute_command)
+                task.last_command = execute_command
+                task.last_command_preprocessed = execute_command != envelope.content
+                task.last_command_is_entry_read = False
                 task.command_count += 1
-                return TaskTurnProposal(execute_cmd=envelope.content)
+                return TaskTurnProposal(execute_cmd=execute_command)
             if envelope.kind == "abandon":
                 _remember(task, "Solver abandoned task", envelope.content)
                 task.solver_stopped_reason = "solver_abandoned"
@@ -739,6 +834,7 @@ def _continue_active_task(
         _remember_tool_result(task, "Platform command result", result)
         if command_result_complete(result):
             _record_sop_step(task, task.last_command or "", result)
+            _remember_pagination_evidence(task, result)
             evidence_label = "Complete tool output or observation"
             if (
                 len(evidence_label) + 2 + len(result)
@@ -763,6 +859,26 @@ def _continue_active_task(
         if remaining == 0:
             task.solver_stopped_reason = "command_result_at_deadline"
             return _leave_task(turn, task, owner)
+        if (result_is_entry_read and not task.api_docs_read_attempted
+            and "[TASK_INPUT_PATH]" in result
+            and "[TASK_INPUT_CONTENT]" in result):
+            api_docs_cmd = _build_api_docs_read_command(result)
+            if api_docs_cmd is not None:
+                can_auto_read = (
+                    not _final_answer_required(task)
+                    and (remaining is None or remaining >= 3)
+                    and (_effective_deadline(task) is not None
+                         or task.command_count < MAX_UNKNOWN_TASK_COMMANDS)
+                )
+                if can_auto_read:
+                    task.api_docs_read_attempted = True
+                    task.last_command = api_docs_cmd
+                    task.last_command_preprocessed = False
+                    task.last_command_is_entry_read = False
+                    task.command_count += 1
+                    _remember(task, "Automatic API_DOCS.md read", api_docs_cmd)
+                    return TaskTurnProposal(execute_cmd=api_docs_cmd)
+            task.api_docs_read_attempted = True
         cycle_fingerprint = hashlib.sha256(
             f"{task.last_command or ''}\0{result}".encode("utf-8")
         ).hexdigest()
@@ -794,19 +910,25 @@ def _continue_active_task(
                 "or partial answer now, or abandon the task.",
             ))
         if (task.last_command and not task.crlf_auto_attempted
-            and _remaining_tool_cycles(task, remaining) >= 1
-            and (remaining is None or remaining >= 4)):
+            and not _final_answer_required(task)
+            and (remaining is None or remaining >= 2)
+            and (_effective_deadline(task) is not None
+                 or task.command_count < MAX_UNKNOWN_TASK_COMMANDS)):
             repair_command = _crlf_repair_command(task.last_command, result)
             if repair_command is not None:
                 task.crlf_auto_attempted = True
                 task.crlf_hint_requested = True
                 task.last_command = repair_command
+                task.last_command_preprocessed = False
+                task.last_command_is_entry_read = False
                 task.command_count += 1
                 _remember(task, "Platform command requested", repair_command)
                 return TaskTurnProposal(execute_cmd=repair_command)
-        if (task.last_command and task.pagination_auto_count < 2
-            and _remaining_tool_cycles(task, remaining) >= 1
-            and (remaining is None or remaining >= 4)):
+        if (task.last_command and task.pagination_auto_count < 4
+            and not _final_answer_required(task)
+            and (remaining is None or remaining >= 2)
+            and (_effective_deadline(task) is not None
+                 or task.command_count < MAX_UNKNOWN_TASK_COMMANDS)):
             gap = _pagination_gap(result, task)
             if gap is not None:
                 total, offset, limit, count = gap
@@ -818,6 +940,8 @@ def _continue_active_task(
                     task.pagination_checked = True
                     task.pagination_auto_count += 1
                     task.last_command = next_command
+                    task.last_command_preprocessed = False
+                    task.last_command_is_entry_read = False
                     task.command_count += 1
                     _remember(task, "Platform command requested", next_command)
                     return TaskTurnProposal(execute_cmd=next_command)
@@ -874,6 +998,7 @@ def _continue_active_task(
             command = build_task_input_command(*target)
             _remember(task, "Automatic bounded task input read", command)
             task.last_command = command
+            task.last_command_is_entry_read = True
             task.command_count += 1
             return TaskTurnProposal(execute_cmd=command)
     urgency = ""
@@ -891,6 +1016,7 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
     context_text = _bounded(context, MAX_TOOL_CONTEXT_CHARS)
     history_text = _solver_history_text(task)
     evidence_text = _solver_evidence_text(task)
+    pagination_text = _pagination_evidence_text(task)
     failed_observations_text = _failed_observations_text(task)
     environment_text = _environment_path_text(task, task_text)
     remaining = _remaining_rounds(turn, task)
@@ -987,6 +1113,7 @@ def _solver_prompt(turn: Turn, task: TaskMemory, context: str) -> str:
         + f"{context_text}\n{task.sop_hint}Observed environment path clues from successful "
         "sandbox output; re-check for this task:\n"
         f"{environment_text}\nCritical tool evidence:\n{evidence_text}\n"
+        f"Bounded pagination page evidence:\n{pagination_text}\n"
         "Recent failed or incomplete command observations (not verified facts):\n"
         f"{failed_observations_text}\n"
         f"Solver history:\n{history_text}\nTask:\n{task_text}"
@@ -1109,6 +1236,73 @@ def _failed_observations_text(task: TaskMemory) -> str:
 def _solver_evidence_text(task: TaskMemory) -> str:
     joined = "\n\n".join(task.solver_evidence)
     return _bounded(joined, MAX_SOLVER_EVIDENCE_CHARS) if joined else "(none)"
+
+
+def _remember_pagination_evidence(task: TaskMemory, result: str) -> None:
+    if not result.startswith("[exitCode:0]\n") or "[TRUNCATED]" in result:
+        return
+    try:
+        value = json.loads(result.partition("\n")[2])
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(value, dict) or _explicit_business_error(value):
+        return
+    data = value.get("data")
+    if "pagination" not in value and not (
+        isinstance(data, dict) and "pagination" in data
+    ):
+        return
+    fingerprint = hashlib.sha256(result.encode("utf-8")).hexdigest()[:16]
+    event = f"page[{fingerprint}]:\n{_bounded_middle(result, 1_500)}"
+    if event not in task.pagination_evidence:
+        task.pagination_evidence.append(event)
+    del task.pagination_evidence[:-5]
+
+
+def _pagination_evidence_text(task: TaskMemory) -> str:
+    if not task.pagination_evidence:
+        return "(none)"
+    return _bounded("\n\n".join(task.pagination_evidence), 8_192)
+
+
+def _build_api_docs_read_command(result: str) -> str | None:
+    if (not command_result_complete(result)
+        or result.count("[TASK_INPUT_PATH]") != 1
+        or result.count("[TASK_INPUT_CONTENT]") != 1):
+        return None
+    lines = result.splitlines()
+    try:
+        path_marker = lines.index("[TASK_INPUT_PATH]")
+        content_marker = lines.index("[TASK_INPUT_CONTENT]")
+    except ValueError:
+        return None
+    if path_marker + 1 != content_marker - 1 or path_marker + 1 >= len(lines):
+        return None
+    raw_path = lines[path_marker + 1]
+    content = "\n".join(lines[content_marker + 1:])
+    if not any(keyword in content.casefold() for keyword in (
+        "api", "http://", "https://", "curl", "endpoint", "接口", "端点",
+    )):
+        return None
+    path = PurePosixPath(raw_path)
+    root = PurePosixPath("/tmp/selfEvolutionTask")
+    if (not path.is_absolute() or ".." in path.parts or root not in path.parents
+        or path.name in ("", ".", "..")):
+        return None
+    script = (
+        "import pathlib,sys; root=pathlib.Path(sys.argv[1]).resolve(strict=True); "
+        "task=pathlib.Path(sys.argv[2]).resolve(strict=True); "
+        "assert root==task.parent or root in task.parents; "
+        "docs=(task.parent/'API_DOCS.md').resolve(strict=True); "
+        "assert docs.parent==task.parent and docs.is_file(); "
+        "data=docs.open(encoding='utf-8').read(32769); "
+        "print('[API_DOCS_PATH]'); print(docs); print('[API_DOCS_CONTENT]'); "
+        "print(data[:32768],end=''); "
+        "print('\\n[TRUNCATED]' if len(data)>32768 else '',end='')"
+    )
+    return shlex.join([
+        "python3", "-c", script, str(root), str(path),
+    ])
 
 
 def _remember_environment_paths(
