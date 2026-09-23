@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import agent.economy as economy
+import agent.tasks as task_module
 from agent.actions import ActionAllocator, ActionProposal
 from agent.brain import DecisionEngine
 from agent.protocol import Pos, Turn
@@ -1123,6 +1124,7 @@ class TaskTests(unittest.TestCase):
         for command, script in (
             ("./check.sh", "./check.sh"),
             ("cd '/tmp/work space' && './my check.sh'", "./my check.sh"),
+            ("./late.sh", "./late.sh"),
         ):
             with self.subTest(command=command):
                 engine = DecisionEngine()
@@ -1130,7 +1132,7 @@ class TaskTests(unittest.TestCase):
                                       phase_task="repair current script")
                 engine.decide(active)
                 task = engine.state.state.active_task
-                task.timeout_round = 8
+                task.timeout_round = 4 if command == "./late.sh" else 8
                 task.pending_llm_round = None
                 task.pending_cmd_round = 1
                 task.last_command = command
@@ -1142,7 +1144,7 @@ class TaskTests(unittest.TestCase):
                 response = engine.decide(received)
                 self.assertEqual(response["prompt"], "")
                 self.assertIn("python3 -c", response["executeCmd"])
-                self.assertIn("check.sh", response["executeCmd"])
+                self.assertIn(script.removeprefix("./"), response["executeCmd"])
                 self.assertTrue(response["executeCmd"].endswith(
                     " && " + ("'./my check.sh'" if "my check" in command else script)
                 ))
@@ -1156,7 +1158,7 @@ class TaskTests(unittest.TestCase):
         for command, result, timeout in (
             ("./check.sh", "[exitCode:126]\n./other.sh: /bin/sh^M: bad interpreter", 8),
             ("./check.sh | cat", "[exitCode:126]\n./check.sh: /bin/sh^M: bad interpreter", 8),
-            ("./check.sh", "[exitCode:126]\n./check.sh: /bin/sh^M: bad interpreter", 4),
+            ("./check.sh", "[exitCode:126]\n./check.sh: /bin/sh^M: bad interpreter", 3),
         ):
             with self.subTest(command=command, timeout=timeout):
                 engine = DecisionEngine()
@@ -1265,7 +1267,11 @@ class TaskTests(unittest.TestCase):
             request = copy.deepcopy(active)
             request["roundNo"] = round_no
             request["llmResp"] = json.dumps({"kind": "command", "content": command})
-            self.assertEqual(engine.decide(request)["executeCmd"], command)
+            executed = engine.decide(request)["executeCmd"]
+            if "./check" in command:
+                self.assertTrue(executed.endswith("./check"))
+            else:
+                self.assertEqual(executed, command)
             round_no += 1
             received = copy.deepcopy(active)
             received["roundNo"] = round_no
@@ -1832,7 +1838,7 @@ class TaskTests(unittest.TestCase):
         first["llmResp"] = json.dumps({
             "kind": "command", "content": "./check.sh",
         })
-        self.assertEqual(engine.decide(first)["executeCmd"], "./check.sh")
+        self.assertTrue(engine.decide(first)["executeCmd"].endswith("./check.sh"))
         failed = copy.deepcopy(active)
         failed["roundNo"] = 3
         failed["lastCmdResult"] = (
@@ -4081,6 +4087,167 @@ class TaskTests(unittest.TestCase):
         task = engine.state.state.active_task
         self.assertIsNone(task.accepted_round)
         self.assertIsNone(task.timeout_round)
+
+    def test_preprocesses_local_workspace_command_without_changing_cd_flow(self):
+        for command, prefix in (
+            ("./check", "find . -maxdepth 2"),
+            ("cd '/tmp/work space' && ./check", "cd '/tmp/work space' && { find . -maxdepth 2"),
+            ("cd '/tmp/work space'; ./check", "cd '/tmp/work space'; "),
+        ):
+            with self.subTest(command=command):
+                processed = task_module._preprocess_execute_command(command)
+                self.assertIn(prefix, processed)
+                self.assertTrue(processed.endswith("./check"))
+        unsafe = "cd /tmp/missing; ./check"
+        processed = task_module._preprocess_execute_command(unsafe)
+        self.assertIn("if [ $? -eq 0 ]", processed)
+        self.assertNotIn("cd /tmp/missing; find", processed)
+        self.assertEqual(task_module._preprocess_execute_command("curl https://example.test"),
+                         "curl https://example.test")
+
+    def test_preprocess_preserves_shell_tail_expansion_and_ignores_path_arguments(self):
+        chained = "cd /tmp/ws && printf ready && ./check \"$MODE\""
+        processed = task_module._preprocess_execute_command(chained)
+        self.assertIn("cd /tmp/ws && { find . -maxdepth 2", processed)
+        self.assertIn("-type f -exec", processed)
+        self.assertNotIn("-name", processed)
+        self.assertTrue(processed.endswith('printf ready && ./check "$MODE"'))
+        self.assertEqual(task_module._preprocess_execute_command(
+            'cat ./config.json'), 'cat ./config.json')
+        self.assertEqual(task_module._preprocess_execute_command(
+            'cat > ./config'), 'cat > ./config')
+        self.assertEqual(task_module._preprocess_execute_command(
+            "cd /tmp/ws extra && ./check"), "cd /tmp/ws extra && ./check")
+
+    def test_engine_tracks_the_preprocessed_command_as_executed(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3), phase_task="run check")
+        engine.decide(active)
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = json.dumps({"kind": "command", "content": "./check"})
+        response = engine.decide(command)
+        self.assertIn("find . -maxdepth 2", response["executeCmd"])
+        self.assertEqual(engine.state.state.active_task.last_command,
+                         response["executeCmd"])
+
+    def test_api_docs_read_command_is_same_directory_and_domain_bounded(self):
+        valid = (
+            "[exitCode:0]\n[TASK_INPUT_PATH]\n"
+            "/tmp/selfEvolutionTask/job one/task.txt\n"
+            "[TASK_INPUT_CONTENT]\nCall the API endpoint"
+        )
+        command = task_module._build_api_docs_read_command(valid)
+        self.assertIn("API_DOCS.md", command)
+        self.assertIn("job one", command)
+        self.assertIn("read(32769)", command)
+        for path in (
+            "/tmp/selfEvolutionTask-evil/job/task.txt",
+            "/tmp/selfEvolutionTask/../escape/task.txt",
+            "/tmp/selfEvolutionTask/job/../../escape.txt",
+        ):
+            with self.subTest(path=path):
+                result = valid.replace(
+                    "/tmp/selfEvolutionTask/job one/task.txt", path,
+                )
+                self.assertIsNone(task_module._build_api_docs_read_command(result))
+        for prefix, suffix in (("[exitCode:1]\n", ""),
+                               ("[exitCode:0]\n", "\n[TRUNCATED]")):
+            self.assertIsNone(task_module._build_api_docs_read_command(prefix + valid.partition("\n")[2] + suffix))
+        self.assertIsNone(task_module._build_api_docs_read_command(
+            valid + "\n[TASK_INPUT_PATH]\n/tmp/selfEvolutionTask/job/other.txt"
+        ))
+
+    def test_api_docs_attempt_only_consumes_real_entry_result(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3),
+                              phase_task="read task_input.txt")
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.timeout_round = 10
+        task.last_command_is_entry_read = False
+        unrelated = copy.deepcopy(active)
+        unrelated["roundNo"] = 2
+        unrelated["lastCmdResult"] = "[exitCode:0]\nunrelated"
+        first = engine.decide(unrelated)
+        self.assertFalse(task.api_docs_read_attempted)
+        task.pending_llm_round = None
+        task.pending_cmd_round = 2
+        task.last_command_is_entry_read = True
+        entry = copy.deepcopy(active)
+        entry["roundNo"] = 3
+        entry["lastCmdResult"] = (
+            "[exitCode:0]\n[TASK_INPUT_PATH]\n"
+            "/tmp/selfEvolutionTask/job/task_input.txt\n"
+            "[TASK_INPUT_CONTENT]\nUse the API endpoint"
+        )
+        task.timeout_round = 6
+        second = engine.decide(entry)
+        self.assertTrue(task.api_docs_read_attempted)
+        self.assertIn("API_DOCS.md", second["executeCmd"])
+
+    def test_auto_pagination_runs_with_two_rounds_and_stops_after_four(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3), phase_task="paged API")
+        engine.decide(active)
+        task = engine.state.state.active_task
+        task.pending_llm_round = None
+        body = lambda offset: "[exitCode:0]\n" + json.dumps({
+            "data": {"records": [{"id": offset}],
+                     "pagination": {"total_count": 6, "offset": offset, "limit": 1}},
+        })
+        for offset in range(4):
+            task.pending_cmd_round = offset + 1
+            task.last_command = f"curl 'https://example.test/data?offset={offset}&limit=1'"
+            task.timeout_round = 4 + offset
+            received = copy.deepcopy(active)
+            received["roundNo"] = 2 + offset
+            received["lastCmdResult"] = body(offset)
+            self.assertIn(f"offset={offset + 1}", engine.decide(received)["executeCmd"])
+        task.pending_cmd_round = 5
+        task.last_command = "curl 'https://example.test/data?offset=4&limit=1'"
+        task.timeout_round = 8
+        received["roundNo"] = 6
+        received["lastCmdResult"] = body(4)
+        self.assertEqual(engine.decide(received)["executeCmd"], "")
+
+    def test_five_page_engine_chain_preserves_pages_and_submits_at_deadline(self):
+        engine = DecisionEngine()
+        active = task_payload(round_no=1, pioneer_pos=(3, 3), phase_task="paged API")
+        engine.decide(active)
+        engine.state.state.active_task.timeout_round = 8
+        command = copy.deepcopy(active)
+        command["roundNo"] = 2
+        command["llmResp"] = json.dumps({
+            "kind": "command",
+            "content": "curl 'https://example.test/data?offset=0&limit=1'",
+        })
+        self.assertIn("offset=0", engine.decide(command)["executeCmd"])
+        final_prompt = None
+        for offset in range(5):
+            page = copy.deepcopy(active)
+            page["roundNo"] = 3 + offset
+            page["lastCmdResult"] = "[exitCode:0]\n" + json.dumps({
+                "data": {"records": [{"marker": f"PAGE_{offset}"}],
+                         "pagination": {"total_count": 5, "offset": offset,
+                                        "limit": 1}},
+            })
+            response = engine.decide(page)
+            if offset < 4:
+                self.assertIn(f"offset={offset + 1}", response["executeCmd"])
+            else:
+                final_prompt = response["prompt"]
+                self.assertEqual(response["executeCmd"], "")
+        for offset in range(5):
+            self.assertIn(f"PAGE_{offset}", final_prompt)
+        answer = copy.deepcopy(active)
+        answer["roundNo"] = 8
+        answer["llmResp"] = json.dumps({
+            "kind": "answer", "content": "combined", "complete": True,
+        })
+        self.assertEqual(engine.decide(answer)["roleCommandMap"]["10011"], {
+            "action": "submitAnswer", "taskAnswer": "combined",
+        })
 
 
 if __name__ == "__main__":
