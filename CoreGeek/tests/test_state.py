@@ -27,6 +27,70 @@ def load_state_module(test_case):
 
 
 class StateTests(unittest.TestCase):
+    def test_wall_damage_history_requires_contiguous_same_wall_observations(self):
+        state_module = load_state_module(self)
+        store = state_module.StateStore()
+        payload = load_fixture()
+        payload["roundNo"] = 10
+        wall = {
+            "id": 10100,
+            "pos": {"x": 5, "y": 5},
+            "roleType": "wall",
+            "health": 1000,
+            "attackPower": 0,
+            "attackRange": 0,
+            "backPackCapability": 0,
+            "backpack": [],
+            "level": 1,
+            "cooldown": 0,
+        }
+        payload["teamOur"]["roles"].append(wall)
+        store.observe(
+            Turn.load(payload), payload, state_module.request_fingerprint(payload),
+        )
+
+        damaged = copy.deepcopy(payload)
+        damaged["roundNo"] = 11
+        damaged["teamOur"]["roles"][-1]["health"] = 800
+        store.observe(
+            Turn.load(damaged), damaged,
+            state_module.request_fingerprint(damaged),
+        )
+        self.assertEqual(
+            store.state.wall_recent_damage[Pos(5, 5)], ((11, 200),),
+        )
+
+        missing = copy.deepcopy(damaged)
+        missing["roundNo"] = 12
+        missing["teamOur"]["roles"] = missing["teamOur"]["roles"][:-1]
+        store.observe(
+            Turn.load(missing), missing,
+            state_module.request_fingerprint(missing),
+        )
+
+        returned = copy.deepcopy(damaged)
+        returned["roundNo"] = 13
+        returned["teamOur"]["roles"][-1]["health"] = 700
+        store.observe(
+            Turn.load(returned), returned,
+            state_module.request_fingerprint(returned),
+        )
+        self.assertEqual(
+            store.state.wall_recent_damage[Pos(5, 5)], ((11, 200),),
+        )
+
+        rebuilt = copy.deepcopy(returned)
+        rebuilt["roundNo"] = 14
+        rebuilt["teamOur"]["roles"][-1]["id"] = 10101
+        rebuilt["teamOur"]["roles"][-1]["health"] = 600
+        store.observe(
+            Turn.load(rebuilt), rebuilt,
+            state_module.request_fingerprint(rebuilt),
+        )
+        self.assertEqual(
+            store.state.wall_recent_damage[Pos(5, 5)], ((11, 200),),
+        )
+
     def test_same_news_is_recorded_again_for_a_new_session(self):
         # Break caught: retained old-session history suppresses current evidence.
         state_module = load_state_module(self)

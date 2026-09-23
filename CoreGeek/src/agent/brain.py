@@ -43,7 +43,7 @@ from .pressure_shadow import (
     historical_investment_assessment, observe_shadow, shadow_diagnostic,
 )
 from .state import BaseReserve, MAX_HISTORY_FACTS, StateStore, request_fingerprint
-from .tasks import TaskTurnProposal, propose_tasks
+from .tasks import TaskTurnProposal, propose_tasks, task_opportunity_status
 from .treasure import MAX_TREASURE_CANDIDATES, evaluate_treasure_candidates
 
 _NEIGHBOUR_STEPS = (
@@ -138,6 +138,33 @@ class DecisionEngine:
                 * ECONOMY_BUDGET_FRACTION
                 * FORTIFICATION_BUDGET_FRACTION,
             )
+            idle_pioneer_purchase = False
+            if (
+                turn.is_day
+                and not turn.phase_task
+                and state.active_task is None
+                and turn.pioneers()
+            ):
+                idle_pioneer_purchase = task_opportunity_status(
+                    turn,
+                    turn.pioneers()[0],
+                    clock=self.clock,
+                    deadline=economy_deadline,
+                    max_expansions=self.max_search_expansions,
+                    start_guard=lambda task, stand, arrival: (
+                        task_start_skip_reason(
+                            turn,
+                            state,
+                            turn.pioneers()[0],
+                            task,
+                            stand,
+                            arrival,
+                            clock=self.clock,
+                            deadline=economy_deadline,
+                            max_expansions=self.max_search_expansions,
+                        )
+                    ),
+                ) == "none"
             unavailable_for_defense = self._task_reserved_roles(
                 turn, state,
             )
@@ -177,6 +204,7 @@ class DecisionEngine:
                 fortification_builder_id=fortification_builder_id,
                 reserved_role_ids=task_role_ids,
                 night_cleared=night_cleared,
+                allow_idle_pioneer_purchase=idle_pioneer_purchase,
                 diagnostic_sink=economy_diagnostics.append,
             )
             economy_candidates = reserve_purchase_candidate(
@@ -235,6 +263,18 @@ class DecisionEngine:
                     assigned_route = assignment_by_role.get(
                         candidate.proposal.actor_id,
                     )
+                    pioneer_investment = (
+                        actor is not None
+                        and actor.kind == "pioneer"
+                        and idle_pioneer_purchase
+                        and isinstance(candidate.diagnostic, dict)
+                        and candidate.diagnostic.get("kind") in (
+                            "pioneerInvestment", "heldInvestment",
+                        )
+                    )
+                    if pioneer_investment:
+                        safe_day_work.append(candidate)
+                        continue
                     if (
                         actor is None
                         or actor.kind != "worker"

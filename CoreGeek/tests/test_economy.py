@@ -317,6 +317,28 @@ class EconomyTests(unittest.TestCase):
             candidates.index("WallUpgradeVoucher1"),
         )
 
+    def test_preferred_wall_upgrade_candidate_is_not_duplicated(self):
+        payload = economy_payload()
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=1000),
+        )
+        payload["weaponShopList"].append(
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        )
+        turn = Turn.load(payload)
+        context = economy.RouteSearchContext(
+            {}, preferred_wall_targets={"WallUpgradeVoucher1": 10050},
+        )
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            candidates = economy._purchase_candidates(
+                turn, turn.workers()[0],
+            )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+
+        self.assertEqual(candidates.count("WallUpgradeVoucher1"), 1)
+
     def test_wall_upgrade_purchase_waits_for_towers_and_blueprint_walls(self):
         payload = economy_payload(gold=20)
         payload["teamOur"]["roles"].append(
@@ -333,6 +355,387 @@ class EconomyTests(unittest.TestCase):
             command.get("name") == "WallUpgradeVoucher1"
             for command in response["roleCommandMap"].values()
         ))
+
+    def test_wall_upgrade_beats_repair_by_same_wall_value_per_gold(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=20)
+        payload["teamOur"]["teamId"] = "wall-upgrade-value"
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=700),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy", "name": "WallUpgradeVoucher1", "num": 1,
+        })
+
+    def test_wall_repair_beats_upgrade_by_same_wall_value_per_gold(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=20)
+        payload["teamOur"]["teamId"] = "wall-repair-value"
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=100),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+
+    def test_missing_blueprint_wall_does_not_block_other_wall_upgrade(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=20)
+        payload["teamOur"]["teamId"] = "wall-upgrade-incomplete-line"
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=700),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy", "name": "WallUpgradeVoucher1", "num": 1,
+        })
+
+    def test_existing_upgrade_funding_protects_cash_from_other_wall_repair(self):
+        payload = economy_payload(worker_pos=(6, 1), gold=10)
+        payload["teamOur"]["teamId"] = "wall-upgrade-protected-cash"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 4, 1, items=("copper",)),
+        )
+        payload["teamOur"]["roles"].extend((
+            role(10050, "wall", 5, 3, health=700),
+            role(10051, "wall", 7, 3, health=100),
+        ))
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+        engine = DecisionEngine()
+        engine.state.state = state_for(payload)
+        engine.state.set_plan(
+            10012, Pos(4, 2),
+            "fund:WallUpgradeVoucher1:10020:10050", 70,
+        )
+
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertNotEqual(commands["10010"].get("action"), "buy")
+        self.assertEqual(commands["10012"], {
+            "action": "sell", "name": "copper", "num": 1,
+        })
+
+    def test_imminent_wall_breach_interrupts_upgrade_cash_protection(self):
+        payload = economy_payload(worker_pos=(6, 1), gold=10)
+        payload["teamOur"]["teamId"] = "wall-breach-interrupts-reserve"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 4, 1, items=("copper",)),
+        )
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 7, 3, health=20),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 7, "y": 2},
+            "roleType": "largeRobot",
+            "health": 500,
+            "attackPower": 20,
+            "abnormalState": "",
+            "targetTeam": payload["teamOur"]["type"],
+        }]
+        engine = DecisionEngine()
+        engine.state.state = state_for(payload)
+        engine.state.set_plan(
+            10012, Pos(4, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020", 70,
+        )
+
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10010"], {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+
+    def test_imminent_wall_target_beats_recently_damaged_wall(self):
+        payload = economy_payload(round_no=9, worker_pos=(5, 2), gold=0)
+        payload["teamOur"]["teamId"] = "urgent-before-damage-history"
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 6, "y": 2}, "neutralType": "weaponShop",
+        }]
+        payload["teamOur"]["roles"].extend((
+            role(10050, "wall", 5, 3, health=1000),
+            role(10060, "wall", 4, 3, health=100),
+        ))
+        payload["weaponShopList"] = [
+            {"name": "WallUpgradeVoucher1", "price": 20},
+            {"name": "WallFixer", "price": 10},
+        ]
+        engine = DecisionEngine()
+        engine.decide(payload)
+
+        payload["roundNo"] = 10
+        payload["teamOur"]["goldNum"] = 10
+        payload["teamOur"]["roles"][-2]["health"] = 300
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 3, "y": 3},
+            "roleType": "largeRobot",
+            "health": 500,
+            "attackPower": 100,
+            "abnormalState": "",
+            "targetTeam": payload["teamOur"]["type"],
+        }]
+        engine.decide(payload)
+
+        payload["roundNo"] = 11
+        payload["teamOur"]["goldNum"] = 0
+        payload["teamOur"]["roles"][0]["backpack"] = ["WallFixer"]
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command, {
+            "action": "use", "name": "WallFixer",
+            "targetPos": [{"x": 4, "y": 3}],
+        })
+
+    def test_emergency_self_care_interrupts_upgrade_cash_protection(self):
+        payload = economy_payload(worker_pos=(6, 1), gold=10)
+        payload["teamOur"]["teamId"] = "self-care-interrupts-reserve"
+        payload["teamOur"]["roles"][0]["health"] = 40
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 4, 1, items=("copper",)),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 100}]
+        payload["weaponShopList"] = [
+            {"name": "Medicine", "price": 10},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+        engine.state.state = state_for(payload)
+        engine.state.set_plan(
+            10012, Pos(4, 2),
+            "fund:WeaponUpgradeVoucher1:10020:10020", 70,
+        )
+
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10010"], {
+            "action": "buy", "name": "Medicine", "num": 1,
+        })
+
+    def test_recently_damaged_wall_is_bound_ahead_of_lower_id_wall(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=20)
+        payload["teamOur"]["teamId"] = "wall-recent-damage-priority"
+        payload["teamOur"]["roles"].extend((
+            role(10050, "wall", 5, 3, health=700),
+            role(10051, "wall", 7, 3, health=700),
+        ))
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+        engine = DecisionEngine()
+        engine.state.state = state_for(payload)
+        engine.state.state.wall_recent_damage[Pos(7, 3)] = ((1, 200),)
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["name"],
+                         "WallUpgradeVoucher1")
+        self.assertEqual(
+            economy._plan_use_target_id(engine.state.state.plans[10010]),
+            10051,
+        )
+
+    def test_joint_funding_uses_same_wall_value_choice(self):
+        payload = economy_payload(
+            worker_pos=(4, 1), items=("copper",), gold=0,
+        )
+        payload["teamOur"]["teamId"] = "wall-upgrade-joint-value"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 4, 3, items=("copper",)),
+        )
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=700),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 20},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+        engine = DecisionEngine()
+
+        engine.decide(payload)
+
+        self.assertTrue(all(
+            plan.reason.startswith("fund:WallUpgradeVoucher1:")
+            for plan in engine.state.state.plans.values()
+        ))
+
+    def test_same_kind_weapon_upgrade_prefers_new_visible_coverage(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=100)
+        payload["teamOur"]["teamId"] = "weapon-upgrade-visible-coverage"
+        payload["teamOur"]["roles"].append(
+            role(10021, "gatling", 2, 7, health=1000),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        payload["robot"]["roles"] = [{
+            "id": 30001,
+            "pos": {"x": 2, "y": 11},
+            "roleType": "largeRobot",
+            "health": 500,
+            "attackPower": 20,
+            "abnormalState": "",
+            "targetTeam": payload["teamOur"]["type"],
+        }]
+        engine = DecisionEngine()
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["name"],
+                         "WeaponUpgradeVoucher1")
+        self.assertEqual(
+            economy._plan_use_target_id(engine.state.state.plans[10010]),
+            10021,
+        )
+
+    def test_full_health_wall_upgrade_does_not_preempt_weapon_upgrade(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=100)
+        payload["teamOur"]["teamId"] = "weapon-before-full-wall"
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 5, 3, health=1000),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+
+        response = DecisionEngine().decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["name"],
+                         "WeaponUpgradeVoucher1")
+
+    def test_new_weapon_funding_protects_cash_from_later_wall_repair(self):
+        payload = economy_payload(
+            worker_pos=(4, 1), items=("copper",), gold=0,
+        )
+        payload["teamOur"]["teamId"] = "new-weapon-funding-protection"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 6, 1),
+        )
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 7, 3, health=100),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 100}]
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)["roleCommandMap"]
+        self.assertEqual(first["10010"], {
+            "action": "sell", "name": "copper", "num": 1,
+        })
+        self.assertTrue(
+            engine.state.state.plans[10010].reason.startswith(
+                "fund:WeaponUpgradeVoucher1:"
+            )
+        )
+
+        payload["roundNo"] = 2
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        payload["teamOur"]["roles"][0]["backpack"] = []
+        payload["teamOur"]["goldNum"] = 100
+        bought = False
+        for _ in range(6):
+            commands = engine.decide(payload)["roleCommandMap"]
+            self.assertNotEqual(
+                commands.get("10012", {}).get("name"), "WallFixer",
+            )
+            worker_command = commands["10010"]
+            if worker_command["action"] == "buy":
+                self.assertEqual(
+                    worker_command["name"], "WeaponUpgradeVoucher1",
+                )
+                bought = True
+                break
+            self.assertEqual(worker_command["action"], "move")
+            payload["teamOur"]["roles"][0]["pos"] = copy.deepcopy(
+                worker_command["targetPos"][0]
+            )
+            payload["roundNo"] += 1
+            payload["lastRoundRoleActionResults"] = {"10010": True}
+        self.assertTrue(bought)
+
+        payload["teamOur"]["roles"][0]["backpack"] = [
+            "WeaponUpgradeVoucher1"
+        ]
+        payload["teamOur"]["goldNum"] = 0
+        payload["roundNo"] += 1
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        used = False
+        for _ in range(12):
+            commands = engine.decide(payload)["roleCommandMap"]
+            worker_command = commands["10010"]
+            if worker_command["action"] == "use":
+                self.assertEqual(
+                    worker_command["name"], "WeaponUpgradeVoucher1",
+                )
+                used = True
+                break
+            self.assertEqual(worker_command["action"], "move")
+            payload["teamOur"]["roles"][0]["pos"] = copy.deepcopy(
+                worker_command["targetPos"][0]
+            )
+            payload["roundNo"] += 1
+            payload["lastRoundRoleActionResults"] = {"10010": True}
+        self.assertTrue(used)
+
+    def test_held_upgrade_voucher_does_not_keep_cash_reserved(self):
+        payload = economy_payload(worker_pos=(6, 1), gold=10)
+        payload["teamOur"]["teamId"] = "held-voucher-releases-cash"
+        payload["teamOur"]["roles"].insert(
+            1, role(10012, "worker", 7, 8,
+                    items=("WeaponUpgradeVoucher1",)),
+        )
+        payload["teamOur"]["roles"].append(
+            role(10050, "wall", 7, 3, health=100),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine()
+        engine.state.state = state_for(payload)
+        engine.state.set_plan(
+            10012, Pos(8, 8),
+            "fund:WeaponUpgradeVoucher1:10030:10030", 70,
+        )
+
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10010"], {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
 
     def test_wall_upgrade_level_two_moves_buys_uses_then_stops_at_level_three(self):
         payload = economy_payload(worker_pos=(5, 2), gold=30)
