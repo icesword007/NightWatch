@@ -1,11 +1,12 @@
 import copy
+import itertools
 import json
 import unittest
 from pathlib import Path
 
 from agent.pressure_shadow import ShadowState, observe_shadow, shadow_diagnostic
 from agent.protocol import Turn
-from agent.server import turn_log_record
+from agent.server import task_log_record, turn_log_record
 from analyze_logs import analyze_lines
 
 
@@ -50,6 +51,200 @@ class OfflineAnalysisTests(unittest.TestCase):
         self.assertEqual(result["groups"][0]["frames"], 1)
         self.assertEqual(result["groups"][0]["economy"]["gold"]["zero"], 1)
         self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(result))
+
+    def test_real_task_and_turn_records_deduplicate_same_submit(self):
+        payload = {
+            "roundNo": 5, "phaseTask": "SENSITIVE_TASK", "errors": [],
+            "lastCmdResult": "[exitCode:0]\nSENSITIVE_RESULT",
+            "teamOur": {"type": "challenger", "teamId": "team-a",
+                        "goldNum": 10, "totalScore": 0, "roles": []},
+            "teamEnemy": {"roles": []},
+        }
+        response = {"roleCommandMap": {"7": {
+            "action": "submitAnswer", "taskAnswer": "SENSITIVE_ANSWER"}}}
+        trace = {"newsEvidence": {"currentSession": 1},
+                 "taskInstanceId": "1:5", "solverState": "waiting_llm",
+                 "solverReason": "llm_pending",
+                 "taskEnvelopeCorrectionRequested": True}
+        turn = turn_log_record(payload, response, {"processing": 1},
+                               decision_trace=trace)
+        task = task_log_record(payload, response, decision_trace=trace)
+        result = self.run_rows(turn, task)
+        summary = result["groups"][0]["tasks"]
+        instance = summary["instances"][0]
+        self.assertEqual(instance["submitAnswerRequests"], 1)
+        self.assertEqual(instance["evidenceSources"], ["task", "turn"])
+        self.assertEqual(instance["solverStates"], ["waiting_llm"])
+        self.assertEqual(instance["solverReasons"], ["llm_pending"])
+        self.assertEqual(instance["commandResultClasses"], ["completed"])
+        self.assertEqual(instance["envelopeCorrectionRequested"], True)
+        self.assertIn("envelopeCorrectionRequested", instance["diagnosticFlags"])
+        self.assertEqual(result["input"]["taskEventRecords"], 1)
+        self.assertEqual(instance["timeline"][0]["roundNo"], 5)
+        self.assertEqual(instance["timeline"][0]["sources"], ["task", "turn"])
+        self.assertEqual(instance["timeline"][0]["submitObservations"], 2)
+        self.assertNotIn("SENSITIVE_", json.dumps(result))
+
+    def test_task_only_record_is_grouped_and_missing_identity_is_not_merged(self):
+        base = {"event": "task", "buildId": "r-test", "roundNo": 8,
+                "team": {"type": "challenger", "id": "team-a"},
+                "sessionIndex": 1, "taskInstanceId": "1:8",
+                "solverState": "waiting", "requestFingerprint": "a" * 64,
+                "input": {"cmdResult": {"class": "completed", "value": "SECRET"},
+                          "errors": [{"code": 2, "description": "SECRET"}]}}
+        unknown = copy.deepcopy(base)
+        unknown["sessionIndex"] = None
+        result = self.run_rows(base, unknown)
+        self.assertEqual(len(result["groups"]), 2)
+        known = next(group for group in result["groups"] if group["session"] == 1)
+        instance = known["tasks"]["instances"][0]
+        self.assertEqual(instance["commandResultClasses"], ["completed"])
+        self.assertEqual(instance["relatedErrorCodes"], [])
+        self.assertIn("error_association_unknown", instance["unknowns"])
+        self.assertEqual(instance["successStatus"], "unknown")
+        self.assertIn("turn_record_missing", instance["unknowns"])
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_production_ended_errors_attach_to_ended_instance(self):
+        payload = {"roundNo": 9, "phaseTask": "NEW_SECRET",
+            "errors": [{"errorCode": 2, "description": "SECRET_ERROR"}],
+            "teamOur": {"type": "challenger", "teamId": "team-a",
+                        "goldNum": 0, "totalScore": 0, "roles": []}}
+        trace = {"newsEvidence": {"currentSession": 1},
+                 "taskInstanceId": "1:2", "solverState": "solving",
+                 "taskEnd": {"instanceId": "1:1", "endRound": 9,
+                             "associatedErrorCodes": [2]}}
+        task = task_log_record(payload, {"roleCommandMap": {}},
+                               decision_trace=trace)
+        result = self.run_rows(task)["groups"][0]["tasks"]
+        by_id = {item["instanceId"]: item for item in result["instances"]}
+        self.assertEqual(by_id["1:1"]["relatedErrorCodes"], [2])
+        self.assertEqual(by_id["1:2"]["relatedErrorCodes"], [])
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_cross_source_submit_without_shared_fingerprint_is_unknown(self):
+        turn = row(4, decision={"taskInstanceId": "1:4"})
+        turn["commands"] = {"items": [{"action": "submitAnswer"}],
+                            "truncated": False}
+        task = {"event": "task", "buildId": "r-test", "roundNo": 4,
+                "team": turn["team"], "sessionIndex": 1,
+                "taskInstanceId": "1:4", "solverState": "submit_pending",
+                "output": {"taskActions": [{"action": "submitAnswer"}]}}
+        instance = self.run_rows(turn, task)["groups"][0]["tasks"]["instances"][0]
+        self.assertIsNone(instance["submitAnswerRequests"])
+        self.assertEqual(instance["submitAnswerRequestBounds"], {"min": 1, "max": 2})
+        self.assertIn("submit_association_unknown", instance["unknowns"])
+
+    def test_malformed_task_metadata_is_redacted_and_does_not_crash(self):
+        task = {"event": "task", "buildId": "r-test", "roundNo": 4,
+                "team": {"type": "challenger", "id": "team-a"},
+                "sessionIndex": 1, "taskInstanceId": "1:4",
+                "requestFingerprint": "b" * 64,
+                "solverState": {"secret": "SENSITIVE_SENTINEL"},
+                "solverReason": ["SENSITIVE_SENTINEL"],
+                "endedTaskInfo": {"instanceId": "1:3", "endRound": 4,
+                    "endReason": {}, "solverStoppedReason": [],
+                    "associatedErrorCodes": {}},
+                "input": {"cmdResult": {"class": []},
+                          "errors": [{"code": {"secret": "SENSITIVE_SENTINEL"}}]}}
+        output = self.run_rows(task)
+        self.assertEqual(len(output["groups"]), 1)
+        instances = output["groups"][0]["tasks"]["instances"]
+        unknowns = next(item["unknowns"] for item in instances
+                        if item["instanceId"] == "1:4")
+        self.assertIn("solver_state_invalid", unknowns)
+        self.assertIn("solver_reason_invalid", unknowns)
+        self.assertIn("command_result_class_invalid", unknowns)
+        self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(output))
+
+    def test_task_timeline_is_bounded_and_conflicts_reduce_trust(self):
+        records = [{"event": "task", "buildId": "r-test", "roundNo": index,
+                    "team": {"type": "challenger", "id": "team-a"},
+                    "sessionIndex": 1, "taskInstanceId": "1:4",
+                    "requestFingerprint": f"{index:064x}",
+                    "solverState": "solving"} for index in range(1, 67)]
+        conflict = copy.deepcopy(records[0])
+        conflict["solverState"] = "submit_pending"
+        result = self.run_rows(*records, conflict)["groups"][0]["tasks"]
+        instance = result["instances"][0]
+        self.assertEqual(len(instance["timeline"]), 64)
+        self.assertTrue(instance["timelineTruncated"])
+        self.assertIn("conflicting_task_record", instance["unknowns"])
+        self.assertEqual(result["coverage"]["conflictingDuplicateTaskRecords"], 1)
+
+    def test_submit_bounds_deduplicate_repeated_task_before_cross_source_range(self):
+        turn = row(2, decision={"taskInstanceId": "1:1"})
+        turn["commands"] = {"items": [{"action": "submitAnswer"}],
+                            "truncated": False}
+        task = {"event": "task", "buildId": "r-test", "roundNo": 2,
+                "team": turn["team"], "sessionIndex": 1,
+                "taskInstanceId": "1:1", "requestFingerprint": "a" * 64,
+                "solverState": "submit_pending",
+                "output": {"taskActions": [{"action": "submitAnswer"}]}}
+        instance = self.run_rows(turn, task, copy.deepcopy(task))["groups"][0]
+        instance = instance["tasks"]["instances"][0]
+        self.assertIsNone(instance["submitAnswerRequests"])
+        self.assertEqual(instance["submitAnswerRequestBounds"], {"min": 1, "max": 2})
+        self.assertEqual(instance["observedSubmitRecords"], 3)
+
+    def test_conflicting_same_fingerprint_submit_count_is_not_exact(self):
+        submitted = {"event": "task", "buildId": "r-test", "roundNo": 2,
+            "team": {"type": "challenger", "id": "team-a"},
+            "sessionIndex": 1, "taskInstanceId": "1:1",
+            "requestFingerprint": "a" * 64, "solverState": "submit_pending",
+            "output": {"taskActions": [{"action": "submitAnswer"}]}}
+        absent = copy.deepcopy(submitted)
+        absent["output"]["taskActions"] = []
+        instance = self.run_rows(submitted, absent)["groups"][0]
+        instance = instance["tasks"]["instances"][0]
+        self.assertIsNone(instance["submitAnswerRequests"])
+        self.assertEqual(instance["submitAnswerRequestBounds"], {"min": 0, "max": 1})
+        self.assertIn("conflicting_task_record", instance["unknowns"])
+
+    def test_submit_count_fingerprint_groups_table_and_order_invariance(self):
+        def task(fingerprint, count):
+            value = {"event": "task", "buildId": "r-test", "roundNo": 2,
+                "team": {"type": "challenger", "id": "team-a"},
+                "sessionIndex": 1, "taskInstanceId": "1:1",
+                "solverState": "submit_pending",
+                "output": {"taskActions": [
+                    {"action": "submitAnswer"} for _ in range(count)]}}
+            if fingerprint is not None:
+                value["requestFingerprint"] = fingerprint * 64
+            return value
+
+        def turn(count, fingerprint=None):
+            value = row(2, decision={"taskInstanceId": "1:1"})
+            value["commands"] = {"items": [
+                {"action": "submitAnswer"} for _ in range(count)],
+                "truncated": False}
+            if fingerprint is not None:
+                value["requestFingerprint"] = fingerprint * 64
+            return value
+
+        cases = (
+            ("same_duplicate", [task("a", 1), task("a", 1)],
+             {"min": 1, "max": 1}, 1, (1,)),
+            ("same_conflict", [task("a", 0), task("a", 1)],
+             {"min": 0, "max": 1}, None, (0, 1)),
+            ("different", [task("a", 1), task("b", 1)],
+             {"min": 2, "max": 2}, 2, (2,)),
+            ("cross_source_same", [turn(1, "a"), task("a", 1)],
+             {"min": 1, "max": 1}, 1, (1,)),
+            ("mixed_missing", [task("a", 1), task(None, 1)],
+             {"min": 1, "max": 2}, None, (1, 2)),
+            ("single_missing", [task(None, 1)],
+             {"min": 1, "max": 1}, 1, (1,)),
+        )
+        for name, records, bounds, exact, feasible in cases:
+            for order in itertools.permutations(records):
+                with self.subTest(name=name, order=[r["event"] for r in order]):
+                    instance = self.run_rows(*order)["groups"][0]
+                    instance = instance["tasks"]["instances"][0]
+                    self.assertEqual(instance["submitAnswerRequestBounds"], bounds)
+                    self.assertEqual(instance["submitAnswerRequests"], exact)
+                    self.assertTrue(all(bounds["min"] <= value <= bounds["max"]
+                                        for value in feasible))
 
     def test_tasks_end_event_uses_ended_instance_and_never_infers_success(self):
         first = row(1, decision={"taskInstanceId": "1:1"})
@@ -226,6 +421,84 @@ class OfflineAnalysisTests(unittest.TestCase):
         self.assertEqual(group["tasks"]["instances"][0]["end"]["associatedErrorCodes"], [2])
         self.assertEqual(group["pressure"]["scoresBySide"]["challenger"]
                          ["persistenceBaseline"]["correctNegative"], 1)
+
+    def test_offline_pressure_whitelists_night_start_and_wall_counts(self):
+        record = row(72, decision={"pressureShadow": {
+            "session": 1,
+            "nightSummary": {"night": 1,
+                "observedRange": {"firstRound": 71, "lastRound": 72, "frames": 2},
+                "firstNightRobotDifference": {
+                    "status": "conditional_observation", "rawDifference": -2,
+                    "inferredOpponentAdditions": -2,
+                    "ourAppliedAdditions": 0,
+                    "ourAppliedAdditionsBasis": "program_does_not_summon",
+                    "unknowns": ["timing_unverified"],
+                    "secret": "SENSITIVE_SENTINEL"},
+                "sides": {"challenger": {"criticalWalls": {
+                    "damagedWallFrames": 2, "nearBaseDamagedWallFrames": 1,
+                    "sideDamagedWallFrames": 1,
+                    "damagedWallFramesWithAdjacentRobots": 1,
+                    "adjacentRobotObservations": None,
+                    "adjacentRobotObservationsLowerBound": 3,
+                    "longestConsecutiveDamageRounds": 2,
+                    "coverageComplete": False,
+                    "unknowns": ["robots_missing"]}},
+                    "defender": {"criticalWalls": {}}}}}})
+        result = self.run_rows(record)["groups"][0]["pressure"]["nights"][0]
+        self.assertEqual(result["firstNightRobotDifference"]["rawDifference"], -2)
+        self.assertEqual(result["criticalWalls"]["challenger"]
+                         ["damagedWallFrames"], 2)
+        self.assertIsNone(result["criticalWalls"]["challenger"]
+                          ["adjacentRobotObservations"])
+        self.assertEqual(result["criticalWalls"]["challenger"]
+                         ["adjacentRobotObservationsLowerBound"], 3)
+        self.assertFalse(result["criticalWalls"]["challenger"]
+                         ["coverageComplete"])
+        self.assertIn("robots_missing", result["criticalWalls"]["challenger"]
+                      ["unknowns"])
+        self.assertNotIn("SENSITIVE_SENTINEL", json.dumps(result))
+
+    def test_final_only_production_record_keeps_frozen_night_observation(self):
+        state = ShadowState()
+        for round_no in range(70, 132):
+            value = json.loads(FIXTURE.read_text(encoding="utf-8"))
+            value["roundNo"] = round_no
+            value["teamOur"].update(type="challenger", teamId="team-a")
+            value["teamOur"]["roles"] = [{"id": 10013,
+                "roleType": "station", "pos": {"x": 2, "y": 2},
+                "health": 100, "level": 1}, {"id": 10014,
+                "roleType": "wall", "pos": {"x": 5, "y": 5},
+                "health": 90 if round_no == 131 else 100, "level": 1}]
+            value["teamEnemy"]["roles"] = [{"id": 20013,
+                "roleType": "station", "pos": {"x": 18, "y": 18},
+                "health": 100, "level": 1}]
+            value["robot"] = {"roles": ([
+                {"id": 1, "roleType": "smallRobot", "pos": {"x": 3, "y": 3},
+                 "health": 50, "targetTeam": "challenger"},
+            ] if round_no == 71 else [{"id": 2, "roleType": "smallRobot",
+                "pos": {"x": 4, "y": 5}, "health": 50,
+                "targetTeam": "challenger"}] if round_no == 130 else [])}
+            observe_shadow(Turn.load(value), state)
+        shadow = shadow_diagnostic(state)
+        self.assertIsNone(shadow["nightSummary"])
+        final_payload = value
+        record = turn_log_record(final_payload, {"roleCommandMap": {}},
+            {"processing": 1}, decision_trace={
+                "newsEvidence": {"currentSession": 1},
+                "pressureShadow": shadow})
+        night = self.run_rows(record)["groups"][0]["pressure"]["nights"][0]
+        self.assertEqual(night["firstNightRobotDifference"]["rawDifference"], 1)
+        self.assertEqual(night["firstNightRobotDifference"]["assumptions"],
+                         ["equal_natural_robot_totals"])
+        self.assertEqual(night["firstNightRobotDifference"]["timingStatus"],
+                         "unknown")
+        self.assertTrue(night["criticalWalls"]["challenger"]["dawnObserved"])
+        self.assertEqual(night["criticalWalls"]["challenger"]
+                         ["damagedWallFrames"], 1)
+        self.assertIsNone(night["criticalWalls"]["challenger"]
+                          ["adjacentRobotObservations"])
+        self.assertEqual(night["criticalWalls"]["challenger"]
+                         ["dawnPriorAdjacentRobotObservations"], 1)
 
     def test_task_and_pressure_keep_unknown_on_legacy_duplicate_and_bad_fields(self):
         legacy = row(1, decision={"taskInstanceId": "1:1"})

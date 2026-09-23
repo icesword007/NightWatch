@@ -38,8 +38,8 @@ def robot(robot_id, target, health=50, *, kind="smallRobot", x=3, y=3):
                 health=health, targetTeam=target)
 
 
-def wall(wall_id, health=100, level=1):
-    return dict(id=wall_id, roleType="wall", pos=dict(x=5, y=5),
+def wall(wall_id, health=100, level=1, *, x=5, y=5):
+    return dict(id=wall_id, roleType="wall", pos=dict(x=x, y=y),
                 health=health, level=level)
 
 
@@ -264,6 +264,52 @@ class PressureShadowTests(unittest.TestCase):
         self.assertEqual(result["current"]["unknownTargetRobots"], 1)
         self.assertEqual(result["current"]["sides"]["challenger"]["robots"]["nearestBaseChebyshev"], 1)
         self.assertIn("unknown_target_robots", result["current"]["unknowns"])
+        self.assertEqual(result["nightSummary"]["firstNightRobotDifference"]
+                         ["status"], "unknown")
+
+    def test_first_night_robot_difference_is_frozen_and_team_relative(self):
+        for team, ours_target, enemy_target in (
+            ("challenger", "challenger", "defender"),
+            ("defender", "defender", "challenger"),
+        ):
+            with self.subTest(team=team):
+                state = ShadowState()
+                first = self.observe(state, 71, team=team, robots=[
+                    robot(1, ours_target), robot(2, ours_target),
+                    robot(3, ours_target), robot(4, enemy_target),
+                ])
+                observed = first["nightSummary"]["firstNightRobotDifference"]
+                self.assertEqual(observed["status"], "conditional_observation")
+                self.assertEqual(observed["rawDifference"], 2)
+                self.assertEqual(observed["inferredOpponentAdditions"], 2)
+                self.assertEqual(observed["ourAppliedAdditions"], 0)
+                self.assertIn("timing_unverified", observed["unknowns"])
+                later = self.observe(state, 72, team=team, robots=[])
+                self.assertEqual(later["nightSummary"]["firstNightRobotDifference"], observed)
+
+    def test_first_night_robot_difference_missing_or_late_stays_unknown(self):
+        state = ShadowState()
+        missing = self.observe(state, 71, robots_observed=False)
+        observation = missing["nightSummary"]["firstNightRobotDifference"]
+        self.assertEqual(observation["status"], "unknown")
+        self.assertIsNone(observation["rawDifference"])
+        later = self.observe(state, 72, robots=[robot(1, "challenger")])
+        self.assertEqual(later["nightSummary"]["firstNightRobotDifference"], observation)
+        late = self.observe(ShadowState(), 72, robots=[])
+        self.assertIn("night_started_late",
+                      late["nightSummary"]["firstNightRobotDifference"]["unknowns"])
+
+    def test_negative_first_night_difference_is_inconsistent_not_normal_additions(self):
+        state = ShadowState()
+        result = self.observe(state, 71, robots=[
+            robot(1, "defender"), robot(2, "defender"),
+            robot(3, "challenger"),
+        ])
+        observed = result["nightSummary"]["firstNightRobotDifference"]
+        self.assertEqual(observed["rawDifference"], -1)
+        self.assertEqual(observed["status"], "inconsistent_observation")
+        self.assertIsNone(observed["inferredOpponentAdditions"])
+        self.assertIn("negative_difference", observed["unknowns"])
 
     def test_missing_robots_and_id_limit_mark_incomplete(self):
         state = ShadowState()
@@ -635,6 +681,124 @@ class PressureShadowTests(unittest.TestCase):
             "damaged", "repairedSameLevel", "upgraded", "disappeared", "new",
         )}, dict(damaged=1, repairedSameLevel=1, upgraded=1,
                  disappeared=1, new=1))
+
+    def test_critical_wall_pressure_records_geometry_without_causation(self):
+        state = ShadowState()
+        self.observe(state, 70,
+                     our_walls=[wall(11, 100, x=5, y=5),
+                                wall(12, 100, x=3, y=2)])
+        self.observe(state, 71,
+                     robots=[robot(1, "challenger", x=4, y=5)],
+                     our_walls=[wall(11, 100, x=5, y=5),
+                                wall(12, 100, x=3, y=2)])
+        second = self.observe(state, 72,
+                              robots=[robot(1, "challenger", x=4, y=5),
+                                      robot(2, "challenger", x=3, y=3)],
+                              our_walls=[wall(11, 90, x=5, y=5),
+                                         wall(12, 90, x=3, y=2)])
+        pressure = second["current"]["sides"]["challenger"]["criticalWallPressure"]
+        self.assertEqual(pressure["damagedWalls"], 2)
+        self.assertEqual(pressure["nearBaseDamagedWalls"], 1)
+        self.assertEqual(pressure["sideDamagedWalls"], 1)
+        self.assertEqual(pressure["damagedWallsWithAdjacentRobots"], 2)
+        self.assertEqual(pressure["causalAttribution"], "unknown")
+        third = self.observe(state, 73,
+                             robots=[robot(1, "challenger", x=4, y=5)],
+                             our_walls=[wall(11, 80, x=5, y=5),
+                                        wall(12, 90, x=3, y=2)])
+        summary = third["nightSummary"]["sides"]["challenger"]["criticalWalls"]
+        self.assertEqual(summary["longestConsecutiveDamageRounds"], 2)
+        self.assertEqual(summary["damagedWallFrames"], 3)
+        self.assertEqual(third["current"]["sides"]["challenger"]
+                         ["criticalWallBreach"], "unknown")
+        defender = ShadowState()
+        self.observe(defender, 71, team="defender",
+                     robots=[robot(5, "defender", x=4, y=5)],
+                     our_walls=[wall(21, 100)])
+        mapped = self.observe(defender, 72, team="defender",
+                              robots=[robot(5, "defender", x=4, y=5)],
+                              our_walls=[wall(21, 90)])
+        self.assertEqual(mapped["current"]["sides"]["defender"]
+                         ["criticalWallPressure"]["damagedWalls"], 1)
+
+    def test_adjacent_robot_without_wall_loss_and_gap_do_not_extend_streak(self):
+        state = ShadowState()
+        self.observe(state, 71, robots=[robot(1, "challenger", x=4, y=5)],
+                     our_walls=[wall(11, 100)])
+        unchanged = self.observe(state, 72,
+                                 robots=[robot(1, "challenger", x=4, y=5)],
+                                 our_walls=[wall(11, 100)])
+        pressure = unchanged["current"]["sides"]["challenger"]["criticalWallPressure"]
+        self.assertEqual(pressure["damagedWalls"], 0)
+        self.assertEqual(pressure["adjacentRobotsToDamagedWalls"], 0)
+        gap = self.observe(state, 74,
+                           robots=[robot(1, "challenger", x=4, y=5)],
+                           our_walls=[wall(11, 90)])
+        self.assertFalse(gap["current"]["sides"]["challenger"]
+                         ["criticalWallPressure"]["comparable"])
+        upgraded = self.observe(state, 75,
+                                robots=[robot(1, "challenger", x=4, y=5)],
+                                our_walls=[wall(11, 120, 2)])
+        self.assertEqual(upgraded["current"]["sides"]["challenger"]
+                         ["criticalWallPressure"]["damagedWalls"], 0)
+
+    def test_wall_pressure_marks_missing_base_robot_and_wall_limits(self):
+        state = ShadowState()
+        self.observe(state, 71, our_walls=[wall(11, 100)])
+        missing_base = payload(72, our_walls=[wall(11, 90)],
+                               robots_observed=False)
+        missing_base["teamOur"]["roles"] = [wall(11, 90)]
+        observe_shadow(Turn.load(missing_base), state)
+        current = shadow_diagnostic(state)["current"]["sides"]["challenger"]
+        self.assertIsNone(current["criticalWallPressure"]["nearBaseDamagedWalls"])
+        self.assertIsNone(current["criticalWallPressure"]
+                         ["adjacentRobotsToDamagedWalls"])
+        summary = shadow_diagnostic(state)["nightSummary"]["sides"]
+        self.assertFalse(summary["challenger"]["criticalWalls"]["coverageComplete"])
+        self.assertIn("base_missing", summary["challenger"]
+                      ["criticalWalls"]["unknowns"])
+        self.assertIn("robots_missing", summary["challenger"]
+                      ["criticalWalls"]["unknowns"])
+
+        limited = ShadowState()
+        walls = [wall(1000 + i, 100, x=5 + i % 10, y=5 + i // 10)
+                 for i in range(513)]
+        self.observe(limited, 71, our_walls=walls)
+        result = self.observe(limited, 72, our_walls=walls)
+        pressure = result["current"]["sides"]["challenger"]["criticalWallPressure"]
+        self.assertFalse(pressure["wallObservationComplete"])
+        self.assertIn("wall_id_limit", pressure["unknowns"])
+
+    def test_final_and_recent_night_keep_frozen_first_night_observation(self):
+        state = ShadowState()
+        self.observe(state, 70)
+        for round_no in range(71, 131):
+            robots = ([robot(1, "challenger"), robot(2, "challenger"),
+                       robot(3, "defender")] if round_no == 71 else [])
+            self.observe(state, round_no, robots=robots)
+        final = self.observe(state, 131)
+        expected = final["verification"]["firstNightRobotDifference"]
+        self.assertEqual(expected["rawDifference"], 1)
+        self.assertEqual(final["recentNights"][-1]
+                         ["firstNightRobotDifference"], expected)
+
+    def test_dawn_wall_damage_is_counted_with_prior_robot_context_unknown(self):
+        state = ShadowState()
+        self.observe(state, 70, our_walls=[wall(11, 100)])
+        for round_no in range(71, 131):
+            robots = [robot(1, "challenger", x=4, y=5)] if round_no == 130 else []
+            self.observe(state, round_no, robots=robots,
+                         our_walls=[wall(11, 100)])
+        final = self.observe(state, 131, robots=[],
+                             our_walls=[wall(11, 90)])
+        metrics = final["verification"]["sides"]["challenger"]["metrics"]
+        self.assertEqual(metrics["walls"]["damaged"], 1)
+        critical = metrics["criticalWalls"]
+        self.assertEqual(critical["damagedWallFrames"], 1)
+        self.assertEqual(critical["sideDamagedWallFrames"], 1)
+        self.assertIsNone(critical["adjacentRobotObservations"])
+        self.assertEqual(critical["dawnPriorAdjacentRobotObservations"], 1)
+        self.assertIn("dawn_robot_association_unknown", critical["unknowns"])
 
 
 if __name__ == "__main__":
