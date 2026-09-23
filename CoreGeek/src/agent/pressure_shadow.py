@@ -4,10 +4,10 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any
 
-from .protocol import DAY_ROUNDS, ROUNDS_PER_DAY, Turn, distance, station_footprint
+from .protocol import DAY_ROUNDS, ROUNDS_PER_DAY, Pos, Turn, distance, station_footprint
 
 
-ALGORITHM_VERSION = "shadow_v2"
+ALGORITHM_VERSION = "shadow_v3"
 ID_LIMIT = 512
 SIDES = ("challenger", "defender")
 BASE_MAX_HEALTH = (1500, 3000, 4500)
@@ -24,8 +24,23 @@ def _night_metrics() -> dict[str, Any]:
                    "nearestBaseChebyshev": None},
         "walls": {name: 0 for name in (
             "damaged", "disappeared", "new", "upgraded",
-            "repairedSameLevel",
+            "repairedSameLevel", "positionChanged",
         )},
+        "criticalWalls": {
+            "damagedWallFrames": 0, "nearBaseDamagedWallFrames": 0,
+            "sideDamagedWallFrames": 0,
+            "damagedWallFramesWithAdjacentRobots": 0,
+            "adjacentRobotObservations": 0,
+            "longestConsecutiveDamageRounds": 0,
+            "damagedWallFramesObservedLowerBound": 0,
+            "nearBaseDamagedWallFramesObservedLowerBound": 0,
+            "sideDamagedWallFramesObservedLowerBound": 0,
+            "damagedWallFramesWithAdjacentRobotsObservedLowerBound": 0,
+            "adjacentRobotObservationsLowerBound": 0,
+            "coverageComplete": True, "unknowns": [],
+            "dawnObserved": False, "dawnWallObservationComplete": None,
+            "dawnPriorAdjacentRobotObservations": 0,
+        },
         "completeness": {"base": True, "robots": True, "walls": True,
                          "unknowns": []},
     }
@@ -37,7 +52,7 @@ def _day_context() -> dict[str, Any]:
                  "hpDecrease": 0, "identityChanges": 0},
         "walls": {name: 0 for name in (
             "damaged", "disappeared", "new", "upgraded",
-            "repairedSameLevel",
+            "repairedSameLevel", "positionChanged",
         )},
     }
 
@@ -61,14 +76,20 @@ class NightRecord:
     investment_end_defense: dict[str, Any] | None = None
     investment_unknowns: set[str] = field(default_factory=set)
     investment_defense_changes: set[str] = field(default_factory=set)
+    first_night_robot_difference: dict[str, Any] | None = None
+    wall_damage_streaks: dict[str, dict[int, int]] = field(
+        default_factory=lambda: {side: {} for side in SIDES})
 
 
 @dataclass(slots=True)
 class ShadowState:
     last_round: int | None = None
     previous_bases: dict[str, tuple[int, int, int] | None] = field(default_factory=dict)
-    previous_walls: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
+    previous_walls: dict[str, dict[int, tuple[int, int, int, int]]] = field(
+        default_factory=dict)
+    previous_walls_complete: dict[str, bool] = field(default_factory=dict)
     previous_robots: dict[int, tuple[str, int]] | None = None
+    previous_robot_positions: dict[str, dict[tuple[int, int], int]] | None = None
     pending_prediction: dict[str, Any] | None = None
     active_night: NightRecord | None = None
     recent_nights: list[dict[str, Any]] = field(default_factory=list)
@@ -146,32 +167,38 @@ def _observe_investment_base(
         record.investment_unknowns.add("base_hp_increased")
 
 
-def _wall_map(roles: tuple) -> tuple[dict[int, tuple[int, int]], bool]:
-    walls = (role for role in roles if role.kind == "wall")
+def _wall_map(roles: tuple) -> tuple[dict[int, tuple[int, int, int, int]], bool]:
+    walls = sorted((role for role in roles if role.kind == "wall"),
+                   key=lambda role: role.unit_id)
     result = {}
     truncated = False
     for wall in walls:
         if len(result) < ID_LIMIT:
-            result[wall.unit_id] = (wall.level, wall.health)
+            result[wall.unit_id] = (
+                wall.level, wall.health, wall.pos.x, wall.pos.y,
+            )
         else:
             truncated = True
     return result, truncated
 
 
 def _wall_changes(
-    old: dict[int, tuple[int, int]], new: dict[int, tuple[int, int]],
+    old: dict[int, tuple[int, int, int, int]],
+    new: dict[int, tuple[int, int, int, int]],
 ) -> dict[str, int]:
     shared = old.keys() & new.keys()
+    comparable = {i for i in shared if old[i][2:] == new[i][2:]}
     return {
         "damaged": sum(new[i][1] < old[i][1] and new[i][0] == old[i][0]
-                       for i in shared),
+                       for i in comparable),
         "disappeared": len(old.keys() - new.keys()),
         "new": len(new.keys() - old.keys()),
-        "upgraded": sum(new[i][0] > old[i][0] for i in shared),
+        "upgraded": sum(new[i][0] > old[i][0] for i in comparable),
         "repairedSameLevel": sum(
             new[i][1] > old[i][1] and new[i][0] == old[i][0]
-            for i in shared
+            for i in comparable
         ),
+        "positionChanged": sum(old[i][2:] != new[i][2:] for i in shared),
     }
 
 
@@ -266,6 +293,8 @@ def _verification(
     sides = {}
     for side in SIDES:
         metrics = copy.deepcopy(record.metrics[side])
+        metrics["criticalWalls"]["unknowns"] = sorted(set(
+            metrics["criticalWalls"]["unknowns"]))
         if record.unknowns:
             metrics["completeness"]["base"] = False
         metrics["completeness"]["unknowns"] = sorted(set(
@@ -297,6 +326,8 @@ def _verification(
                           "lastRound": record.last_round,
                           "frames": record.frames},
         "unknowns": sorted(record.unknowns),
+        "firstNightRobotDifference": copy.deepcopy(
+            record.first_night_robot_difference),
         "sides": sides,
         "actualBaseDamage": sides[our_team]["actualBaseDamage"],
         "result": sides[our_team]["result"],
@@ -315,6 +346,10 @@ def _finish_night(
     expected_end = record.night * ROUNDS_PER_DAY
     if boundary_round != expected_end + 1:
         record.unknowns.add("missing_day_boundary")
+        for side in SIDES:
+            critical = record.metrics[side]["criticalWalls"]
+            critical["coverageComplete"] = False
+            critical["unknowns"].append("dawn_missing")
     complete = record.complete and record.frames == ROUNDS_PER_DAY - DAY_ROUNDS
     complete = complete and record.last_round == expected_end and not record.unknowns
     verification = _verification(
@@ -399,13 +434,77 @@ def observe_shadow(
                         max(0, previous[2] - base.health),
                     )
                 current_walls, limited = _wall_map(roles)
+                critical = record.metrics[side]["criticalWalls"]
+                critical["dawnObserved"] = True
+                critical["dawnWallObservationComplete"] = not limited
                 if limited:
                     record.metrics[side]["completeness"]["walls"] = False
+                    critical["coverageComplete"] = False
+                    critical["unknowns"].append("dawn_wall_id_limit")
                 changes = _wall_changes(
                     state.previous_walls.get(side, {}), current_walls,
                 )
                 for name, count in changes.items():
                     record.metrics[side]["walls"][name] += count
+                previous_walls = state.previous_walls.get(side, {})
+                damaged_ids = [wall_id for wall_id in
+                               previous_walls.keys() & current_walls.keys()
+                               if previous_walls[wall_id][0]
+                               == current_walls[wall_id][0]
+                               and previous_walls[wall_id][2:]
+                               == current_walls[wall_id][2:]
+                               and current_walls[wall_id][1]
+                               < previous_walls[wall_id][1]] if consecutive else []
+                if damaged_ids:
+                    wall_complete = (not limited
+                        and state.previous_walls_complete.get(side, False))
+                    critical["damagedWallFramesObservedLowerBound"] += len(
+                        damaged_ids)
+                    if wall_complete and critical["damagedWallFrames"] is not None:
+                        critical["damagedWallFrames"] += len(damaged_ids)
+                    else:
+                        critical["damagedWallFrames"] = None
+                    near_base = 0
+                    if base is not None:
+                        for wall_id in damaged_ids:
+                            _, _, x, y = current_walls[wall_id]
+                            if min(distance(Pos(x, y), cell) for cell in
+                                   station_footprint(base.pos)) <= 1:
+                                near_base += 1
+                        critical["nearBaseDamagedWallFramesObservedLowerBound"] += near_base
+                        critical["sideDamagedWallFramesObservedLowerBound"] += (
+                            len(damaged_ids) - near_base)
+                    if wall_complete and base is not None:
+                        if critical["nearBaseDamagedWallFrames"] is not None:
+                            critical["nearBaseDamagedWallFrames"] += near_base
+                        if critical["sideDamagedWallFrames"] is not None:
+                            critical["sideDamagedWallFrames"] += (
+                                len(damaged_ids) - near_base)
+                    else:
+                        critical["nearBaseDamagedWallFrames"] = None
+                        critical["sideDamagedWallFrames"] = None
+                    prior_positions = state.previous_robot_positions
+                    if prior_positions is None:
+                        critical["dawnPriorAdjacentRobotObservations"] = None
+                    else:
+                        critical["dawnPriorAdjacentRobotObservations"] += sum(
+                            prior_positions[side].get((x + dx, y + dy), 0)
+                            for wall_id in damaged_ids
+                            for _, _, x, y in (current_walls[wall_id],)
+                            for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+                    critical["damagedWallFramesWithAdjacentRobots"] = None
+                    critical["adjacentRobotObservations"] = None
+                    critical["coverageComplete"] = False
+                    critical["unknowns"].append(
+                        "dawn_robot_association_unknown")
+                    next_streaks = {}
+                    for wall_id in damaged_ids:
+                        streak = record.wall_damage_streaks[side].get(
+                            wall_id, 0) + 1
+                        next_streaks[wall_id] = streak
+                        critical["longestConsecutiveDamageRounds"] = max(
+                            critical["longestConsecutiveDamageRounds"], streak)
+                    record.wall_damage_streaks[side] = next_streaks
         _finish_night(
             state, turn.team_type, turn.round_no, collect_investment_history,
         )
@@ -450,6 +549,7 @@ def observe_shadow(
     bases = {"challenger": None, "defender": None}
     base_units = {}
     walls = {}
+    walls_complete = {}
     unknowns = []
     if state.last_round is None and turn.round_no != 1:
         unknowns.append("history_starts_late")
@@ -460,6 +560,7 @@ def observe_shadow(
         base_units[side] = base
         bases[side] = (base.unit_id, base.level, base.health) if base else None
         walls[side], limited = _wall_map(roles)
+        walls_complete[side] = not limited
         if base is None:
             unknowns.append(f"{side}_base_missing")
         if limited:
@@ -471,14 +572,21 @@ def observe_shadow(
                      "disappeared": 0,
                      "nearestBaseChebyshev": None} for side in SIDES}
     robot_hp = {}
+    robot_positions = {side: {} for side in SIDES}
     unknown_target = 0
-    for robot in turn.robots:
-        if len(robot_hp) < ID_LIMIT:
+    for robot_index, robot in enumerate(sorted(
+            turn.robots, key=lambda item: item.robot_id)):
+        if robot_index < ID_LIMIT:
             robot_hp[robot.robot_id] = (robot.target_team, robot.health)
         if robot.target_team not in SIDES:
             unknown_target += 1
             continue
         group = robots[robot.target_team]
+        if robot_index < ID_LIMIT:
+            position_key = (robot.pos.x, robot.pos.y)
+            robot_positions[robot.target_team][position_key] = (
+                robot_positions[robot.target_team].get(position_key, 0) + 1
+            )
         group["count"] += 1
         by_type = group["types"].setdefault(robot.kind, {"count": 0, "totalHp": 0})
         by_type["count"] += 1
@@ -507,6 +615,44 @@ def observe_shadow(
             group.update(count=None, types=None, totalHp=None,
                          observedHpLoss=None, damagedIds=None,
                          disappeared=None)
+    if state.active_night is not None and not turn.is_day \
+            and state.active_night.first_night_robot_difference is None:
+        reasons = []
+        if turn.round_no != first_night_round:
+            reasons.append("night_started_late")
+        if not turn.robot_roles_observed:
+            reasons.append("robots_missing")
+        if "robot_id_limit" in unknowns:
+            reasons.append("robot_id_limit")
+        if unknown_target:
+            reasons.append("unknown_target_robots")
+        enemy = "defender" if turn.team_type == "challenger" else "challenger"
+        complete = not reasons
+        opponent = robots[turn.team_type]["count"] if complete else None
+        ours = robots[enemy]["count"] if complete else None
+        raw_difference = opponent - ours if complete else None
+        inconsistent = raw_difference is not None and raw_difference < 0
+        if inconsistent:
+            reasons.append("negative_difference")
+        state.active_night.first_night_robot_difference = {
+            "status": ("inconsistent_observation" if inconsistent else
+                       "conditional_observation" if complete else "unknown"),
+            "roundNo": turn.round_no,
+            "opponentRobotsTargetingUs": opponent,
+            "ourRobotsTargetingOpponent": ours,
+            "rawDifference": raw_difference,
+            "ourAppliedAdditions": 0,
+            "ourAppliedAdditionsBasis": "program_does_not_summon",
+            "inferredOpponentAdditions": (
+                None if inconsistent else raw_difference),
+            "inferenceScope": "current_program_only",
+            "assumptions": ["equal_natural_robot_totals"],
+            "unknowns": sorted(set(reasons + [
+                "external_or_deployment_additions_unknown",
+                "timing_unverified",
+            ])),
+            "typeAttribution": "unknown",
+        }
     if (consecutive and not turn.is_day and state.previous_robots is not None
             and turn.robot_roles_observed):
         for robot_id, (target, _) in state.previous_robots.items():
@@ -529,12 +675,76 @@ def observe_shadow(
         changes = _wall_changes(old_walls, new_walls) if consecutive else {
             name: 0 for name in state.day_context[side]["walls"]
         }
+        damaged_ids = []
+        if consecutive:
+            damaged_ids = [wall_id for wall_id in old_walls.keys() & new_walls.keys()
+                           if old_walls[wall_id][0] == new_walls[wall_id][0]
+                           and old_walls[wall_id][2:] == new_walls[wall_id][2:]
+                           and new_walls[wall_id][1] < old_walls[wall_id][1]]
+        adjacent_robots = 0
+        with_adjacent = 0
+        near_base = 0
+        for wall_id in damaged_ids:
+            _, _, x, y = new_walls[wall_id]
+            adjacent = sum(robot_positions[side].get((x + dx, y + dy), 0)
+                           for dx in (-1, 0, 1) for dy in (-1, 0, 1))
+            adjacent_robots += adjacent
+            with_adjacent += adjacent > 0
+            base_unit = base_units[side]
+            if base_unit is not None and min(
+                distance(Pos(x, y), cell) for cell in station_footprint(base_unit.pos)
+            ) <= 1:
+                near_base += 1
+        robots_complete = turn.robot_roles_observed and not unknown_target \
+            and len(turn.robots) <= ID_LIMIT
+        wall_comparison_complete = (
+            consecutive and walls_complete[side]
+            and state.previous_walls_complete.get(side, False)
+        )
+        base_geometry_complete = base_units[side] is not None
+        pressure_unknowns = []
+        if not consecutive:
+            pressure_unknowns.append("frame_sequence_incomplete")
+        if not wall_comparison_complete:
+            pressure_unknowns.append("wall_observation_incomplete")
+        if not walls_complete[side] or state.previous_walls_complete.get(side) is False:
+            pressure_unknowns.append("wall_id_limit")
+        if not base_geometry_complete:
+            pressure_unknowns.append("base_missing")
+        if not robots_complete:
+            pressure_unknowns.extend(reason for reason in (
+                "robots_missing", "robot_id_limit", "unknown_target_robots")
+                if reason in unknowns)
+        wall_pressure = {
+            "comparable": wall_comparison_complete,
+            "wallObservationComplete": walls_complete[side],
+            "baseGeometryComplete": base_geometry_complete,
+            "damagedWalls": (len(damaged_ids)
+                             if wall_comparison_complete else None),
+            "damagedWallsObservedLowerBound": len(damaged_ids),
+            "nearBaseDamagedWalls": (near_base if wall_comparison_complete
+                                     and base_geometry_complete else None),
+            "sideDamagedWalls": (len(damaged_ids) - near_base
+                                  if wall_comparison_complete
+                                  and base_geometry_complete else None),
+            "damagedWallsWithAdjacentRobots": (
+                with_adjacent if wall_comparison_complete and robots_complete
+                else None),
+            "adjacentRobotsToDamagedWalls": (
+                adjacent_robots if wall_comparison_complete and robots_complete
+                else None),
+            "robotObservationComplete": robots_complete,
+            "unknowns": sorted(set(pressure_unknowns)),
+            "causalAttribution": "unknown",
+            "criticalWallBreachRisk": "unknown",
+        }
         current["sides"][side] = {
             "base": {"id": base[0], "level": base[1], "hp": base[2],
                      "observedHpLoss": base_loss} if base else None,
             "walls": {"count": len(new_walls), **changes},
             "robots": robots[side],
             "criticalWallBreach": "unknown",
+            "criticalWallPressure": wall_pressure,
         }
         if turn.is_day and consecutive and turn.round_in_day != 1:
             context = state.day_context[side]
@@ -576,6 +786,72 @@ def observe_shadow(
                     if reason in unknowns and reason not in record.metrics[side]["completeness"]["unknowns"]:
                         record.metrics[side]["completeness"]["unknowns"].append(reason)
             metrics = record.metrics[side]
+            critical = metrics["criticalWalls"]
+            critical_unknowns = critical["unknowns"]
+            if (record.first_round is None
+                    and "missing_dusk_boundary" in record.unknowns):
+                critical_unknowns.append("missing_dusk_boundary")
+            if record.first_round is not None and not consecutive:
+                critical_unknowns.append("frame_sequence_incomplete")
+            if not walls_complete[side] or (
+                    state.previous_walls_complete.get(side) is False):
+                critical_unknowns.append("wall_id_limit")
+            if not base_geometry_complete:
+                critical_unknowns.append("base_missing")
+            if not robots_complete:
+                critical_unknowns.extend(reason for reason in (
+                    "robots_missing", "robot_id_limit", "unknown_target_robots")
+                    if reason in unknowns)
+            critical["coverageComplete"] = not critical_unknowns
+            if not consecutive:
+                record.wall_damage_streaks[side].clear()
+            next_streaks = {}
+            for wall_id in damaged_ids:
+                streak = record.wall_damage_streaks[side].get(wall_id, 0) + 1
+                next_streaks[wall_id] = streak
+                critical["longestConsecutiveDamageRounds"] = max(
+                    critical["longestConsecutiveDamageRounds"], streak)
+            record.wall_damage_streaks[side] = next_streaks
+            critical["damagedWallFramesObservedLowerBound"] += len(damaged_ids)
+            first_observed_night_frame = record.first_round is None
+            if (first_observed_night_frame and not wall_comparison_complete
+                    and walls_complete[side] and not critical_unknowns):
+                pass
+            elif critical["damagedWallFrames"] is not None and wall_comparison_complete:
+                critical["damagedWallFrames"] += len(damaged_ids)
+            else:
+                critical["damagedWallFrames"] = None
+            if base_geometry_complete:
+                critical["nearBaseDamagedWallFramesObservedLowerBound"] += near_base
+                critical["sideDamagedWallFramesObservedLowerBound"] += (
+                    len(damaged_ids) - near_base)
+            if (first_observed_night_frame and not wall_comparison_complete
+                    and walls_complete[side] and base_geometry_complete
+                    and not critical_unknowns):
+                pass
+            elif wall_comparison_complete and base_geometry_complete:
+                if critical["nearBaseDamagedWallFrames"] is not None:
+                    critical["nearBaseDamagedWallFrames"] += near_base
+                if critical["sideDamagedWallFrames"] is not None:
+                    critical["sideDamagedWallFrames"] += len(damaged_ids) - near_base
+            else:
+                critical["nearBaseDamagedWallFrames"] = None
+                critical["sideDamagedWallFrames"] = None
+            if turn.robot_roles_observed:
+                critical["damagedWallFramesWithAdjacentRobotsObservedLowerBound"] += with_adjacent
+                critical["adjacentRobotObservationsLowerBound"] += adjacent_robots
+            if (first_observed_night_frame and not wall_comparison_complete
+                    and walls_complete[side] and robots_complete
+                    and not critical_unknowns):
+                pass
+            elif wall_comparison_complete and robots_complete:
+                if critical["damagedWallFramesWithAdjacentRobots"] is not None:
+                    critical["damagedWallFramesWithAdjacentRobots"] += with_adjacent
+                if critical["adjacentRobotObservations"] is not None:
+                    critical["adjacentRobotObservations"] += adjacent_robots
+            else:
+                critical["damagedWallFramesWithAdjacentRobots"] = None
+                critical["adjacentRobotObservations"] = None
             if robots[side]["count"] is not None:
                 threat = {"roundNo": turn.round_no,
                           "count": robots[side]["count"],
@@ -660,9 +936,14 @@ def observe_shadow(
     if collect_investment_history:
         state.previous_our_defense = our_defense
     state.previous_walls = walls
+    state.previous_walls_complete = walls_complete
     state.previous_robots = (
         robot_hp if turn.robot_roles_observed and len(turn.robots) <= ID_LIMIT
         else None
+    )
+    state.previous_robot_positions = (
+        robot_positions if turn.robot_roles_observed
+        and len(turn.robots) <= ID_LIMIT and not unknown_target else None
     )
     state.last_round = turn.round_no
 
@@ -680,6 +961,8 @@ def shadow_diagnostic(state: ShadowState) -> dict[str, Any]:
                           "frames": record.frames},
         "frameSequenceCompleteSoFar": record.complete,
         "unknowns": sorted(record.unknowns),
+        "firstNightRobotDifference": copy.deepcopy(
+            record.first_night_robot_difference),
         "sides": copy.deepcopy(record.metrics),
     } if record is not None else None)
     return {"current": state.current,

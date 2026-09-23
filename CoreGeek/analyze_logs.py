@@ -44,6 +44,23 @@ SOLVER_STOP_REASONS = frozenset({
 })
 SIDES = ("challenger", "defender")
 RISK = frozenset({"unknown", "low", "elevated"})
+TASK_SOLVER_STATES = frozenset({
+    "idle", "reading", "solving", "waiting_llm", "waiting_command",
+    "answer_ready", "submit_pending", "ended",
+})
+TASK_SOLVER_REASONS = SOLVER_STOP_REASONS | frozenset({
+    "command_pending", "llm_pending", "answer_ready", "solving",
+    "command_requested", "llm_requested", "submit_requested",
+})
+COMMAND_RESULT_CLASSES = frozenset({
+    "none", "truncated", "timeout", "judger_error", "completed", "failed",
+    "unknown",
+})
+TASK_DIAGNOSTIC_FLAGS = (
+    "taskEntryReadAttempted", "finalOnlyCorrectionRequested",
+    "repeatedCommandCorrectionRequested", "envelopeCorrectionRequested",
+    "envelopeCorrectionPending",
+)
 
 
 def number(value):
@@ -93,7 +110,7 @@ def nonnegative_int(value):
     return value if type(value) is int and value >= 0 else None
 
 
-def task_summary(records, session, sequence_complete):
+def task_summary(records, task_records, session, sequence_complete):
     instances = {}
     unattributed = 0
 
@@ -103,7 +120,37 @@ def task_summary(records, session, sequence_complete):
             "lastObservedRound": None, "submitAnswerRequests": 0,
             "end": None,
             "successStatus": "unknown", "unknowns": [],
+            "evidenceSources": [], "solverStates": [], "solverReasons": [],
+            "commandResultClasses": [], "relatedErrorCodes": [],
+            "envelopeCorrectionRequested": None,
+            "diagnosticFlags": [],
+            "timeline": [], "timelineTruncated": False,
+            "_submitRecords": [], "_timeline": {},
         })
+
+    task_rounds = [record["roundNo"] for record in task_records]
+    task_unique_rounds = sorted(set(task_rounds))
+    fingerprint_signatures = defaultdict(set)
+
+    def timeline(item, round_no, source):
+        event = item["_timeline"].setdefault(round_no, {
+            "roundNo": round_no, "sources": set(), "solverStates": set(),
+            "solverReasons": set(), "commandResultClasses": set(),
+            "submitObservations": 0, "relatedErrorCodes": set(),
+            "diagnosticFlags": set(),
+        })
+        event["sources"].add(source)
+        return event
+
+    def observe_submit(item, record, source, count):
+        fingerprint = record.get("requestFingerprint")
+        fingerprint = fingerprint if isinstance(fingerprint, str) and re.fullmatch(
+            r"[0-9a-f]{64}", fingerprint) else None
+        item["_submitRecords"].append({
+            "roundNo": record.get("roundNo"), "fingerprint": fingerprint,
+            "source": source, "count": count,
+        })
+        timeline(item, record["roundNo"], source)["submitObservations"] += count
 
     for record in records:
         decision = record.get("decision")
@@ -120,16 +167,19 @@ def task_summary(records, session, sequence_complete):
             if isinstance(commands, dict):
                 rows = commands.get("items")
                 if isinstance(rows, list):
-                    item["submitAnswerRequests"] += sum(
+                    submit_count = sum(
                         isinstance(command, dict)
                         and command.get("action") == "submitAnswer"
                         for command in rows)
+                    observe_submit(item, record, "turn", submit_count)
                 else:
                     item["unknowns"].append("commands_missing")
                 if commands.get("truncated") is True:
                     item["unknowns"].append("commands_truncated")
             else:
                 item["unknowns"].append("commands_missing")
+            item["evidenceSources"].append("turn")
+            timeline(item, round_no, "turn")
         elif value_at(record, "task", "active") is True:
             unattributed += 1
 
@@ -141,6 +191,8 @@ def task_summary(records, session, sequence_complete):
             unattributed += 1
             continue
         item = entry(ended_id)
+        item["evidenceSources"].append("turn")
+        ended_event = timeline(item, record["roundNo"], "turn")
         if ended.get("endRound") != record["roundNo"]:
             item["unknowns"].append("end_round_mismatch")
             continue
@@ -165,17 +217,310 @@ def task_summary(records, session, sequence_complete):
                 if type(ended.get("observedGoldDelta")) is int else None,
             "attribution": "unattributed", "successStatus": "unknown",
         }
+        item["relatedErrorCodes"].extend(codes)
+        ended_event["relatedErrorCodes"].update(codes)
+
+    for record in task_records:
+        instance_id = task_instance(record.get("taskInstanceId"), session)
+        fingerprint = record.get("requestFingerprint")
+        if isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            actions = value_at(record, "output", "taskActions")
+            submit_count = sum(isinstance(action, dict)
+                and action.get("action") == "submitAnswer" for action in actions) \
+                if isinstance(actions, list) else 0
+            ended_value = record.get("endedTaskInfo")
+            ended_id = ended_value.get("instanceId") if isinstance(ended_value, dict) else None
+            raw_state = record.get("solverState")
+            safe_state = raw_state if isinstance(raw_state, str) else None
+            fingerprint_signatures[(record["roundNo"], fingerprint)].add(
+                (instance_id, safe_state, submit_count,
+                 ended_id if isinstance(ended_id, str) else None))
+        if instance_id is not None:
+            item = entry(instance_id)
+            item["evidenceSources"].append("task")
+            round_no = record["roundNo"]
+            event = timeline(item, round_no, "task")
+            item["firstObservedRound"] = (round_no if item["firstObservedRound"] is None
+                                           else min(item["firstObservedRound"], round_no))
+            item["lastObservedRound"] = max(item["lastObservedRound"] or 0, round_no)
+            state = record.get("solverState")
+            reason = record.get("solverReason")
+            if isinstance(state, str) and state in TASK_SOLVER_STATES:
+                item["solverStates"].append(state)
+                event["solverStates"].add(state)
+            elif state is not None:
+                item["unknowns"].append("solver_state_invalid")
+            if isinstance(reason, str) and reason in TASK_SOLVER_REASONS:
+                item["solverReasons"].append(reason)
+                event["solverReasons"].add(reason)
+            elif reason is not None:
+                item["unknowns"].append("solver_reason_invalid")
+            internals = record.get("solverInternals")
+            if isinstance(internals, dict):
+                correction = internals.get("envelopeCorrectionRequested")
+                if type(correction) is bool:
+                    item["envelopeCorrectionRequested"] = correction
+                item["diagnosticFlags"].extend(
+                    flag for flag in TASK_DIAGNOSTIC_FLAGS
+                    if internals.get(flag) is True)
+                event["diagnosticFlags"].update(
+                    flag for flag in TASK_DIAGNOSTIC_FLAGS
+                    if internals.get(flag) is True)
+            cmd_result = value_at(record, "input", "cmdResult")
+            result_class = cmd_result.get("class") if isinstance(cmd_result, dict) else None
+            if isinstance(result_class, str) and result_class in COMMAND_RESULT_CLASSES:
+                item["commandResultClasses"].append(result_class)
+                event["commandResultClasses"].add(result_class)
+            elif result_class is not None:
+                item["unknowns"].append("command_result_class_invalid")
+            errors = value_at(record, "input", "errors")
+            error_codes = [error.get("code") for error in errors
+                           if isinstance(error, dict) and error.get("code") in (1, 2)] \
+                if isinstance(errors, list) else []
+            association = value_at(record, "input", "answerResult", "association")
+            if association == "current_task_action_feedback":
+                item["relatedErrorCodes"].extend(error_codes)
+                event["relatedErrorCodes"].update(error_codes)
+            elif error_codes and association != "ended_task":
+                item["unknowns"].append("error_association_unknown")
+            if value_at(record, "input", "cmdResult", "truncated") is True:
+                item["diagnosticFlags"].append("commandResultTruncated")
+                event["diagnosticFlags"].add("commandResultTruncated")
+            if value_at(record, "input", "llmEnvelopeParseFailed") is True:
+                item["diagnosticFlags"].append("llmEnvelopeParseFailed")
+                event["diagnosticFlags"].add("llmEnvelopeParseFailed")
+            for path, flag in (
+                (("input", "phaseTask", "truncated"), "phaseTaskTruncated"),
+                (("input", "llmResp", "truncated"), "llmResponseTruncated"),
+                (("input", "llmEnvelope", "content", "truncated"),
+                 "llmEnvelopeTruncated"),
+                (("output", "prompt", "truncated"), "promptTruncated"),
+                (("output", "executeCmd", "truncated"),
+                 "executeCommandTruncated"),
+            ):
+                if value_at(record, *path) is True:
+                    item["diagnosticFlags"].append(flag)
+                    event["diagnosticFlags"].add(flag)
+            actions = value_at(record, "output", "taskActions")
+            if isinstance(actions, list):
+                if any(value_at(action, "taskAnswer", "truncated") is True
+                       for action in actions if isinstance(action, dict)):
+                    item["diagnosticFlags"].append("taskAnswerTruncated")
+                    event["diagnosticFlags"].add("taskAnswerTruncated")
+                observe_submit(item, record, "task", sum(
+                    isinstance(action, dict) and action.get("action") == "submitAnswer"
+                    for action in actions))
+        else:
+            unattributed += 1
+
+        ended = record.get("endedTaskInfo")
+        if isinstance(ended, dict):
+            ended_id = task_instance(ended.get("instanceId"), session)
+            if ended_id is None:
+                unattributed += 1
+            else:
+                item = entry(ended_id)
+                item["evidenceSources"].append("task")
+                ended_event = timeline(item, record["roundNo"], "task")
+                if item["end"] is None and ended.get("endRound") == record["roundNo"]:
+                    associated_codes = sorted({code for code in (
+                        ended.get("associatedErrorCodes")
+                        if isinstance(ended.get("associatedErrorCodes"), list)
+                        else []) if type(code) is int and code in (1, 2)})
+                    item["end"] = {
+                        "acceptedRound": nonnegative_int(ended.get("acceptedRound")),
+                        "timeoutRound": nonnegative_int(ended.get("timeoutRound")),
+                        "endRound": nonnegative_int(ended.get("endRound")),
+                        "endReason": ended.get("endReason") if isinstance(
+                            ended.get("endReason"), str) and ended.get("endReason")
+                            in TASK_END_REASONS else "unknown",
+                        "submissionCount": nonnegative_int(ended.get("submissionCount")),
+                        "associatedErrorCodes": associated_codes,
+                        "solverStoppedReason": ended.get("solverStoppedReason")
+                            if isinstance(ended.get("solverStoppedReason"), str)
+                            and ended.get("solverStoppedReason") in SOLVER_STOP_REASONS
+                            else None,
+                        "observedTeamScoreDelta": ended.get("observedTeamScoreDelta") if type(ended.get("observedTeamScoreDelta")) is int else None,
+                        "observedGoldDelta": ended.get("observedGoldDelta") if type(ended.get("observedGoldDelta")) is int else None,
+                        "attribution": "unattributed", "successStatus": "unknown",
+                    }
+                    item["relatedErrorCodes"].extend(associated_codes)
+                    ended_event["relatedErrorCodes"].update(associated_codes)
+
+    conflicting_instances = {
+        signature[0] for signatures in fingerprint_signatures.values()
+        if len(signatures) > 1 for signature in signatures
+        if signature[0] is not None
+    }
 
     for item in instances.values():
         if item["end"] is None:
             item["unknowns"].append("end_not_observed")
+        if "task" in item["evidenceSources"] and "turn" not in item["evidenceSources"]:
+            item["unknowns"].append("turn_record_missing")
         if not sequence_complete:
             item["unknowns"].append("sequence_ambiguous")
+        observations = item.pop("_submitRecords")
+        lower = upper = 0
+        ambiguous = False
+        by_round = defaultdict(list)
+        for observation in observations:
+            by_round[observation["roundNo"]].append(observation)
+        for round_observations in by_round.values():
+            fingerprint_groups = defaultdict(list)
+            missing_counts = []
+            for observation in round_observations:
+                fingerprint = observation["fingerprint"]
+                if fingerprint is None:
+                    missing_counts.append(observation["count"])
+                else:
+                    fingerprint_groups[fingerprint].append(observation["count"])
+            known_min = sum(min(counts) for counts in fingerprint_groups.values())
+            known_max = sum(max(counts) for counts in fingerprint_groups.values())
+            known_conflict = any(min(counts) != max(counts)
+                                 for counts in fingerprint_groups.values())
+            if not fingerprint_groups and len(missing_counts) == 1:
+                round_min = round_max = missing_counts[0]
+            else:
+                missing_min = max(missing_counts, default=0)
+                round_min = max(known_min, missing_min)
+                round_max = known_max + sum(missing_counts)
+                if missing_counts or known_conflict:
+                    ambiguous = True
+            lower += round_min
+            upper += round_max
+        item["submitAnswerRequestBounds"] = {"min": lower, "max": upper}
+        item["observedSubmitRecords"] = len(observations)
+        item["submitAnswerRequests"] = None if ambiguous else lower
+        if ambiguous:
+            item["unknowns"].append("submit_association_unknown")
+        if item["instanceId"] in conflicting_instances:
+            item["unknowns"].append("conflicting_task_record")
+        raw_timeline = item.pop("_timeline")
+        timeline_rows = []
+        for round_no in sorted(raw_timeline)[:64]:
+            row = raw_timeline[round_no]
+            timeline_rows.append({key: sorted(value) if isinstance(value, set) else value
+                                  for key, value in row.items()})
+        item["timeline"] = timeline_rows
+        item["timelineTruncated"] = len(raw_timeline) > 64
+        for field in ("evidenceSources", "solverStates", "solverReasons",
+                      "commandResultClasses", "relatedErrorCodes",
+                      "diagnosticFlags"):
+            item[field] = sorted(set(item[field]))
         item["unknowns"] = sorted(set(item["unknowns"]))
-    return {"instances": [instances[key] for key in sorted(instances)],
+    instance_values = [instances[key] for key in sorted(instances)]
+    return {"instances": instance_values,
             "unattributedFrames": unattributed,
-            "source": "turn_commands_visible_only",
+            "source": "turn_and_task_metadata",
+            "coverage": {
+                "turnRecords": len(records), "taskRecords": len(task_records),
+                "fingerprintedTaskRecords": sum(
+                    isinstance(record.get("requestFingerprint"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", record["requestFingerprint"]) is not None
+                    for record in task_records),
+                "taskOnlyInstances": sum(
+                    item["evidenceSources"] == ["task"] for item in instance_values),
+                "duplicateTaskRecords": sum(count - 1 for count in Counter(
+                    (record["roundNo"], record["requestFingerprint"])
+                    for record in task_records
+                    if isinstance(record.get("requestFingerprint"), str)
+                    and re.fullmatch(r"[0-9a-f]{64}", record["requestFingerprint"])
+                    is not None).values() if count > 1),
+                "conflictingDuplicateTaskRecords": sum(
+                    len(signatures) > 1 for signatures in fingerprint_signatures.values()),
+                "taskOutOfOrderCount": sum(current <= previous for previous, current
+                    in zip(task_rounds, task_rounds[1:])),
+                "taskRoundGaps": [{"after": left, "before": right,
+                                   "missing": right - left - 1}
+                    for left, right in zip(task_unique_rounds, task_unique_rounds[1:])
+                    if right > left + 1],
+            },
             "successStatus": "unknown"}
+
+
+def _safe_night_observation(source):
+    difference = source.get("firstNightRobotDifference")
+    safe_difference = None
+    if isinstance(difference, dict):
+        status = difference.get("status")
+        raw = difference.get("rawDifference")
+        inferred = difference.get("inferredOpponentAdditions")
+        applied = difference.get("ourAppliedAdditions")
+        raw_unknowns = difference.get("unknowns")
+        raw_unknowns = raw_unknowns if isinstance(raw_unknowns, list) else []
+        safe_difference = {
+            "status": status if status in (
+                "conditional_observation", "inconsistent_observation", "unknown",
+            ) else "unknown",
+            "rawDifference": raw if type(raw) is int else None,
+            "inferredOpponentAdditions": inferred if type(inferred) is int else None,
+            "ourAppliedAdditions": (
+                applied if type(applied) is int and applied >= 0 else None),
+            "ourAppliedAdditionsBasis": (
+                "program_does_not_summon"
+                if difference.get("ourAppliedAdditionsBasis")
+                == "program_does_not_summon" else "unknown"),
+            "inferenceScope": (
+                "current_program_only"
+                if difference.get("inferenceScope") == "current_program_only"
+                else "unknown"),
+            "assumptions": (["equal_natural_robot_totals"]
+                if isinstance(difference.get("assumptions"), list)
+                and "equal_natural_robot_totals" in difference["assumptions"] else []),
+            "timingStatus": (
+                "unknown" if "timing_unverified" in raw_unknowns else "not_reported"),
+            "unknowns": sorted({reason for reason in raw_unknowns
+                if isinstance(reason, str) and reason in (
+                    "timing_unverified", "night_started_late", "robots_missing",
+                    "robot_id_limit", "unknown_target_robots",
+                    "external_or_deployment_additions_unknown",
+                    "negative_difference")}),
+        }
+    fields = (
+        "damagedWallFrames", "nearBaseDamagedWallFrames",
+        "sideDamagedWallFrames", "damagedWallFramesWithAdjacentRobots",
+        "adjacentRobotObservations", "longestConsecutiveDamageRounds",
+        "damagedWallFramesObservedLowerBound",
+        "nearBaseDamagedWallFramesObservedLowerBound",
+        "sideDamagedWallFramesObservedLowerBound",
+        "damagedWallFramesWithAdjacentRobotsObservedLowerBound",
+        "adjacentRobotObservationsLowerBound",
+        "dawnPriorAdjacentRobotObservations",
+    )
+    safe_walls = {}
+    sides = source.get("sides")
+    sides = sides if isinstance(sides, dict) else {}
+    for side in SIDES:
+        side_value = sides.get(side)
+        side_value = side_value if isinstance(side_value, dict) else {}
+        values = side_value.get("criticalWalls")
+        if not isinstance(values, dict):
+            metrics = side_value.get("metrics")
+            values = metrics.get("criticalWalls") if isinstance(metrics, dict) else None
+        values = values if isinstance(values, dict) else {}
+        unknowns = values.get("unknowns")
+        unknowns = unknowns if isinstance(unknowns, list) else []
+        safe_walls[side] = {
+            **{field: nonnegative_int(values.get(field)) for field in fields},
+            "coverageComplete": (values.get("coverageComplete")
+                                 if type(values.get("coverageComplete")) is bool
+                                 else None),
+            "dawnObserved": (values.get("dawnObserved")
+                             if type(values.get("dawnObserved")) is bool else None),
+            "dawnWallObservationComplete": (
+                values.get("dawnWallObservationComplete")
+                if type(values.get("dawnWallObservationComplete")) is bool
+                else None),
+            "unknowns": sorted({reason for reason in unknowns
+                if isinstance(reason, str) and reason in (
+                    "frame_sequence_incomplete", "wall_id_limit", "base_missing",
+                    "robots_missing", "robot_id_limit", "unknown_target_robots",
+                    "missing_dusk_boundary", "dawn_missing",
+                    "dawn_wall_id_limit", "dawn_robot_association_unknown")}),
+        }
+    return {"firstNightRobotDifference": safe_difference,
+            "criticalWalls": safe_walls}
 
 
 def pressure_summary(records, identity_unknown):
@@ -184,6 +529,17 @@ def pressure_summary(records, identity_unknown):
         shadow = value_at(record, "decision", "pressureShadow")
         if not isinstance(shadow, dict):
             continue
+        night_summary = shadow.get("nightSummary")
+        if isinstance(night_summary, dict):
+            night = nonnegative_int(night_summary.get("night"))
+            observed_round = nonnegative_int(value_at(
+                night_summary, "observedRange", "lastRound"))
+            if night and observed_round is not None and observed_round <= record["roundNo"]:
+                item = nights.setdefault(night, {})
+                if observed_round >= item.get("summaryRound", -1):
+                    item["nightObservation"] = _safe_night_observation(
+                        night_summary)
+                    item["summaryRound"] = observed_round
         prediction = shadow.get("prediction")
         if isinstance(prediction, dict) and prediction.get("status") == "issued":
             night = nonnegative_int(prediction.get("night"))
@@ -212,6 +568,7 @@ def pressure_summary(records, identity_unknown):
                 or status == current.get("status") and observed_round > current_round):
                 item["verification"] = verification
                 item["verificationRound"] = observed_round
+                item["nightObservation"] = _safe_night_observation(verification)
 
     scores = {name: Counter() for name in ("assessment", "persistenceBaseline")}
     scores_by_side = {side: {name: Counter() for name in scores} for side in SIDES}
@@ -256,9 +613,15 @@ def pressure_summary(records, identity_unknown):
                 scores[name][result] += 1
                 scores_by_side[side][name][result] += 1
             sides[side] = side_summary
+        observation = item.get("nightObservation", {})
         output.append({"night": night, "verificationStatus":
                        verification.get("status") if verification else "missing",
-                       "sides": sides})
+                       "sides": sides,
+                       "firstNightRobotDifference": observation.get(
+                           "firstNightRobotDifference"),
+                       "criticalWalls": observation.get("criticalWalls", {
+                           side: {} for side in SIDES}),
+                       })
     score_keys = ("hit", "falseNegative", "falsePositive",
                   "correctNegative", "unscorable")
     return {"nights": output, "identityUnknown": identity_unknown,
@@ -447,7 +810,7 @@ def history_comparisons(by_round, sequence_complete, identity_unknown):
     return {"comparisons": comparisons}
 
 
-def summarize_group(key, records):
+def summarize_group(key, records, task_records=()):
     team_type, team_id, session, build = key
     identity_unknown = None in key
     rounds = [record["roundNo"] for record in records]
@@ -457,7 +820,7 @@ def summarize_group(key, records):
     out_of_order = sum(current <= previous for previous, current in zip(rounds, rounds[1:]))
     gaps = [{"after": left, "before": right, "missing": right - left - 1}
             for left, right in zip(unique, unique[1:]) if right > left + 1]
-    sequence_complete = not duplicate and not out_of_order and not gaps and not identity_unknown
+    sequence_complete = bool(records) and not duplicate and not out_of_order and not gaps and not identity_unknown
     by_round = {record["roundNo"]: record for record in records if count[record["roundNo"]] == 1}
     unique_records = [record for record in records if count[record["roundNo"]] == 1]
     latency = {}
@@ -539,7 +902,8 @@ def summarize_group(key, records):
         "buildId": build, "frames": len(records),
         "uniqueFrames": len(unique_records),
         "excludedDuplicateFrames": len(records) - len(unique_records),
-        "sequence": {"firstRound": unique[0], "lastRound": unique[-1],
+        "sequence": {"firstRound": unique[0] if unique else None,
+            "lastRound": unique[-1] if unique else None,
             "duplicateRounds": duplicate, "outOfOrderCount": out_of_order,
             "gaps": gaps, "identityUnknown": identity_unknown,
             "complete": sequence_complete,
@@ -572,7 +936,7 @@ def summarize_group(key, records):
         "errors": {"count": numeric_summary([value_at(record, "errorCount")
                                              for record in unique_records])},
         "historyInvestment": history_comparisons(by_round, sequence_complete, identity_unknown),
-        "tasks": task_summary(unique_records, session, sequence_complete),
+        "tasks": task_summary(unique_records, task_records, session, sequence_complete),
         "pressure": pressure_summary(unique_records, identity_unknown),
     }
 
@@ -594,13 +958,15 @@ def analyze_lines(lines, *, pk, half):
     if not pk or half not in ("challenger", "defender"):
         raise ValueError("explicit PK and half (challenger/defender) required")
     groups = defaultdict(list)
+    task_groups = defaultdict(list)
     unrecognized = invalid_round = ignored_events = half_mismatch = 0
     for line in lines:
         record = parse_line(line)
         if record is None:
             unrecognized += 1
             continue
-        if record.get("event") != "turn":
+        event = record.get("event")
+        if event not in ("turn", "task"):
             ignored_events += 1
             continue
         round_no = record.get("roundNo")
@@ -610,8 +976,8 @@ def analyze_lines(lines, *, pk, half):
         team = record.get("team")
         if not isinstance(team, dict):
             team = {}
-        session = value_at(record, "decision", "newsEvidence", "currentSession")
-        if session is MISSING or session is None:
+        session = record.get("sessionIndex", MISSING) if event == "task" else value_at(record, "decision", "newsEvidence", "currentSession")
+        if event == "turn" and (session is MISSING or session is None):
             session = value_at(record, "decision", "pressureShadow", "session")
         if session is MISSING or type(session) is not int:
             session = None
@@ -620,13 +986,15 @@ def analyze_lines(lines, *, pk, half):
             half_mismatch += 1
         key = (team_type, safe_id(team.get("id")), session,
                safe_id(record.get("buildId")))
-        groups[key].append(record)
-    output = [summarize_group(key, records) for key, records in groups.items()]
+        (groups if event == "turn" else task_groups)[key].append(record)
+    output = [summarize_group(key, groups.get(key, []), task_groups.get(key, []))
+              for key in groups.keys() | task_groups.keys()]
     output.sort(key=lambda group: (str(group["team"]), str(group["session"]),
                                    str(group["buildId"])))
     return {"pk": pk, "half": half,
             "input": {"unrecognizedLines": unrecognized,
                       "ignoredOtherEvents": ignored_events,
+                      "taskEventRecords": sum(map(len, task_groups.values())),
                       "invalidRoundRecords": invalid_round,
                       "halfTeamMismatchFrames": half_mismatch},
             "groups": output,
