@@ -32,7 +32,7 @@ from .protocol import (
     sell_command,
     use_command,
 )
-from .state import BaseReserve, SessionState
+from .state import BaseReserve, PlanState, SessionState
 
 MINERALS = ("stone", "iron", "copper")
 MAX_WEAPONS = 3
@@ -136,6 +136,8 @@ class RouteSearchContext:
     investment_targets: set[int] = field(default_factory=set)
     investment_owners: dict[int, int] = field(default_factory=dict)
     wall_upgrade_targets: tuple[Pos, ...] = ()
+    preferred_wall_targets: dict[str, int] = field(default_factory=dict)
+    preferred_weapon_targets: dict[str, int] = field(default_factory=dict)
     procurement_blocked_role_ids: set[int] = field(default_factory=set)
 
 
@@ -156,6 +158,7 @@ def propose_economy(
     fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
     night_cleared: bool = False,
+    allow_idle_pioneer_purchase: bool = False,
     diagnostic_sink: Callable[[dict], None] | None = None,
 ) -> tuple[PlannedAction, ...]:
     context = RouteSearchContext({})
@@ -171,6 +174,7 @@ def propose_economy(
             fortification_builder_id=fortification_builder_id,
             reserved_role_ids=reserved_role_ids,
             night_cleared=night_cleared,
+            allow_idle_pioneer_purchase=allow_idle_pioneer_purchase,
         )
         if diagnostic_sink is not None:
             held = next((
@@ -238,6 +242,7 @@ def _propose_economy(
     fortification_builder_id: int | None = None,
     reserved_role_ids: frozenset[int] = frozenset(),
     night_cleared: bool = False,
+    allow_idle_pioneer_purchase: bool = False,
 ) -> tuple[PlannedAction, ...]:
     context = _ROUTE_SEARCH_CONTEXT.get()
     current_day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
@@ -294,6 +299,8 @@ def _propose_economy(
     ensure_defense_layout(turn, state)
     if context is not None:
         context.wall_upgrade_targets = state.layout_wall_targets
+        context.preferred_wall_targets = _preferred_wall_targets(turn, state)
+        context.preferred_weapon_targets = _preferred_weapon_targets(turn)
     candidates: list[PlannedAction] = []
     maintained_roles: set[int] = set()
     claimed_build_targets: set[Pos] = set()
@@ -541,6 +548,22 @@ def _propose_economy(
         else:
             context.tower_status = "no_complete_route_or_window"
 
+    protected_reserve = _active_upgrade_reserve(turn, state)
+    reserve_interrupted = (
+        any(_wall_repair_urgent(turn, wall) for wall in turn.walls())
+        or "Medicine" in turn.weapon_prices
+        and any(
+            role.health <= EMERGENCY_MEDICINE_HEALTH
+            for role in turn.controllable()
+        )
+    )
+    protected_cash = 0
+    if protected_reserve is not None and not reserve_interrupted:
+        protected_cash = min(
+            max(turn.gold - claimed_gold, 0), protected_reserve[1],
+        )
+        claimed_gold += protected_cash
+
     reserve = state.base_reserve
     if context is not None and reserve is not None:
         context.investment_owners[reserve.station_id] = reserve.holder_id
@@ -581,7 +604,16 @@ def _propose_economy(
                     joint_plan is None
                     and _is_immediate_held_investment_action(candidate)
                 )
-                if not self_care and not immediate_investment:
+                pioneer_continuation = (
+                    allow_idle_pioneer_purchase
+                    and role.kind == PIONEER
+                    and _is_held_investment_action(candidate)
+                )
+                if (
+                    not self_care
+                    and not immediate_investment
+                    and not pioneer_continuation
+                ):
                     candidate = None
             if (
                 role.unit_id in reserved_role_ids
@@ -596,6 +628,43 @@ def _propose_economy(
             candidates.append(candidate)
             _reserve_investment_target(candidate, _ROUTE_SEARCH_CONTEXT.get())
             maintained_roles.add(role.unit_id)
+
+    if allow_idle_pioneer_purchase:
+        for pioneer in sorted(turn.pioneers(), key=lambda entry: entry.unit_id):
+            if (
+                pioneer.unit_id in maintained_roles
+                or pioneer.unit_id in reserved_role_ids
+            ):
+                continue
+            candidate = _pioneer_upgrade_purchase_action(
+                turn,
+                pioneer,
+                turn.gold - claimed_gold + (
+                    protected_cash
+                    if protected_reserve is not None
+                    and protected_reserve[0] == pioneer.unit_id
+                    else 0
+                ),
+                state.plans.get(pioneer.unit_id),
+                clock,
+                deadline,
+                max_expansions,
+            )
+            if candidate is None:
+                continue
+            candidates.append(candidate)
+            _reserve_investment_target(candidate, context)
+            maintained_roles.add(pioneer.unit_id)
+            item = candidate.plan_reason.split(":", 2)[1]
+            claimed_gold += max(
+                0,
+                turn.weapon_prices[item] - (
+                    protected_cash
+                    if protected_reserve is not None
+                    and protected_reserve[0] == pioneer.unit_id
+                    else 0
+                ),
+            )
 
     joint_candidates, joint_roles, joint_cancellations = _joint_funding_actions(
         turn,
@@ -765,6 +834,19 @@ def _propose_economy(
             elif action == "buy":
                 name = candidate.proposal.command["name"]
                 claimed_gold += turn.weapon_prices[name]
+            elif (
+                candidate.plan_reason is not None
+                and candidate.plan_reason.startswith(("fund:", "batch:"))
+            ):
+                item = candidate.plan_reason.split(":", 2)[1]
+                if item.startswith((
+                    "WallUpgradeVoucher", "WeaponUpgradeVoucher",
+                )):
+                    price = turn.weapon_prices.get(item)
+                    if price is not None:
+                        claimed_gold += min(
+                            max(turn.gold - claimed_gold, 0), price,
+                        )
     if state.base_blocked_day == current_day:
         station = turn.station()
         if station is not None and station.level in (1, 2):
@@ -781,6 +863,36 @@ def _propose_economy(
                 )
             ]
     return tuple(candidates)
+
+
+def _active_upgrade_reserve(
+    turn: Turn,
+    state: SessionState,
+) -> tuple[int, int] | None:
+    for role_id, plan in sorted(state.plans.items()):
+        if not plan.reason.startswith(("fund:", "batch:")):
+            continue
+        parts = plan.reason.split(":")
+        if len(parts) < 2 or not parts[1].startswith((
+            "WallUpgradeVoucher", "WeaponUpgradeVoucher",
+        )):
+            continue
+        item = parts[1]
+        target_id = _plan_use_target_id(plan)
+        target = turn.unit(target_id) if target_id is not None else None
+        role = turn.unit(role_id)
+        price = turn.weapon_prices.get(item)
+        if (
+            role is not None
+            and target is not None
+            and _item_matches_target(item, target)
+            and price is not None
+            and item not in role.backpack
+            and plan.deadline_round is not None
+            and turn.round_no <= plan.deadline_round
+        ):
+            return role_id, price
+    return None
 
 
 def prepare_base_reserve(
@@ -2080,8 +2192,12 @@ def _joint_funding_actions(
             )
             if option is not None:
                 options.append(option)
+    workers_by_id = {worker.unit_id: worker for worker in workers}
     options.sort(key=lambda option: (
         existing is None or option.buyer_id != existing[3],
+        _purchase_candidates(
+            turn, workers_by_id[option.buyer_id],
+        ).index(option.item),
         max(option.buyer_rounds, option.contributor_rounds),
         option.buyer_rounds + option.contributor_rounds,
         option.buyer_id,
@@ -2202,6 +2318,10 @@ def _joint_funding_route(
         return min(
             options,
             key=lambda option: (
+                option.use_target_id != (
+                    context.preferred_wall_targets.get(item)
+                    if context is not None else None
+                ),
                 max(option.buyer_rounds, option.contributor_rounds),
                 option.buyer_rounds + option.contributor_rounds,
                 option.use_target_id or 0,
@@ -2835,6 +2955,68 @@ def _single_funding_action(
         max_expansions,
         verified_route=route,
     )
+
+
+def _pioneer_upgrade_purchase_action(
+    turn: Turn,
+    pioneer: Unit,
+    available_gold: int,
+    plan: PlanState | None,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    if not turn.is_day or pioneer.kind != PIONEER or pioneer.backpack_full:
+        return None
+    existing_item = None
+    existing_target_id = None
+    if plan is not None and plan.reason.startswith("fund:"):
+        parts = plan.reason.split(":")
+        if len(parts) >= 2 and parts[1].startswith(INVESTMENT_ITEM_PREFIXES):
+            existing_item = parts[1]
+            existing_target_id = _plan_use_target_id(plan)
+    items = tuple(
+        item for item in _purchase_candidates(turn, pioneer)
+        if item.startswith(INVESTMENT_ITEM_PREFIXES)
+    )
+    if existing_item in items:
+        items = (existing_item, *(item for item in items if item != existing_item))
+    for item in items:
+        price = turn.weapon_prices.get(item)
+        if price is None or price > available_gold:
+            continue
+        route = _purchase_route(
+            turn,
+            pioneer,
+            item,
+            clock,
+            deadline,
+            max_expansions,
+            preferred_use_target_id=(
+                existing_target_id if item == existing_item else None
+            ),
+        )
+        if route is None or route.rounds > turn.rounds_until_night:
+            continue
+        candidate = _funding_action(
+            turn,
+            pioneer,
+            item,
+            turn.round_no + turn.rounds_until_night - 1,
+            clock,
+            deadline,
+            max_expansions,
+            verified_route=route,
+        )
+        if candidate is None:
+            continue
+        diagnostic = dict(candidate.diagnostic or {})
+        diagnostic.update({
+            "kind": "pioneerInvestment",
+            "fullRouteRounds": route.rounds,
+        })
+        return replace(candidate, diagnostic=diagnostic)
+    return None
 
 
 def _new_procurement_batch_action(
@@ -3870,6 +4052,7 @@ def _purchase_route(
             preferred_post_id=preferred_post_id,
             preferred_use_target_id=preferred_use_target_id,
             gate_new_maintenance=gate_new_maintenance,
+            prefer_context_target=True,
         )
         if held is None:
             continue
@@ -3952,9 +4135,20 @@ def _held_item_route(
     preferred_post_id: int | None = None,
     preferred_use_target_id: int | None = None,
     gate_new_maintenance: bool = False,
+    prefer_context_target: bool = False,
 ) -> FundingRoute | None:
     targets = _item_targets(turn, item)
     context = _ROUTE_SEARCH_CONTEXT.get()
+    explicit_preferred_target = preferred_use_target_id is not None
+    if (
+        prefer_context_target
+        and preferred_use_target_id is None
+        and context is not None
+    ):
+        preferred_use_target_id = (
+            context.preferred_wall_targets.get(item)
+            or context.preferred_weapon_targets.get(item)
+        )
     if context is not None:
         targets = tuple(
             target for target in targets
@@ -3966,7 +4160,7 @@ def _held_item_route(
                 or context.investment_owners.get(target.unit_id) == worker.unit_id
             )
         )
-    if preferred_use_target_id is not None:
+    if explicit_preferred_target:
         targets = tuple(
             target for target in targets
             if target.unit_id == preferred_use_target_id
@@ -4013,7 +4207,11 @@ def _held_item_route(
                     )
                 ):
                     continue
-                key = (_funding_route_key(candidate), target_id or 0)
+                key = (
+                    target_id != preferred_use_target_id,
+                    _funding_route_key(candidate),
+                    target_id or 0,
+                )
                 if best is None or key < best[0]:
                     best = (key, candidate)
         context = _ROUTE_SEARCH_CONTEXT.get()
@@ -4225,11 +4423,22 @@ def _purchase_candidates(turn: Turn, worker: Unit) -> tuple[str, ...]:
     candidates: list[str] = []
     if worker.health < _max_role_health(worker) and "Medicine" in turn.weapon_prices:
         candidates.append("Medicine")
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    preferred_wall_items = tuple(
+        item for item in (
+            context.preferred_wall_targets
+            if context is not None else ()
+        )
+        if item in turn.weapon_prices
+    )
     damaged_wall = next((
         wall for wall in turn.walls()
         if wall.health < _max_building_health(wall)
     ), None)
-    if damaged_wall is not None and "WallFixer" in turn.weapon_prices:
+    if (
+        any(_wall_repair_urgent(turn, wall) for wall in turn.walls())
+        and "WallFixer" in turn.weapon_prices
+    ):
         candidates.append("WallFixer")
     for target in (*turn.weapons(), *((turn.station(),) if turn.station() else ())):
         prefix = "Weapon" if target.kind in TOWER_TYPES else "Station"
@@ -4237,21 +4446,155 @@ def _purchase_candidates(turn: Turn, worker: Unit) -> tuple[str, ...]:
             item = f"{prefix}UpgradeVoucher{target.level}"
             if item in turn.weapon_prices and item not in candidates:
                 candidates.append(item)
-    wall_positions = {wall.pos for wall in turn.walls()}
-    context = _ROUTE_SEARCH_CONTEXT.get()
-    layout_walls = context.wall_upgrade_targets if context is not None else ()
+    for item in preferred_wall_items:
+        if item not in candidates:
+            candidates.append(item)
+    if (
+        damaged_wall is not None
+        and "WallFixer" in turn.weapon_prices
+        and "WallFixer" not in candidates
+    ):
+        candidates.append("WallFixer")
     wall_levels = (
         {wall.level for wall in turn.walls()}
-        if len(turn.weapons()) >= MAX_WEAPONS
-        and bool(layout_walls)
-        and set(layout_walls).issubset(wall_positions)
-        else set()
+        if len(turn.weapons()) >= MAX_WEAPONS else set()
     )
     for required_level in (1, 2):
         item = f"WallUpgradeVoucher{required_level}"
-        if required_level in wall_levels and item in turn.weapon_prices:
+        if (
+            required_level in wall_levels
+            and item in turn.weapon_prices
+            and item not in candidates
+        ):
             candidates.append(item)
     return tuple(candidates)
+
+
+def _preferred_wall_targets(
+    turn: Turn,
+    state: SessionState,
+) -> dict[str, int]:
+    result: dict[str, int] = {}
+    ordered = sorted(
+        turn.walls(),
+        key=lambda wall: (
+            not _wall_repair_urgent(turn, wall),
+            not _wall_visible_threat(turn, wall),
+            wall.health if _wall_visible_threat(turn, wall) else 0,
+            *_wall_investment_priority(state, wall),
+        ),
+    )
+    for wall in ordered:
+        if wall.health < _max_building_health(wall):
+            item = (
+                "WallFixer"
+                if _wall_repair_urgent(turn, wall)
+                else f"WallUpgradeVoucher{wall.level}"
+                if _wall_prefers_upgrade(turn, wall)
+                else "WallFixer"
+            )
+            if item in turn.weapon_prices:
+                result.setdefault(item, wall.unit_id)
+        elif wall.level in (1, 2):
+            item = f"WallUpgradeVoucher{wall.level}"
+            if item in turn.weapon_prices:
+                result.setdefault(item, wall.unit_id)
+    for wall in ordered:
+        if wall.level in (1, 2):
+            item = f"WallUpgradeVoucher{wall.level}"
+            if item in turn.weapon_prices:
+                result.setdefault(item, wall.unit_id)
+    return result
+
+
+def _preferred_weapon_targets(turn: Turn) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for level in (1, 2):
+        item = f"WeaponUpgradeVoucher{level}"
+        if item not in turn.weapon_prices:
+            continue
+        eligible = tuple(
+            weapon for weapon in turn.weapons() if weapon.level == level
+        )
+        if not eligible:
+            continue
+        first = min(eligible, key=lambda weapon: weapon.unit_id)
+        same_kind = tuple(
+            weapon for weapon in eligible if weapon.kind == first.kind
+        )
+        if len(same_kind) < 2:
+            continue
+        ranked = sorted(
+            same_kind,
+            key=lambda weapon: _weapon_upgrade_priority(turn, weapon, item),
+        )
+        if (
+            _weapon_upgrade_priority(turn, ranked[0], item)[0]
+            < _weapon_upgrade_priority(turn, ranked[1], item)[0]
+        ):
+            result[item] = ranked[0].unit_id
+    return result
+
+
+def _weapon_upgrade_priority(
+    turn: Turn,
+    weapon: Unit,
+    item: str,
+) -> tuple[int, int, int, int]:
+    current_range = weapon.range_of_attack()
+    next_range = replace(weapon, level=weapon.level + 1).range_of_attack()
+    newly_covered = sum(
+        robot.target_team == turn.team_type
+        and current_range < distance(weapon.pos, robot.pos) <= next_range
+        for robot in turn.robots
+    )
+    marginal_attack = {
+        "gatling": 10,
+        "railgun": 10,
+        "rocket": 20,
+    }.get(weapon.kind, 0)
+    price = max(turn.weapon_prices.get(item, 1), 1)
+    return (
+        -(newly_covered * marginal_attack * 100 // price),
+        -(marginal_attack * 100 // price),
+        -(next_range - current_range),
+        weapon.unit_id,
+    )
+
+
+def _wall_prefers_upgrade(turn: Turn, wall: Unit) -> bool:
+    if wall.kind != WALL or wall.level not in (1, 2):
+        return False
+    repair_price = turn.weapon_prices.get("WallFixer")
+    upgrade_price = turn.weapon_prices.get(
+        f"WallUpgradeVoucher{wall.level}",
+    )
+    if repair_price is None or upgrade_price is None:
+        return upgrade_price is not None
+    repair_gain = _max_building_health(wall) - wall.health
+    upgrade_gain = _max_building_health(replace(wall, level=wall.level + 1)) - wall.health
+    return upgrade_gain * repair_price >= repair_gain * upgrade_price
+
+
+def _wall_visible_threat(turn: Turn, wall: Unit) -> bool:
+    return any(
+        robot.target_team == turn.team_type
+        and distance(robot.pos, wall.pos) <= ROBOT_ATTACK_RANGE
+        for robot in turn.robots
+    )
+
+
+def _wall_investment_priority(
+    state: SessionState,
+    wall: Unit,
+) -> tuple[int, int, int, int]:
+    events = state.wall_recent_damage.get(wall.pos, ())
+    return (
+        -sum(amount for _, amount in events),
+        -len(events),
+        -(_max_building_health(wall) - wall.health),
+        wall.unit_id,
+    )
 
 
 def _purchase_is_timely(
@@ -4493,9 +4836,20 @@ def _item_targets(turn: Turn, item: str) -> tuple[Unit, ...]:
         targets = turn.walls()
     else:
         return ()
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    preferred_id = (
+        (
+            context.preferred_wall_targets.get(item)
+            or context.preferred_weapon_targets.get(item)
+        )
+        if context is not None else None
+    )
     return tuple(sorted(
         (target for target in targets if _item_matches_target(item, target)),
-        key=lambda target: target.unit_id,
+        key=lambda target: (
+            target.unit_id != preferred_id,
+            target.unit_id,
+        ),
     ))
 
 

@@ -1,6 +1,8 @@
 # NightWatch 内网验证手册
 
-仓库当前构建`nightwatch-s2-integrated-r17`：包含r14全部能力及内网任务调优移植。任务明细改为event=task，保留turn/news与请求关联；新增目录深2的CRLF预处理、同目录API_DOCS自动读取一次，分页最多4次，自动分页/反应式CRLF可在剩余2轮触发并保留截止提交机会。完整SHA、实际部署版本、场次和停止条件始终以 https://github.com/icesword007/NightWatch/issues/12 当前正文为准；若该提示仍指定旧r14，不把本地r17作为已部署版本。
+仓库当前构建`nightwatch-s2-integrated-r18`：包含r14全部能力、R292内网r17任务调优移植，以及R293墙维修/升级比较、受损位置优先、升级资金保护和R294空闲开拓者日间采购/使用/回岗。任务明细为event=task，保留turn/news；预防式CRLF、同目录API_DOCS自动读一次、最多4个自动后续页与剩余2轮恢复均在本版。任务机会可行或未知时不购物；普通墙维护不抢可兑现投资，紧急自救仍可打断。完整SHA、部署版本、场次与停止条件以 https://github.com/icesword007/NightWatch/issues/12 最新正文为准，不沿用旧r14/r17指令。所有增量仅本地验证通过，收益待实战。
+
+离线工具仍只读取event=turn；event=task中的新明细需内网单独关联，不能因工具未汇总而判日志缺失。实际接受经济动作见decision.actions[].economy，pioneerInvestment/heldInvestment结合金币、背包、位置和下一轮反馈验证，不以buy/use请求代替成功。原始任务内容、答案、命令和凭据只留内网；issue仅给脱敏索引与统计。
 
 r10[送测说明](【codex】s2-integrated-r10-intranet-prompt.md)仅作历史参考；r11仅作历史参考；当前版本验收以#12当前正文为准。r7/r8/r9参考仅保留历史与字段解释；#17经济性能、#18任务/新闻、#19防守及压力旁路；旧单迁移关闭不表示修复。
 

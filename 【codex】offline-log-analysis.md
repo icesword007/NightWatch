@@ -13,7 +13,7 @@ python3 analyze_logs.py --input /absolute/path/to/server.log --pk PK编号 --hal
 
 经济摘要包含金币范围、逐段列明起止轮次/长度/日/昼夜的空指令区间及最长长度、寻路搜索/计算/扩展计数、`defensePlanning.unsafeDayWork` 及规划截断轮数。空指令仅认非负整型 `commandCount=0`；缺失、null、布尔/浮点/负数等错误类型分别计数。重复轮排除，缺帧及日/昼夜边界切段。基地摘要包含 HP/等级范围、升级券使用**请求**数与相邻帧可见的等级上升数。HP独立读取 `bases.our.health`；等级仅在 `ourStructures.items` 可见同 ID 基地时读取。结构列表截断时，已知 HP/等级仍保留，未见基地的等级为未知；防线全集可比性为未知。这些只是日志可见事实；发出 `use` 指令不等于平台执行成功。
 
-`tasks.instances` 按 `decision.taskInstanceId` 汇集观察轮次与 `commands.items` 中可见的 `submitAnswer` **请求**数；结束事件单独按 `decision.taskEnd.instanceId` 归属，因此结束轮已转为 idle 或新实例时不会错挂。`commands` 缺失或截断、缺结束事件、轮次不连续均列入 `unknowns`。结束信息只保留轮次、原因、内部提交数、关联错误码、停止原因及队伍分数/金币观察差；差值始终为 `unattributed`，成功状态始终为 `unknown`。请求数、内部计数和平台反馈不是同一口径。工具只读 `event=turn`；`task_detail.submittedAnswers` 是本轮响应的带 `items` 和 `truncated` 的对象，不能把两个对象键当作两次提交，也不能把它当成平台成功反馈。该事件可能含原始答案，分析器仍忽略它。
+`tasks.instances` 按 `decision.taskInstanceId` 汇集观察轮次与 `commands.items` 中可见的 `submitAnswer` **请求**数；结束事件单独按 `decision.taskEnd.instanceId` 归属，因此结束轮已转为 idle 或新实例时不会错挂。`commands` 缺失或截断、缺结束事件、轮次不连续均列入 `unknowns`。结束信息只保留轮次、原因、内部提交数、关联错误码、停止原因及队伍分数/金币观察差；差值始终为 `unattributed`，成功状态始终为 `unknown`。请求数、内部计数和平台反馈不是同一口径。工具只读 `event=turn`；r17起任务明细为 `event=task`，需内网另行关联分析，该工具不解析其正文。以下 `task_detail` 为旧日志格式：`task_detail.submittedAnswers` 是本轮响应的带 `items` 和 `truncated` 的对象，不能把两个对象键当作两次提交，也不能把它当成平台成功反馈。该事件可能含原始答案，分析器仍忽略它。
 
 `pressure.nights` 从 `decision.pressureShadow.prediction` 与 `verification/recentNights` 按夜次汇总双方。夜间伤害事件 `event_observed` 与次日 `final` 属同一夜，优先用 final；只有事件时取该夜最新观测，保留局部证据。明确受伤可由事件证明；无伤仅在 `final.complete=true` 且该侧 `actualBaseDamage=false` 时成立。缺尾帧、缺验证或身份不明时实际状态为未知。预测已发出但夜晚尚未到来，也会列为不可评分的夜次。正式 `assessment` 与 `persistenceBaseline` 分开评分；`unknown` 预测列为不可评分，不算漏报或预测失败。汇总给出双方及合计的命中、漏报、误报、无伤正确和不可评分个数，不计算缺证据下的准确率。
 

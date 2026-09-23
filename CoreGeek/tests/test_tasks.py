@@ -88,6 +88,52 @@ def state_for(payload):
 
 
 class TaskTests(unittest.TestCase):
+    def test_task_opportunity_budget_limit_is_unknown(self):
+        payload = task_payload(round_no=10, pioneer_pos=(1, 1))
+        turn = Turn.load(payload)
+
+        status = task_module.task_opportunity_status(
+            turn,
+            turn.pioneers()[0],
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=0,
+        )
+
+        self.assertEqual(status, "unknown")
+
+    def test_task_opportunity_mixed_rejection_and_limit_is_unknown(self):
+        payload = task_payload(round_no=10, pioneer_pos=(3, 3))
+        turn = Turn.load(payload)
+
+        status = task_module.task_opportunity_status(
+            turn,
+            turn.pioneers()[0],
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=0,
+            start_guard=lambda task, stand, arrival: "known_rejection",
+        )
+
+        self.assertEqual(status, "unknown")
+
+    def test_task_opportunity_unknown_return_route_is_unknown(self):
+        payload = task_payload(round_no=10, pioneer_pos=(3, 3))
+        turn = Turn.load(payload)
+
+        status = task_module.task_opportunity_status(
+            turn,
+            turn.pioneers()[0],
+            clock=lambda: 0.0,
+            deadline=1.0,
+            max_expansions=64,
+            start_guard=lambda task, stand, arrival: (
+                "return_route_unavailable"
+            ),
+        )
+
+        self.assertEqual(status, "unknown")
+
     def test_explicit_file_task_starts_with_one_bounded_read_command(self):
         engine = DecisionEngine()
         active = task_payload(

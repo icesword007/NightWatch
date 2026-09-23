@@ -167,6 +167,12 @@ class SessionState:
     base_blocked_day: int | None = None
     base_blocked_holder_id: int | None = None
     base_reserve_reason: str | None = None
+    wall_last_samples: dict[Pos, tuple[int, int, int, int]] = field(
+        default_factory=dict
+    )
+    wall_recent_damage: dict[Pos, tuple[tuple[int, int], ...]] = field(
+        default_factory=dict
+    )
     last_round_no: int | None = None
     last_fingerprint: str | None = None
     last_response: dict[str, Any] | None = None
@@ -285,6 +291,7 @@ class StateStore:
         self._release_dead_roles(turn)
         self._release_invalid_plans(turn)
         self._observe_base_upgrade(turn)
+        self._observe_wall_damage(turn)
         self._observe_fortification(turn)
         observe_pressure(turn, state)
         self._update_task(
@@ -649,6 +656,34 @@ class StateStore:
             state.base_reserve_event = "voucher_missing"
         elif reserve.item in holder.backpack and state.base_reserve_event == "buy_reported":
             state.base_reserve_event = "held"
+
+    def _observe_wall_damage(self, turn: Turn) -> None:
+        state = self._require_state()
+        cutoff = turn.round_no - ROUNDS_PER_DAY + 1
+        recent = {
+            pos: tuple(event for event in events if event[0] >= cutoff)
+            for pos, events in state.wall_recent_damage.items()
+        }
+        current: dict[Pos, tuple[int, int, int, int]] = {}
+        for wall in turn.walls():
+            previous = state.wall_last_samples.get(wall.pos)
+            events = recent.get(wall.pos, ())
+            if (
+                previous is not None
+                and previous[:2] == (wall.unit_id, wall.level)
+                and previous[2] == turn.round_no - 1
+                and previous[3] > wall.health
+            ):
+                events = (*events, (turn.round_no, previous[3] - wall.health))
+            if events:
+                recent[wall.pos] = events
+            current[wall.pos] = (
+                wall.unit_id, wall.level, turn.round_no, wall.health,
+            )
+        state.wall_recent_damage = {
+            pos: events for pos, events in recent.items() if events
+        }
+        state.wall_last_samples = current
 
     def _release_invalid_plans(self, turn: Turn) -> None:
         state = self._require_state()

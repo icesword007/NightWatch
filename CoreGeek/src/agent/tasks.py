@@ -540,6 +540,35 @@ def propose_tasks(
     ),))
 
 
+def task_opportunity_status(
+    turn: Turn,
+    pioneer: Unit,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float,
+    max_expansions: int,
+    start_guard: Callable[[PlayerTask, Pos, int], str | None] | None = None,
+) -> str:
+    """Return available, none, or unknown without changing task state."""
+    if turn.phase_task:
+        return "available"
+    if not any(
+        task.is_valid and task.cooldown_rounds == 0
+        for task in turn.player_tasks
+    ):
+        return "none"
+    selected, skip_reason = _select_task(
+        turn, pioneer, clock, deadline, max_expansions, start_guard,
+    )
+    if selected is not None:
+        return "available"
+    if skip_reason in (
+        "planning_budget_unknown", "return_route_unavailable",
+    ):
+        return "unknown"
+    return "none"
+
+
 def _prior_task_experience(task: TaskMemory, state: SessionState) -> str:
     if not task.task_type:
         return ""
@@ -1416,6 +1445,7 @@ def _select_task(
 ) -> tuple[tuple[PlayerTask, Pos, Pos | None] | None, str | None]:
     options = []
     skip_reason = None
+    search_incomplete = False
     for task in turn.player_tasks:
         if not task.is_valid or task.cooldown_rounds != 0:
             continue
@@ -1444,6 +1474,8 @@ def _select_task(
                         options.append((cost, task, cell, path.step))
                     elif skip_reason is None:
                         skip_reason = reason
+                elif path.status in ("deadline", "expansion_limit"):
+                    search_incomplete = True
                 if clock() >= deadline:
                     break
             if clock() >= deadline:
@@ -1451,7 +1483,11 @@ def _select_task(
         if clock() >= deadline:
             break
     if not options:
-        return None, skip_reason
+        if search_incomplete:
+            return None, "planning_budget_unknown"
+        if skip_reason is not None:
+            return None, skip_reason
+        return None, None
     _, task, cell, step = min(options, key=lambda option: (
         option[0],
         -(option[1].score_reward + option[1].gold_reward),

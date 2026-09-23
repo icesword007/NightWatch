@@ -660,6 +660,217 @@ class DefenseTests(unittest.TestCase):
             item.proposal.actor_id == 10011 for item in candidates
         ))
 
+    def test_idle_pioneer_buys_and_uses_cash_upgrade_voucher(self):
+        payload = defense_payload(round_no=10)
+        payload["teamOur"]["teamId"] = "idle-pioneer-upgrade"
+        payload["teamOur"]["goldNum"] = 150
+        payload["robot"]["roles"] = []
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 12, "y": 4}, "neutralType": "weaponShop",
+        }]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher2", "price": 150,
+        }]
+        for role in payload["teamOur"]["roles"]:
+            if role["roleType"] == "worker":
+                role["backPackCapability"] = 1
+                role["backpack"] = ["stone"]
+        engine = DecisionEngine()
+
+        first = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(first["10011"], {
+            "action": "buy", "name": "WeaponUpgradeVoucher2", "num": 1,
+        })
+        self.assertFalse(any(
+            command.get("action") in ("collect", "build", "sell")
+            for role_id, command in first.items() if role_id == "10011"
+        ))
+
+        payload["roundNo"] = 11
+        payload["teamOur"]["goldNum"] = 0
+        payload["teamOur"]["roles"][2]["backpack"] = [
+            "WeaponUpgradeVoucher2"
+        ]
+        payload["lastRoundRoleActionResults"] = {"10011": True}
+        second = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(second["10011"], {
+            "action": "use", "name": "WeaponUpgradeVoucher2",
+            "targetPos": [{"x": 12, "y": 6}],
+        })
+
+    def test_pioneer_reuses_protected_cash_while_moving_to_shop(self):
+        payload = defense_payload(round_no=10)
+        payload["teamOur"]["teamId"] = "pioneer-protected-shop-route"
+        payload["teamOur"]["goldNum"] = 150
+        payload["robot"]["roles"] = []
+        payload["teamOur"]["roles"][2]["pos"] = {"x": 12, "y": 2}
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 16, "y": 2}, "neutralType": "weaponShop",
+        }]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher2", "price": 150,
+        }]
+        for role in payload["teamOur"]["roles"]:
+            if role["roleType"] == "worker":
+                role["backPackCapability"] = 1
+                role["backpack"] = ["stone"]
+        engine = DecisionEngine()
+        bought = False
+        saw_move = False
+
+        for round_no in range(10, 18):
+            payload["roundNo"] = round_no
+            command = engine.decide(payload)["roleCommandMap"]["10011"]
+            self.assertNotIn(command["action"], ("collect", "build", "sell"))
+            if command["action"] == "buy":
+                bought = True
+                break
+            self.assertEqual(command["action"], "move")
+            saw_move = True
+            payload["teamOur"]["roles"][2]["pos"] = command["targetPos"][0]
+            payload["lastRoundRoleActionResults"] = {"10011": True}
+
+        self.assertTrue(saw_move)
+        self.assertTrue(bought)
+
+    def test_pioneer_does_not_purchase_when_task_is_available(self):
+        payload = defense_payload(round_no=10)
+        payload["teamOur"]["teamId"] = "task-before-pioneer-upgrade"
+        payload["teamOur"]["goldNum"] = 150
+        payload["robot"]["roles"] = []
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 12, "y": 4}, "neutralType": "weaponShop",
+        }]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher2", "price": 150,
+        }]
+        payload["teamOur"]["playerTasks"] = [{
+            "taskType": "synthetic",
+            "taskPosition": {"x": 13, "y": 5},
+            "coldDownRounds": 0,
+            "scoreReward": 10,
+            "goldReward": 10,
+            "isValid": True,
+            "timeoutRounds": 20,
+        }]
+
+        commands = DecisionEngine().decide(payload)["roleCommandMap"]
+
+        self.assertNotEqual(commands.get("10011", {}).get("action"), "buy")
+
+    def test_pioneer_may_purchase_when_task_solver_window_is_too_short(self):
+        payload = defense_payload(round_no=10)
+        payload["teamOur"]["teamId"] = "late-task-allows-pioneer-upgrade"
+        payload["teamOur"]["goldNum"] = 150
+        payload["robot"]["roles"] = []
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 12, "y": 4}, "neutralType": "weaponShop",
+        }]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher2", "price": 150,
+        }]
+        payload["teamOur"]["playerTasks"] = [{
+            "taskType": "synthetic",
+            "taskPosition": {"x": 13, "y": 5},
+            "coldDownRounds": 0,
+            "scoreReward": 10,
+            "goldReward": 10,
+            "isValid": True,
+            "timeoutRounds": 1,
+        }]
+        for role in payload["teamOur"]["roles"]:
+            if role["roleType"] == "worker":
+                role["backPackCapability"] = 1
+                role["backpack"] = ["stone"]
+
+        commands = DecisionEngine().decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10011"], {
+            "action": "buy", "name": "WeaponUpgradeVoucher2", "num": 1,
+        })
+
+    def test_pioneer_does_not_start_upgrade_without_return_window(self):
+        payload = defense_payload(round_no=70)
+        payload["teamOur"]["teamId"] = "late-pioneer-upgrade"
+        payload["teamOur"]["goldNum"] = 150
+        payload["robot"]["roles"] = []
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 12, "y": 4}, "neutralType": "weaponShop",
+        }]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher2", "price": 150,
+        }]
+        for role in payload["teamOur"]["roles"]:
+            if role["roleType"] == "worker":
+                role["backPackCapability"] = 1
+                role["backpack"] = ["stone"]
+
+        commands = DecisionEngine().decide(payload)["roleCommandMap"]
+
+        self.assertNotEqual(commands.get("10011", {}).get("action"), "buy")
+
+    def test_new_task_pauses_held_voucher_then_voucher_is_used(self):
+        payload = defense_payload(round_no=10)
+        payload["teamOur"]["teamId"] = "task-pauses-pioneer-voucher"
+        payload["teamOur"]["goldNum"] = 150
+        payload["robot"]["roles"] = []
+        payload["teamOur"]["roles"][2]["pos"] = {"x": 12, "y": 2}
+        payload["mapInfo"]["zones"] = [{
+            "pos": {"x": 12, "y": 3}, "neutralType": "weaponShop",
+        }]
+        payload["weaponShopList"] = [{
+            "name": "WeaponUpgradeVoucher2", "price": 150,
+        }]
+        for role in payload["teamOur"]["roles"]:
+            if role["roleType"] == "worker":
+                role["backPackCapability"] = 1
+                role["backpack"] = ["stone"]
+        engine = DecisionEngine()
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10011"]["action"],
+            "buy",
+        )
+
+        payload["roundNo"] = 11
+        payload["teamOur"]["goldNum"] = 0
+        payload["teamOur"]["roles"][2]["backpack"] = [
+            "WeaponUpgradeVoucher2"
+        ]
+        payload["lastRoundRoleActionResults"] = {"10011": True}
+        payload["teamOur"]["playerTasks"] = [{
+            "taskType": "synthetic",
+            "taskPosition": {"x": 13, "y": 5},
+            "coldDownRounds": 0,
+            "scoreReward": 10,
+            "goldReward": 10,
+            "isValid": True,
+            "timeoutRounds": 20,
+        }]
+        task_command = engine.decide(payload)["roleCommandMap"]["10011"]
+        self.assertIn(task_command["action"], ("move", "acceptTask"))
+        self.assertNotIn(task_command["action"], ("buy", "use"))
+
+        payload["roundNo"] = 12
+        payload["teamOur"]["playerTasks"] = []
+        payload["lastRoundRoleActionResults"] = {"10011": True}
+        used = False
+        saw_move = False
+        for round_no in range(12, 22):
+            payload["roundNo"] = round_no
+            resumed = engine.decide(payload)["roleCommandMap"]["10011"]
+            if resumed["action"] == "use":
+                self.assertEqual(resumed["name"], "WeaponUpgradeVoucher2")
+                used = True
+                break
+            self.assertEqual(resumed["action"], "move")
+            saw_move = True
+            payload["teamOur"]["roles"][2]["pos"] = resumed["targetPos"][0]
+            payload["lastRoundRoleActionResults"] = {"10011": True}
+        self.assertTrue(saw_move)
+        self.assertTrue(used)
+
     def test_third_weapon_can_create_a_bounded_pioneer_gunner_plan(self):
         # Break caught: the third tower exists but no third controller is assigned.
         payload = defense_payload(round_no=65)
