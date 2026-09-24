@@ -33,7 +33,279 @@ def seed_reserve(engine, payload):
     )
 
 
+def balanced_payload(*, health=1500, gold=100, items=(), round_no=1):
+    payload = base_payload(
+        round_no=round_no, worker_pos=(5, 2), gold=gold,
+        health=health, items=items,
+    )
+    payload["teamOur"]["teamId"] = "balanced-cash-investment"
+    payload["teamOur"]["roles"][2]["level"] = 2
+    payload["weaponShopList"].insert(
+        0, {"name": "WeaponUpgradeVoucher1", "price": 100},
+    )
+    return payload
+
+
 class BaseUpgradeTests(unittest.TestCase):
+    def test_new_cash_investment_balances_base_after_first_weapon_level(self):
+        # Break caught: the first eligible weapon voucher always precedes a
+        # fully funded base voucher after one weapon has advanced a level.
+        payload = balanced_payload()
+        response = DecisionEngine(clock=lambda: 0.0).decide(payload)
+        self.assertEqual(response["roleCommandMap"]["10010"], {
+            "action": "buy", "name": "StationUpgradeVoucher1", "num": 1,
+        })
+
+    def test_balanced_purchase_keeps_night_reserve_until_damage(self):
+        engine = DecisionEngine(clock=lambda: 0.0)
+        payload = balanced_payload()
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10010"]["name"],
+            "StationUpgradeVoucher1",
+        )
+        self.assertIsNotNone(engine.state.state.base_reserve)
+        payload["roundNo"] = 71
+        payload["teamOur"]["goldNum"] = 0
+        payload["teamOur"]["roles"][0]["backpack"] = ["StationUpgradeVoucher1"]
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 8, "y": 9}
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        held = engine.decide(payload)["roleCommandMap"].get("10010", {})
+        self.assertNotEqual(held.get("action"), "use")
+        payload["roundNo"] = 72
+        payload["teamOur"]["roles"][1]["health"] = 300
+        self.assertEqual(engine.decide(payload)["roleCommandMap"]["10010"], {
+            "action": "use", "name": "StationUpgradeVoucher1",
+            "targetPos": [{"x": 9, "y": 9}],
+        })
+
+    def test_balanced_purchase_uses_damaged_base_during_day(self):
+        engine = DecisionEngine(clock=lambda: 0.0)
+        payload = balanced_payload(health=1000)
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10010"]["name"],
+            "StationUpgradeVoucher1",
+        )
+        self.assertIsNone(engine.state.state.base_reserve)
+        payload["roundNo"] = 2
+        payload["teamOur"]["goldNum"] = 0
+        payload["teamOur"]["roles"][0]["backpack"] = ["StationUpgradeVoucher1"]
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 8, "y": 9}
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        self.assertEqual(engine.decide(payload)["roleCommandMap"]["10010"], {
+            "action": "use", "name": "StationUpgradeVoucher1",
+            "targetPos": [{"x": 9, "y": 9}],
+        })
+
+    def test_balanced_purchase_keeps_weapon_priority_until_weapon_leads(self):
+        payload = balanced_payload()
+        payload["teamOur"]["roles"][2]["level"] = 1
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(payload)
+            ["roleCommandMap"]["10010"]["name"],
+            "WeaponUpgradeVoucher1",
+        )
+        payload = balanced_payload(gold=150)
+        payload["teamOur"]["roles"][1].update(level=2, health=3000)
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher2", "price": 150},
+            {"name": "StationUpgradeVoucher2", "price": 150},
+        ]
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(payload)
+            ["roleCommandMap"]["10010"]["name"],
+            "WeaponUpgradeVoucher2",
+        )
+        payload["teamOur"]["roles"][1].update(level=3, health=4500)
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher2", "price": 150},
+        ]
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(payload)
+            ["roleCommandMap"]["10010"]["name"],
+            "WeaponUpgradeVoucher2",
+        )
+
+    def test_balanced_purchase_falls_back_on_price_and_cash(self):
+        payload = balanced_payload()
+        payload["weaponShopList"][1]["price"] = 101
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(payload)
+            ["roleCommandMap"]["10010"]["name"],
+            "WeaponUpgradeVoucher1",
+        )
+        payload = balanced_payload(gold=0, items=("copper",))
+        payload["vendorShopList"] = [{"name": "copper", "price": 100}]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        response = engine.decide(payload)["roleCommandMap"].get("10010", {})
+        self.assertNotEqual(response.get("name"), "StationUpgradeVoucher1")
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith(
+            "fund:WeaponUpgradeVoucher1:"
+        ))
+
+    def test_balanced_purchase_does_not_replace_cross_role_commitment(self):
+        payload = balanced_payload()
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 5, 1),
+        )
+        engine = DecisionEngine(clock=lambda: 0.0)
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(
+            10011, Pos(8, 8), "fund:WeaponUpgradeVoucher1:10020:10030", 70,
+        )
+        commands = engine.decide(payload)["roleCommandMap"].values()
+        self.assertFalse(any(
+            command.get("name") == "StationUpgradeVoucher1"
+            for command in commands
+        ))
+
+    def test_balanced_purchase_does_not_replace_held_voucher_or_medicine(self):
+        payload = balanced_payload()
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 8, 9, items=("WeaponUpgradeVoucher1",)),
+        )
+        commands = DecisionEngine(clock=lambda: 0.0).decide(payload)[
+            "roleCommandMap"
+        ].values()
+        self.assertFalse(any(
+            command.get("name") == "StationUpgradeVoucher1"
+            for command in commands
+        ))
+        payload = balanced_payload()
+        payload["teamOur"]["roles"][0]["health"] = 100
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(payload)
+            ["roleCommandMap"]["10010"]["name"],
+            "Medicine",
+        )
+
+    def test_balanced_purchase_leaves_cash_for_other_roles_urgent_medicine(self):
+        payload = balanced_payload()
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 5, 1, health=30),
+        )
+
+        commands = DecisionEngine(clock=lambda: 0.0).decide(payload)[
+            "roleCommandMap"
+        ]
+
+        self.assertFalse(any(
+            command.get("name") == "StationUpgradeVoucher1"
+            for command in commands.values()
+        ))
+
+    def test_balanced_purchase_needs_a_complete_route_and_return_margin(self):
+        payload = balanced_payload()
+        payload["teamOur"]["roles"].extend(
+            role(30000 + index, "wall", x, y, health=1000)
+            for index, (x, y) in enumerate((
+                (8, 9), (8, 10), (9, 8), (9, 10),
+                (10, 8), (10, 9), (10, 10),
+            ))
+        )
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(payload)
+            ["roleCommandMap"]["10010"]["name"],
+            "WeaponUpgradeVoucher1",
+        )
+        at_boundary = balanced_payload(round_no=58)
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(at_boundary)
+            ["roleCommandMap"]["10010"]["name"],
+            "StationUpgradeVoucher1",
+        )
+        after_boundary = balanced_payload(round_no=59)
+        self.assertEqual(
+            DecisionEngine(clock=lambda: 0.0).decide(after_boundary)
+            ["roleCommandMap"]["10010"]["name"],
+            "WeaponUpgradeVoucher1",
+        )
+        budget_unknown = balanced_payload()
+        command = DecisionEngine(
+            clock=lambda: 0.0, max_search_expansions=8,
+        ).decide(budget_unknown)["roleCommandMap"].get("10010", {})
+        self.assertNotEqual(command.get("name"), "StationUpgradeVoucher1")
+
+    def test_balanced_purchase_reserves_cash_during_route_for_other_worker(self):
+        payload = balanced_payload()
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 3, "y": 2}
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 5, 1),
+        )
+        engine = DecisionEngine(clock=lambda: 0.0)
+        commands = engine.decide(payload)["roleCommandMap"]
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith(
+            "fund:StationUpgradeVoucher1:"
+        ))
+        self.assertFalse(any(
+            command.get("action") == "buy" for command in commands.values()
+        ))
+
+    def test_balanced_base_reserve_is_not_displaced_by_other_new_funding(self):
+        # Break caught: another worker's sale-funded weapon plan can prevent
+        # the newly bought full-health base voucher from being reserved.
+        payload = balanced_payload()
+        payload["teamOur"]["roles"].insert(
+            1, role(10011, "worker", 3, 2, items=("copper",)),
+        )
+        engine = DecisionEngine(clock=lambda: 0.0)
+
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10010"].get("name"),
+                         "StationUpgradeVoucher1")
+        self.assertIsNotNone(engine.state.state.base_reserve)
+
+    def test_balanced_purchase_uses_current_price_after_shop_change(self):
+        engine = DecisionEngine(clock=lambda: 0.0)
+        payload = balanced_payload()
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 3, "y": 2}
+        self.assertEqual(
+            engine.decide(payload)["roleCommandMap"]["10010"]["action"],
+            "move",
+        )
+        payload["roundNo"] = 2
+        payload["teamOur"]["roles"][0]["pos"] = {"x": 4, "y": 1}
+        payload["weaponShopList"][1]["price"] = 101
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        command = engine.decide(payload)["roleCommandMap"].get("10010", {})
+        self.assertNotEqual(command.get("name"), "StationUpgradeVoucher1")
+
+    def test_balanced_purchase_keeps_capacity_towers_and_urgent_wall(self):
+        full = balanced_payload(items=("copper",) * 100)
+        commands = DecisionEngine(clock=lambda: 0.0).decide(full)[
+            "roleCommandMap"
+        ].values()
+        self.assertFalse(any(
+            command.get("name") == "StationUpgradeVoucher1"
+            for command in commands
+        ))
+        incomplete = balanced_payload()
+        incomplete["teamOur"]["roles"].pop()
+        commands = DecisionEngine(clock=lambda: 0.0).decide(incomplete)[
+            "roleCommandMap"
+        ].values()
+        self.assertFalse(any(
+            command.get("name") == "StationUpgradeVoucher1"
+            for command in commands
+        ))
+        urgent = balanced_payload()
+        urgent["teamOur"]["roles"].append(
+            role(30000, "wall", 7, 9, health=5),
+        )
+        urgent["robot"]["roles"] = [{
+            "id": 50000, "roleType": "smallRobot",
+            "pos": {"x": 7, "y": 8}, "health": 30,
+            "targetTeam": "challenger",
+        }]
+        commands = DecisionEngine(clock=lambda: 0.0).decide(urgent)[
+            "roleCommandMap"
+        ].values()
+        self.assertFalse(any(
+            command.get("name") == "StationUpgradeVoucher1"
+            for command in commands
+        ))
+
     def test_day_damage_releases_only_the_station_reserve_plan(self):
         payload = base_payload(
             round_no=131, worker_pos=(8, 9), gold=0, health=300,

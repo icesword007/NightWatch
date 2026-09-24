@@ -649,51 +649,82 @@ def propose_defense(
     staffed_weapons: set[int] = set(reserved_weapon_ids)
     projected_damage: dict[int, int] = {}
 
+    if not turn.is_day:
+        failed_targets: set[int] = set()
+        weapons = turn.weapons()
+        while clock() < deadline:
+            fireable = {
+                weapon.unit_id for weapon in weapons
+                if weapon.unit_id not in staffed_weapons | failed_targets
+                and weapon.cooldown == 0
+                and any(
+                    robot.health > 0
+                    and distance(weapon.pos, robot.pos) <= weapon.range_of_attack()
+                    for robot in turn.robots
+                )
+            }
+            if not fireable:
+                break
+            adjacent = _adjacent_assignments(
+                turn,
+                used_roles | set(unavailable_role_ids),
+                state,
+                frozenset(weapon.unit_id for weapon in weapons
+                          if weapon.unit_id not in fireable),
+            )
+            choice = next(
+                ((weapon, adjacent[weapon.unit_id]) for weapon in weapons
+                 if weapon.unit_id in fireable and weapon.unit_id in adjacent),
+                None,
+            )
+            if choice is None:
+                break
+            weapon, controller = choice
+            target_count = 1 if weapon.kind == "railgun" else max(weapon.level, 1)
+            if weapon.kind == "rocket":
+                rocket_targets = _select_rocket_targets(
+                    turn, weapon, target_count, projected_damage,
+                    clock=clock, deadline=deadline, state=state,
+                )
+                if not rocket_targets:
+                    failed_targets.add(weapon.unit_id)
+                    continue
+                targets = [target.pos for target in rocket_targets]
+            else:
+                target = _select_target(turn, weapon, projected_damage)
+                if target is None:
+                    failed_targets.add(weapon.unit_id)
+                    continue
+                targets = [target.pos for _ in range(target_count)]
+            candidates.append(PlannedAction(
+                ActionProposal(
+                    command_owner_id=weapon.unit_id,
+                    actor_id=controller.unit_id,
+                    command={
+                        "action": "attack",
+                        "controllerId": str(controller.unit_id),
+                        "targetPos": [pos.dump() for pos in targets],
+                    },
+                ),
+                controller.pos,
+                f"gunner:{weapon.unit_id}",
+            ))
+            used_roles.add(controller.unit_id)
+            staffed_weapons.add(weapon.unit_id)
+            if weapon.kind != "rocket":
+                _apply_projected_damage(
+                    turn, weapon, target, target_count, projected_damage,
+                )
+
     adjacent = _adjacent_assignments(
         turn,
         used_roles | set(unavailable_role_ids),
         state,
-        reserved_weapon_ids,
+        frozenset(staffed_weapons),
     )
-    for weapon in turn.weapons():
-        controller = adjacent.get(weapon.unit_id)
-        if controller is None:
-            continue
+    for weapon_id, controller in adjacent.items():
         used_roles.add(controller.unit_id)
-        staffed_weapons.add(weapon.unit_id)
-        if turn.is_day or weapon.cooldown > 0:
-            continue
-        target_count = 1 if weapon.kind == "railgun" else max(weapon.level, 1)
-        if weapon.kind == "rocket":
-            rocket_targets = _select_rocket_targets(
-                turn, weapon, target_count, projected_damage,
-                clock=clock, deadline=deadline, state=state,
-            )
-            if not rocket_targets:
-                continue
-            targets = [target.pos for target in rocket_targets]
-        else:
-            target = _select_target(turn, weapon, projected_damage)
-            if target is None:
-                continue
-            targets = [target.pos for _ in range(target_count)]
-        candidates.append(PlannedAction(
-            ActionProposal(
-                command_owner_id=weapon.unit_id,
-                actor_id=controller.unit_id,
-                command={
-                    "action": "attack",
-                    "controllerId": str(controller.unit_id),
-                    "targetPos": [pos.dump() for pos in targets],
-                },
-            ),
-            controller.pos,
-            f"gunner:{weapon.unit_id}",
-        ))
-        if weapon.kind != "rocket":
-            _apply_projected_damage(
-                turn, weapon, target, target_count, projected_damage,
-            )
+        staffed_weapons.add(weapon_id)
 
     if clock() >= deadline:
         return tuple(candidates)

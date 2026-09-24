@@ -808,6 +808,7 @@ def _propose_economy(
                 check_funding=not funding_rechecked,
                 night_cleared=night_cleared,
                 allow_procurement_batch=not batch_invalidated,
+                investment_state=state if current_plan is None else None,
             )
         if candidate is not None and worker.unit_id in joint_cancellations:
             diagnostic = dict(candidate.diagnostic or {})
@@ -841,6 +842,7 @@ def _propose_economy(
                 item = candidate.plan_reason.split(":", 2)[1]
                 if item.startswith((
                     "WallUpgradeVoucher", "WeaponUpgradeVoucher",
+                    "StationUpgradeVoucher",
                 )):
                     price = turn.weapon_prices.get(item)
                     if price is not None:
@@ -968,6 +970,15 @@ def reserve_purchase_candidate(turn: Turn, state: SessionState,
                                candidates: tuple[PlannedAction, ...],
                                unavailable_role_ids: frozenset[int]) -> tuple[PlannedAction, ...]:
     station = turn.station()
+    base_item = (
+        f"StationUpgradeVoucher{station.level}"
+        if station is not None else None
+    )
+    base_index = next((
+        index for index, candidate in enumerate(candidates)
+        if base_item is not None and candidate.plan_reason is not None
+        and candidate.plan_reason.startswith(f"fund:{base_item}:")
+    ), len(candidates))
     reason = None
     if not turn.is_day:
         reason = "night"
@@ -994,7 +1005,7 @@ def reserve_purchase_candidate(turn: Turn, state: SessionState,
         candidate.plan_reason and candidate.plan_reason.startswith("fund:")
         and not candidate.plan_reason.startswith(
             f"fund:StationUpgradeVoucher{station.level}:"
-        ) for candidate in candidates
+        ) for candidate in candidates[:base_index]
     ):
         reason = "other_funding_priority"
     if reason is not None:
@@ -2804,10 +2815,18 @@ def _trade_or_mine(
     check_funding: bool = True,
     night_cleared: bool = False,
     allow_procurement_batch: bool = True,
+    investment_state: SessionState | None = None,
 ) -> PlannedAction | None:
     minerals = Counter(item for item in worker.backpack if item in MINERALS)
     vendors = turn.zones_of("vendor")
     if check_funding:
+        if investment_state is not None:
+            balanced = _balanced_base_purchase(
+                turn, investment_state, worker, available_gold,
+                clock, deadline, max_expansions,
+            )
+            if balanced is not None:
+                return balanced
         candidate = _single_funding_action(
             turn, worker, available_gold, clock, deadline, max_expansions,
             allow_procurement_batch=allow_procurement_batch,
@@ -2888,6 +2907,79 @@ def _trade_or_mine(
         max_expansions,
         excluded_targets=failed_mines,
     )
+
+
+def _balanced_base_purchase(
+    turn: Turn,
+    state: SessionState,
+    worker: Unit,
+    available_gold: int,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    station = turn.station()
+    if (
+        not turn.is_day or station is None or station.level not in (1, 2)
+        or len(turn.weapons()) != MAX_WEAPONS
+        or max(weapon.level for weapon in turn.weapons()) <= station.level
+        or worker.backpack_full or state.base_reserve is not None
+        or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
+        or state.base_blocked_day == (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+        or any(plan.reason.startswith(("fund:", "batch:", "use:", "shop:"))
+               for plan in state.plans.values())
+        or any(item.startswith(INVESTMENT_ITEM_PREFIXES)
+               for role in turn.controllable() for item in role.backpack)
+        or (
+            "Medicine" in turn.weapon_prices
+            and (
+                worker.health < _max_role_health(worker)
+                or any(role.health <= EMERGENCY_MEDICINE_HEALTH
+                       for role in turn.controllable())
+            )
+        )
+        or any(_wall_repair_urgent(turn, wall) for wall in turn.walls())
+    ):
+        return None
+    base_item = f"StationUpgradeVoucher{station.level}"
+    purchases = _purchase_candidates(turn, worker)
+    base_price = turn.weapon_prices.get(base_item)
+    if base_item not in purchases or base_price is None or base_price > available_gold:
+        return None
+    base_route = _purchase_route(
+        turn, worker, base_item, clock, deadline, max_expansions,
+        preferred_use_target_id=station.unit_id,
+    )
+    if (
+        base_route is None
+        or base_route.rounds + DAY_WORK_RETURN_MARGIN > turn.rounds_until_night
+    ):
+        return None
+    for item in purchases:
+        if not item.startswith("WeaponUpgradeVoucher"):
+            continue
+        price = turn.weapon_prices.get(item)
+        if price is None or price > available_gold:
+            continue
+        route = _purchase_route(
+            turn, worker, item, clock, deadline, max_expansions,
+        )
+        if (
+            route is None
+            or route.rounds + DAY_WORK_RETURN_MARGIN > turn.rounds_until_night
+        ):
+            continue
+        context = _ROUTE_SEARCH_CONTEXT.get()
+        if context is not None and context.truncated_reason is not None:
+            return None
+        return _funding_action(
+            turn, worker, base_item,
+            turn.round_no + turn.rounds_until_night - 1,
+            clock, deadline, max_expansions,
+            preferred_use_target_id=station.unit_id,
+            verified_route=base_route,
+        )
+    return None
 
 
 def daytime_liquidation_actions(
