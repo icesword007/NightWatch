@@ -3,6 +3,7 @@ import inspect
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent.actions import ActionAllocator, ActionProposal, PlannedAction
 from agent.brain import DecisionEngine
@@ -73,6 +74,23 @@ def defense_payload(*, round_no=71):
     return payload
 
 
+def shared_rocket_payload(*, workers=((10010, 6, 8),),
+                          cooldowns=(2, 0, 0), round_no=71):
+    payload = defense_payload(round_no=round_no)
+    payload["teamOur"]["roles"] = [
+        *(unit(role_id, "worker", x, y) for role_id, x, y in workers),
+        unit(10013, "station", 8, 9, health=1500),
+        unit(10020, "rocket", 7, 8, health=1000, cooldown=cooldowns[0]),
+        unit(10030, "rocket", 7, 9, health=1000, cooldown=cooldowns[1]),
+        unit(10040, "rocket", 7, 7, health=1000, cooldown=cooldowns[2]),
+    ]
+    payload["robot"]["roles"] = [
+        robot(30001, "smallRobot", 7, 5, 50),
+        robot(30002, "smallRobot", 8, 5, 50),
+    ]
+    return payload
+
+
 def long_day_work_payload(*, round_no=10, vendor=(34, 14)):
     payload = defense_payload(round_no=round_no)
     payload["mapInfo"].update({
@@ -114,6 +132,145 @@ def proposals(payload):
 
 
 class DefenseTests(unittest.TestCase):
+    def test_shared_gunners_never_double_use_a_role(self):
+        for workers, expected in (
+            ((), set()),
+            (((10010, 6, 8),), {"10020"}),
+            (((10010, 6, 8), (10012, 6, 9)), {"10020", "10030"}),
+            (((10010, 6, 8), (10012, 6, 9), (10011, 6, 7)),
+             {"10020", "10030", "10040"}),
+        ):
+            with self.subTest(workers=workers):
+                response = DecisionEngine(clock=lambda: 0.0).decide(
+                    shared_rocket_payload(workers=workers, cooldowns=(0, 0, 0)),
+                )
+                attacks = {
+                    weapon_id: command for weapon_id, command in
+                    response["roleCommandMap"].items()
+                    if command["action"] == "attack"
+                }
+                self.assertEqual(set(attacks), expected)
+                self.assertEqual(len({
+                    command["controllerId"] for command in attacks.values()
+                }), len(attacks))
+
+    def test_shared_gunner_cannot_fire_all_cooling_or_targetless_towers(self):
+        for cooldowns, no_targets in (((2, 2, 2), False), ((0, 0, 0), True)):
+            with self.subTest(cooldowns=cooldowns, no_targets=no_targets):
+                payload = shared_rocket_payload(cooldowns=cooldowns)
+                if no_targets:
+                    payload["robot"]["roles"] = []
+                response = DecisionEngine(clock=lambda: 0.0).decide(payload)
+                self.assertFalse(any(
+                    command["action"] == "attack"
+                    for command in response["roleCommandMap"].values()
+                ))
+
+    def test_shared_gunner_prefers_in_range_tower_even_with_higher_id(self):
+        payload = shared_rocket_payload(cooldowns=(0, 0, 0))
+        for role in payload["teamOur"]["roles"]:
+            if role["id"] == 10020:
+                role["attackRange"] = 1
+        response = DecisionEngine(clock=lambda: 0.0).decide(payload)
+        attacks = {
+            weapon_id for weapon_id, command in response["roleCommandMap"].items()
+            if command["action"] == "attack"
+        }
+        self.assertEqual(attacks, {"10030"})
+
+    def test_cooling_old_plan_and_role_order_do_not_lock_shared_gunner(self):
+        payload = shared_rocket_payload()
+        payload["teamOur"]["roles"].reverse()
+        engine = DecisionEngine(clock=lambda: 0.0)
+        turn = Turn.load(payload)
+        engine.state.observe(turn, payload, request_fingerprint(payload))
+        engine.state.set_plan(10010, Pos(6, 8), "gunner:10020", 80)
+
+        response = engine.decide(payload)
+
+        self.assertEqual(
+            {key for key, value in response["roleCommandMap"].items()
+             if value["action"] == "attack"},
+            {"10030"},
+        )
+
+    def test_shared_gunner_returns_without_attack_at_deadline(self):
+        self.assertFalse(any(
+            item.proposal.command["action"] == "attack"
+            for item in importlib.import_module("agent.defense").propose_defense(
+                Turn.load(shared_rocket_payload(cooldowns=(0, 0, 0))),
+                state_for(shared_rocket_payload(cooldowns=(0, 0, 0))),
+                clock=lambda: 1.0,
+                deadline=1.0,
+                max_expansions=64,
+            )
+        ))
+
+    def test_target_selection_failure_reassigns_shared_gunner(self):
+        payload = shared_rocket_payload(cooldowns=(0, 0, 0))
+        defense = importlib.import_module("agent.defense")
+        select = defense._select_rocket_targets
+
+        def fail_first(turn, weapon, count, projected_damage, **kwargs):
+            if weapon.unit_id == 10020:
+                return ()
+            return select(turn, weapon, count, projected_damage, **kwargs)
+
+        with patch.object(defense, "_select_rocket_targets", side_effect=fail_first):
+            response = DecisionEngine(clock=lambda: 0.0).decide(payload)
+        attacks = {
+            weapon_id for weapon_id, command in response["roleCommandMap"].items()
+            if command["action"] == "attack"
+        }
+        self.assertEqual(attacks, {"10030"})
+
+    def test_shared_gunner_rotates_after_cooldown_feedback(self):
+        engine = DecisionEngine(clock=lambda: 0.0)
+        first = shared_rocket_payload(cooldowns=(0, 2, 2))
+        response = engine.decide(first)
+        self.assertEqual(
+            {key for key, value in response["roleCommandMap"].items()
+             if value["action"] == "attack"},
+            {"10020"},
+        )
+        next_round = shared_rocket_payload(cooldowns=(2, 0, 2), round_no=72)
+        next_round["lastRoundRoleActionResults"] = {"10020": True}
+        response = engine.decide(next_round)
+        self.assertEqual(
+            {key for key, value in response["roleCommandMap"].items()
+             if value["action"] == "attack"},
+            {"10030"},
+        )
+
+    def test_one_shared_gunner_fires_ready_rocket_not_cooling_rocket(self):
+        # Break caught: a cooling tower wins the one-role adjacency match.
+        response = DecisionEngine(clock=lambda: 0.0).decide(
+            shared_rocket_payload(),
+        )
+        attacks = {
+            weapon_id: command for weapon_id, command in
+            response["roleCommandMap"].items()
+            if command["action"] == "attack"
+        }
+        self.assertEqual(set(attacks), {"10030"})
+        self.assertEqual(attacks["10030"]["controllerId"], "10010")
+
+    def test_two_shared_gunners_cover_both_ready_rockets(self):
+        # Break caught: maximum staffing counts a cooling rocket as useful.
+        response = DecisionEngine(clock=lambda: 0.0).decide(
+            shared_rocket_payload(workers=((10010, 6, 8), (10012, 6, 9))),
+        )
+        attacks = {
+            weapon_id: command for weapon_id, command in
+            response["roleCommandMap"].items()
+            if command["action"] == "attack"
+        }
+        self.assertEqual(set(attacks), {"10030", "10040"})
+        self.assertEqual(
+            {command["controllerId"] for command in attacks.values()},
+            {"10010", "10012"},
+        )
+
     def test_long_legal_sale_keeps_exact_post_return_route(self):
         payload = long_day_work_payload()
         turn = Turn.load(payload)
