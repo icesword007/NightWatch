@@ -4693,15 +4693,42 @@ def _post_routes(
     preferred_post_id: int | None = None,
 ) -> tuple[tuple[Unit, Pos, int], ...]:
     result = []
-    for weapon in turn.weapons():
+    weapons = turn.weapons()
+    bits = {weapon.unit_id: 1 << index for index, weapon in enumerate(weapons)}
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    other_posts = []
+    for role in turn.controllable():
+        if role.unit_id == worker.unit_id:
+            continue
+        options = tuple(
+            weapon.unit_id for weapon in weapons
+            if distance(role.pos, weapon.pos) == 1
+        )
+        plan = context.state.plans.get(role.unit_id) if (
+            context is not None and context.state is not None
+        ) else None
+        if plan is not None and plan.reason.startswith("gunner:"):
+            bound = plan.reason.split(":", 1)[1]
+            if bound.isdecimal() and int(bound) in options:
+                options = (int(bound),)
+        if options:
+            other_posts.append(options)
+
+    def staffed_count(excluded_id: int | None) -> int:
+        masks = {0}
+        for options in other_posts:
+            masks = masks | {
+                mask | bits[weapon_id]
+                for mask in masks for weapon_id in options
+                if weapon_id != excluded_id and not mask & bits[weapon_id]
+            }
+        return max(mask.bit_count() for mask in masks)
+
+    staffed_without_holder = staffed_count(None)
+    for weapon in weapons:
         if preferred_post_id is not None and weapon.unit_id != preferred_post_id:
             continue
-        staffed_by_other = any(
-            role.unit_id != worker.unit_id
-            and distance(role.pos, weapon.pos) == 1
-            for role in turn.controllable()
-        )
-        if staffed_by_other:
+        if staffed_count(weapon.unit_id) < staffed_without_holder:
             continue
         for stand, cost in _routes_to_adjacent(
             turn, worker, weapon.pos, clock, deadline, max_expansions,

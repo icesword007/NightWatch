@@ -5053,6 +5053,86 @@ class EconomyTests(unittest.TestCase):
         )[0]
         self.assertEqual(fixer_action.proposal.command["name"], "WallFixer")
 
+    def test_held_fixer_uses_free_stand_beside_already_staffed_tower(self):
+        # Break caught: two flexible gunners appeared to staff all three towers.
+        payload = economy_payload(
+            round_no=302, worker_pos=(5, 2), items=("WallFixer",), gold=4,
+        )
+        payload["teamOur"]["teamId"] = "held-fixer-staffed-towers"
+        payload["teamOur"]["roles"] = [
+            role(10010, "worker", 5, 2, items=("WallFixer",)),
+            role(10011, "worker", 7, 3),
+            role(10012, "pioneer", 7, 5),
+            role(10013, "station", 10, 10, health=1500),
+            role(10020, "rocket", 8, 2, health=1000),
+            role(10030, "rocket", 8, 4, health=1000),
+            role(10040, "rocket", 8, 6, health=1000),
+            role(10050, "wall", 4, 4, health=100),
+        ]
+        payload["mapInfo"]["zones"] = []
+        payload["weaponShopList"] = []
+        payload["vendorShopList"] = []
+        engine = DecisionEngine(clock=lambda: 0.0)
+
+        command = engine.decide(payload)["roleCommandMap"].get("10010")
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command["action"], "move")
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith(
+            "use:WallFixer:10050"
+        ))
+
+    def test_held_fixer_does_not_claim_post_when_others_cover_all_towers(self):
+        payload = economy_payload(
+            round_no=302, worker_pos=(5, 2), items=("WallFixer",),
+        )
+        payload["teamOur"]["teamId"] = "held-fixer-no-spare-tower"
+        payload["teamOur"]["roles"] = [
+            role(10010, "worker", 5, 2, items=("WallFixer",)),
+            role(10011, "worker", 7, 1),
+            role(10012, "worker", 7, 3),
+            role(10014, "pioneer", 7, 5),
+            role(10013, "station", 10, 10, health=1500),
+            role(10020, "rocket", 8, 2, health=1000),
+            role(10030, "rocket", 8, 4, health=1000),
+            role(10040, "rocket", 8, 6, health=1000),
+            role(10050, "wall", 4, 4, health=100),
+        ]
+        turn = Turn.load(payload)
+        self.assertEqual(economy._post_routes(
+            turn, turn.unit(10010), lambda: 0.0, 1.0, 256,
+        ), ())
+
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(payload)
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("use:WallFixer"))
+
+    def test_held_fixer_does_not_start_route_too_close_to_dusk(self):
+        payload = economy_payload(
+            round_no=68, worker_pos=(5, 2), items=("WallFixer",),
+        )
+        payload["teamOur"]["teamId"] = "held-fixer-dusk-window"
+        payload["teamOur"]["roles"] = [
+            role(10010, "worker", 5, 2, items=("WallFixer",)),
+            role(10011, "worker", 7, 3),
+            role(10012, "pioneer", 7, 5),
+            role(10013, "station", 10, 10, health=1500),
+            role(10020, "rocket", 8, 2, health=1000),
+            role(10030, "rocket", 8, 4, health=1000),
+            role(10040, "rocket", 8, 6, health=1000),
+            role(10050, "wall", 4, 4, health=100),
+        ]
+        payload["mapInfo"]["zones"] = []
+        payload["weaponShopList"] = []
+        payload["vendorShopList"] = []
+        engine = DecisionEngine(clock=lambda: 0.0)
+
+        engine.decide(payload)
+
+        plan = engine.state.state.plans.get(10010)
+        self.assertTrue(plan is None or not plan.reason.startswith("use:WallFixer"))
+
     def test_emergency_medicine_purchase_remains_eligible(self):
         payload = economy_payload(round_no=10, worker_pos=(1, 1), gold=10)
         payload["teamOur"]["roles"][0]["health"] = 40
