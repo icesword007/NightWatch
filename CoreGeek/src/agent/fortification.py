@@ -10,6 +10,7 @@ from .layout import (
     plan_defense_layout,
 )
 from .protocol import (
+    DAY_ROUNDS,
     ROUNDS_PER_DAY,
     STATION,
     Pos,
@@ -19,7 +20,7 @@ from .protocol import (
 
 MAX_WALL_TARGETS = MAX_LAYOUT_WALLS
 UNKNOWN_CAPACITY_WALL_BATCH = 2
-MAX_TEMPORARY_RECHECKS = 2
+QUIET_FLANK_MIN_HEALTH_PERCENT = 90
 
 
 class _PlanningBudgetExhausted(Exception):
@@ -54,6 +55,52 @@ def ordered_wall_targets(
 ) -> tuple[Pos, ...]:
     del candidates
     return plan_defense_layout(turn).wall_targets
+
+
+def low_pressure_flank_wall(turn: Turn, state: Any, pos: Pos) -> bool:
+    targets = state.layout_wall_targets
+    quiet = state.wall_quiet_nights.get(pos)
+    current_day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+    if quiet is None or quiet[0] != current_day - 1:
+        return False
+    night_start = (quiet[0] - 1) * ROUNDS_PER_DAY + DAY_ROUNDS + 1
+    if (
+        state.wall_observation_streak < turn.round_no - night_start + 1
+        or not state.wall_line_ever_complete
+        or len(targets) < 2
+    ):
+        return False
+    first, second = targets[:2]
+    front = (
+        tuple(target for target in targets if target.x == first.x)
+        if first.x == second.x else
+        tuple(target for target in targets if target.y == first.y)
+    )
+    if pos not in targets or pos in front:
+        return False
+    walls = {wall.pos: wall for wall in turn.walls()}
+    wall = walls.get(pos)
+    _, observed_id, observed_level, observed_health = quiet
+    if (
+        observed_health * 100
+        < QUIET_FLANK_MIN_HEALTH_PERCENT * (500 + 500 * observed_level)
+        or wall is not None and (
+            wall.unit_id != observed_id or wall.level != observed_level
+            or wall.health * 100
+            < QUIET_FLANK_MIN_HEALTH_PERCENT * (500 + 500 * wall.level)
+        )
+    ):
+        return False
+    return (
+        all(target in walls for target in front)
+        and not state.wall_recent_damage.get(pos)
+        and len(state.wall_breaches.get(pos, ())) < 2
+        and not any(
+            robot.target_team == turn.team_type
+            and distance(robot.pos, pos) <= 3
+            for robot in turn.robots
+        )
+    )
 
 
 def safe_wall_targets(
@@ -305,21 +352,39 @@ def prepare_fortification(
         target for target in (
             tuple(
                 target for target in state.fortification_targets
+                if target in state.fortification_retryable_builds
+            )
+            + tuple(
+                target for target in state.fortification_targets
                 if target in state.fortification_recovery_targets
+                and target not in state.fortification_retryable_builds
             )
             + tuple(
                 target for target in state.fortification_targets
                 if target not in state.fortification_recovery_targets
+                and target not in state.fortification_retryable_builds
             )
         )
         if target not in state.fortification_completed
         and target not in state.fortification_failed
+        and not low_pressure_flank_wall(turn, state, target)
         and state.fortification_attempt_days.get(target)
         != (turn.round_no - 1) // ROUNDS_PER_DAY + 1
     )
     if not remaining_targets:
-        state.fortification_phase = "complete"
-        state.fortification_skip_reason = None
+        blocked_build = bool(state.fortification_blocked_builds)
+        deferred_flank = any(
+            target not in occupied_walls
+            and low_pressure_flank_wall(turn, state, target)
+            for target in state.fortification_targets
+        )
+        state.fortification_phase = (
+            "waiting" if blocked_build or deferred_flank else "complete"
+        )
+        state.fortification_skip_reason = (
+            "target_temporarily_blocked" if blocked_build else
+            "low_pressure_flank_deferred" if deferred_flank else None
+        )
         return None
     builder = turn.unit(state.fortification_builder_id) if (
         state.fortification_builder_id is not None
@@ -364,7 +429,10 @@ def prepare_fortification(
     )
     if (
         batch_targets
-        and remaining_targets[0] in state.fortification_recovery_targets
+        and remaining_targets[0] in (
+            state.fortification_recovery_targets
+            | state.fortification_retryable_builds
+        )
         and remaining_targets[0] not in batch_targets
     ):
         batch_targets = ()
@@ -629,7 +697,7 @@ def _current_safe_prefix(
             clock=clock, deadline=deadline,
         )
         deferred = deferred_updates.get(target)
-        if deferred is not None and deferred[0] == validation_signature:
+        if deferred == validation_signature:
             continue
         if target in candidates:
             trial_zones = dict(projected_zones)
@@ -645,17 +713,8 @@ def _current_safe_prefix(
             turn, target, candidates, clock=clock, deadline=deadline,
         )
         if blocker_signature is not None:
-            if deferred is None:
-                attempts = 1
-            elif deferred[1] == blocker_signature:
-                attempts = deferred[2]
-            else:
-                attempts = deferred[2] + 1
-            deferred_updates[target] = (
-                validation_signature, blocker_signature, attempts,
-            )
-            if attempts <= MAX_TEMPORARY_RECHECKS:
-                continue
+            deferred_updates[target] = validation_signature
+            continue
         deferred_updates.pop(target, None)
         failed_updates.add(target)
     state.fortification_deferred = deferred_updates

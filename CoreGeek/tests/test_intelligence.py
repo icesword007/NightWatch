@@ -1,17 +1,27 @@
 import copy
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from agent import intelligence
+from agent import economy
 from agent import server as server_module
 from agent.brain import DecisionEngine
-from agent.protocol import Turn
+from agent.protocol import Pos, Turn
 from agent.state import MAX_NEWS_DAY_RECORDS, StateStore, request_fingerprint
 from agent.treasure import evaluate_treasure_candidates
+from tests.test_economy import economy_payload, with_completed_wall_line
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "s0_request.json"
+OFFICIAL_COLLAPSE_NEWS = (
+    "矿业管理局紧急通报：北部铁矿区昨夜发生严重矿井塌方事故，主巷道结构受损，"
+    "部分作业面被掩埋。安全监察部门已下达通知：为保障矿工安全，矿区将于明日全面停工，"
+    "进行巷道加固和主矿脉修复。矿区领班表示：'今天浅层矿面还能抢采一些，"
+    "明天的全面停工不可避免。'工程队评估：类似规模的塌方事故，"
+    "修复工程通常需要2天左右才能完成并恢复开采。"
+)
 
 
 def payload(round_no=1, *, team_id="intelligence-tests"):
@@ -59,6 +69,34 @@ def cited(source, value, excerpt="western market may close"):
     }
 
 
+def economic_reply(request, resource, effect, start, end, basis="absolute_day"):
+    source = request.sources[0]
+    citation = {"sourceId": source.source_id, "excerpt": source.text}
+    return valid_response(request, candidates=[{
+        "type": "news", "interpretation": "Economic window",
+        "citations": [citation], "missingConditions": [], "conflicts": [],
+        "economicEvents": [{
+            "resource": resource, "effect": effect,
+            "startDay": start, "endDay": end, "timeBasis": basis,
+            "citations": [citation],
+        }],
+    }])
+
+
+def collapse_reply(request):
+    source = request.sources[0]
+    citation = {"sourceId": source.source_id, "excerpt": source.text}
+    return valid_response(request, candidates=[{
+        "type": "news", "interpretation": "Iron mine supply window",
+        "citations": [citation], "missingConditions": [], "conflicts": [],
+        "economicEvents": [{
+            "resource": "iron", "effect": effect,
+            "startDay": 2, "endDay": 3,
+            "timeBasis": "relative_publication", "citations": [citation],
+        } for effect in ("mining_halt", "price_rise")],
+    }])
+
+
 def task_payload(round_no=1, *, phase=""):
     value = payload(round_no, team_id="intelligence-task-priority")
     value["mapInfo"].update({
@@ -95,6 +133,471 @@ def task_payload(round_no=1, *, phase=""):
 
 
 class IntelligenceTests(unittest.TestCase):
+    def test_official_collapse_news_changes_real_mining_and_sale_decisions(self):
+        mine_first = with_completed_wall_line(economy_payload(gold=100))
+        mine_first["teamOur"]["teamId"] = "official-collapse-mine"
+        mine_first["mapInfo"]["zones"].append({
+            "pos": {"x": 3, "y": 2}, "neutralType": "iron",
+        })
+        mine_first["vendorShopList"].append({"name": "iron", "price": 200})
+        mine_first["weaponShopList"] = []
+        mine_first["worldNews"] = {
+            "officialNews": OFFICIAL_COLLAPSE_NEWS, "folkLegends": "",
+        }
+        mining = DecisionEngine(clock=lambda: 0.0)
+        mining.decide(mine_first)
+        mine_pending = mining.state.state.pending_news_request
+        mine_second = copy.deepcopy(mine_first)
+        mine_second["roundNo"] = 2
+        mine_second["llmResp"] = collapse_reply(mine_pending)
+        today = mining.decide(mine_second)["roleCommandMap"]["10010"]
+        events = mining.state.state.news_candidates[-1].economic_events
+        self.assertEqual([(event.effect, event.effect_basis) for event in events], [
+            ("mining_halt", "quoted_news"),
+            ("price_rise", "taskbook_5_1_collapse_supply"),
+        ])
+        self.assertEqual((today["action"], today["targetPos"]),
+                         ("collect", [{"x": 3, "y": 2}]))
+        mine_active = copy.deepcopy(mine_second)
+        mine_active["roundNo"] = 131
+        mine_active.pop("llmResp")
+        halted = mining.decide(mine_active)["roleCommandMap"]["10010"]
+        self.assertFalse(halted["action"] == "collect" and
+                         halted.get("targetPos") == [{"x": 3, "y": 2}])
+
+        hold_first = with_completed_wall_line(economy_payload(
+            worker_pos=(3, 2), items=("iron",), gold=100,
+        ))
+        hold_first["teamOur"]["teamId"] = "official-collapse-hold"
+        hold_first["weaponShopList"] = []
+        hold_first["vendorShopList"] = [{"name": "iron", "price": 100}]
+        hold_first["worldNews"] = {
+            "officialNews": OFFICIAL_COLLAPSE_NEWS, "folkLegends": "",
+        }
+        holding = DecisionEngine(clock=lambda: 0.0)
+        holding.decide(hold_first)
+        hold_pending = holding.state.state.pending_news_request
+        hold_second = copy.deepcopy(hold_first)
+        hold_second["roundNo"] = 2
+        hold_second["llmResp"] = collapse_reply(hold_pending)
+        self.assertNotEqual(holding.decide(hold_second)["roleCommandMap"]["10010"]["action"],
+                            "sell")
+        risen = copy.deepcopy(hold_second)
+        risen["roundNo"] = 131
+        risen.pop("llmResp")
+        risen["vendorShopList"][0]["price"] = 101
+        self.assertEqual(holding.decide(risen)["roleCommandMap"]["10010"]["action"],
+                         "sell")
+
+    def test_collapse_inference_rejects_negation_missing_duration_and_other_disaster(self):
+        variants = (
+            "北部铁矿区矿井塌方，矿区明日不会全面停工，修复工程通常需要2天左右才能恢复开采。",
+            "北部铁矿区矿井塌方，矿区明日全面停工，修复工程日期尚未确定，恢复开采待通知。",
+            "北部铁矿区矿井塌方，矿区明日全面停工，修复工程通常需要2天左右才能恢复开采，但铁价不会上涨。",
+            "北部铁矿区附近仓库火灾，矿区明日全面停工，修复工程通常需要2天左右才能恢复开采。",
+            "北部铁矿区矿井塌方，矿区明日全面停工，修复期限未定；两天后天气转晴，何时恢复开采待通知。",
+            "北部铁矿区矿井塌方，矿区明日可能全面停工，修复工程通常需要2天左右才能恢复开采。",
+        )
+        for index, message in enumerate(variants):
+            with self.subTest(message=message):
+                first = payload(team_id=f"collapse-negative-{index}")
+                first["worldNews"]["officialNews"] = message
+                store = StateStore()
+                turn = Turn.load(first)
+                store.observe(turn, first, request_fingerprint(first))
+                request = store.prepare_news_request(turn)
+                parsed = intelligence.parse_news_response(
+                    request, collapse_reply(request),
+                )
+                self.assertEqual(parsed.rejection_reason, "invalid_candidate")
+        uncertain = payload(team_id="collapse-possible-shutdown")
+        uncertain["worldNews"]["officialNews"] = (
+            "北部铁矿区矿井塌方，明日可能全面停工，修复工程通常需要2天左右才能恢复开采。"
+        )
+        store = StateStore()
+        turn = Turn.load(uncertain)
+        store.observe(turn, uncertain, request_fingerprint(uncertain))
+        request = store.prepare_news_request(turn)
+        parsed = intelligence.parse_news_response(
+            request, economic_reply(
+                request, "iron", "mining_halt", 2, 2,
+                "relative_publication",
+            ),
+        )
+        self.assertEqual(parsed.rejection_detail["code"], "uncertain_effect")
+
+    def test_official_collapse_requires_proven_publication_and_official_source(self):
+        for round_no, category, code in (
+            (2, "officialNews", "publication_unproven"),
+            (1, "folkLegends", "untrusted_source"),
+        ):
+            with self.subTest(round_no=round_no, category=category):
+                first = payload(
+                    round_no=round_no,
+                    team_id=f"collapse-source-{round_no}-{category}",
+                )
+                first["worldNews"] = {
+                    "officialNews": OFFICIAL_COLLAPSE_NEWS if category == "officialNews" else "",
+                    "folkLegends": OFFICIAL_COLLAPSE_NEWS if category == "folkLegends" else "",
+                }
+                store = StateStore()
+                turn = Turn.load(first)
+                store.observe(turn, first, request_fingerprint(first))
+                request = store.prepare_news_request(turn)
+                parsed = intelligence.parse_news_response(
+                    request, collapse_reply(request),
+                )
+                self.assertEqual(parsed.rejection_detail["code"], code)
+
+    def test_real_decision_holds_existing_iron_until_observed_rise(self):
+        first = with_completed_wall_line(economy_payload(
+            worker_pos=(3, 2), items=("iron",), gold=100,
+        ))
+        first["teamOur"]["teamId"] = "economic-decision-hold"
+        first["weaponShopList"] = []
+        first["vendorShopList"] = [{"name": "iron", "price": 100}]
+        first["worldNews"] = {
+            "officialNews": "On game day 2 iron prices rise.",
+            "folkLegends": "",
+        }
+        without_news = copy.deepcopy(first)
+        without_news["worldNews"] = {}
+        baseline = DecisionEngine(clock=lambda: 0.0).decide(without_news)
+        self.assertEqual(baseline["roleCommandMap"]["10010"]["action"],
+                         "sell")
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = economic_reply(
+            pending, "iron", "price_rise", 2, 2,
+        )
+        held = engine.decide(second)["roleCommandMap"]["10010"]
+        self.assertNotIn(held["action"], ("sell", "collect"))
+        self.assertEqual(engine.state.state.news_price_baselines[
+            ("iron", "price_rise", 2, 2, pending.sources[0].fingerprint)
+        ], 100)
+        third = copy.deepcopy(second)
+        third["roundNo"] = 3
+        third.pop("llmResp")
+        third["vendorShopList"][0]["price"] = 101
+        sold = engine.decide(third)["roleCommandMap"]["10010"]
+        self.assertEqual(sold["action"], "sell")
+        self.assertEqual(sold["name"], "iron")
+        fourth = copy.deepcopy(third)
+        fourth["roundNo"] = 4
+        fourth["teamOur"]["roles"][0]["backpack"] = []
+        fourth["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(fourth)
+        fifth = copy.deepcopy(fourth)
+        fifth["roundNo"] = 5
+        fifth["teamOur"]["roles"][0]["backpack"] = ["iron"]
+        fifth["vendorShopList"][0]["price"] = 100
+        fifth.pop("lastRoundRoleActionResults")
+        self.assertEqual(engine.decide(fifth)["roleCommandMap"]["10010"]["action"],
+                         "sell")
+
+    def test_economic_hold_expires_and_full_backpack_can_sell(self):
+        first = with_completed_wall_line(economy_payload(
+            worker_pos=(3, 2), items=("iron",), gold=100,
+        ))
+        first["teamOur"]["teamId"] = "economic-hold-expiry"
+        first["weaponShopList"] = []
+        first["vendorShopList"] = [{"name": "iron", "price": 100}]
+        first["worldNews"] = {
+            "officialNews": "On game day 2 iron prices rise.",
+            "folkLegends": "",
+        }
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = economic_reply(
+            pending, "iron", "price_rise", 2, 2,
+        )
+        engine.decide(second)
+        full = copy.deepcopy(second)
+        full["roundNo"] = 3
+        full.pop("llmResp")
+        full["teamOur"]["roles"][0]["backPackCapability"] = 1
+        self.assertEqual(engine.decide(full)["roleCommandMap"]["10010"]["action"],
+                         "sell")
+        expired = copy.deepcopy(second)
+        expired["roundNo"] = 261
+        expired.pop("llmResp")
+        self.assertEqual(engine.decide(expired)["roleCommandMap"]["10010"]["action"],
+                         "sell")
+
+    def test_funding_deficit_sells_despite_future_price_news(self):
+        first = economy_payload(
+            worker_pos=(3, 2), items=("iron",) * 10, gold=0,
+        )
+        first["teamOur"]["teamId"] = "economic-funding-overrides-hold"
+        first["vendorShopList"] = [{"name": "iron", "price": 10}]
+        first["worldNews"] = {
+            "officialNews": "On game day 2 iron prices rise.",
+            "folkLegends": "",
+        }
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = economic_reply(
+            pending, "iron", "price_rise", 2, 2,
+        )
+        command = engine.decide(second)["roleCommandMap"]["10010"]
+        self.assertEqual(command["action"], "sell")
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith("fund:"))
+
+    def test_holding_iron_still_sells_unheld_copper(self):
+        first = with_completed_wall_line(economy_payload(
+            worker_pos=(3, 2), items=("iron", "copper"), gold=100,
+        ))
+        first["teamOur"]["teamId"] = "economic-mixed-inventory"
+        first["weaponShopList"] = []
+        first["vendorShopList"] = [
+            {"name": "iron", "price": 200},
+            {"name": "copper", "price": 100},
+        ]
+        first["worldNews"] = {
+            "officialNews": "On game day 2 iron prices rise.",
+            "folkLegends": "",
+        }
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = economic_reply(
+            pending, "iron", "price_rise", 2, 2,
+        )
+        command = engine.decide(second)["roleCommandMap"]["10010"]
+        self.assertEqual((command["action"], command["name"]),
+                         ("sell", "copper"))
+
+    def test_relative_economic_window_needs_proven_publication_day(self):
+        first = payload(team_id="relative-economic-window")
+        first["worldNews"]["officialNews"] = (
+            "Tomorrow and the day after tomorrow iron mines halt."
+        )
+        store = StateStore()
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        parsed = intelligence.parse_news_response(
+            request, economic_reply(request, "iron", "mining_halt", 2, 3,
+                                    "relative_publication"),
+        )
+        self.assertIsNone(parsed.rejection_reason)
+        delayed = copy.deepcopy(first)
+        delayed["roundNo"] = 2
+        late_store = StateStore()
+        late_turn = Turn.load(delayed)
+        late_store.observe(late_turn, delayed, request_fingerprint(delayed))
+        late_request = late_store.prepare_news_request(late_turn)
+        rejected = intelligence.parse_news_response(
+            late_request, economic_reply(
+                late_request, "iron", "mining_halt", 2, 3,
+                "relative_publication",
+            ),
+        )
+        self.assertEqual(rejected.rejection_detail["code"],
+                         "publication_unproven")
+
+    def test_economic_event_rejects_folk_truncation_other_session_and_fake_day(self):
+        first = payload(team_id="economic-trust-boundary")
+        first["worldNews"]["officialNews"] = (
+            "On game day 1 iron mines halt by 2 or 3 units."
+        )
+        store = StateStore()
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        for altered, expected in (
+            (replace(request, sources=(replace(request.sources[0],
+                                               truncated=True),)), "untrusted_source"),
+            (replace(request, sources=(replace(request.sources[0],
+                                               category="folkLegends"),)), "untrusted_source"),
+            (replace(request, sources=(replace(request.sources[0],
+                                               first_session=2),)), "untrusted_source"),
+            (request, "time_uncited"),
+        ):
+            with self.subTest(expected=expected, source=altered.sources[0]):
+                result = intelligence.parse_news_response(
+                    altered, economic_reply(
+                        altered, "iron", "mining_halt", 2, 3,
+                    ),
+                )
+                self.assertEqual(result.rejection_detail["code"], expected)
+
+    def test_real_decision_switches_away_from_cited_halted_mine(self):
+        first = with_completed_wall_line(economy_payload(gold=100))
+        first["teamOur"]["teamId"] = "economic-decision-mine"
+        first["mapInfo"]["zones"].append({
+            "pos": {"x": 3, "y": 2}, "neutralType": "iron",
+        })
+        first["vendorShopList"].append({"name": "iron", "price": 200})
+        first["weaponShopList"] = []
+        first["worldNews"] = {
+            "officialNews": "On game day 1 iron mines halt.",
+            "folkLegends": "",
+        }
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        source = pending.sources[0]
+        citation = {"sourceId": source.source_id, "excerpt": source.text}
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = valid_response(pending, candidates=[{
+            "type": "news", "interpretation": "Iron halt",
+            "citations": [citation], "missingConditions": [], "conflicts": [],
+            "economicEvents": [{
+                "resource": "iron", "effect": "mining_halt",
+                "startDay": 1, "endDay": 1, "timeBasis": "absolute_day",
+                "citations": [citation],
+            }],
+        }])
+        response = engine.decide(second)
+        command = response["roleCommandMap"]["10010"]
+        self.assertFalse(command["action"] == "collect" and
+                         command.get("targetPos") == [{"x": 3, "y": 2}])
+
+    def test_future_halt_keeps_today_collect_then_blocks_active_day(self):
+        first = with_completed_wall_line(economy_payload(gold=100))
+        first["teamOur"]["teamId"] = "economic-future-halt"
+        first["mapInfo"]["zones"] = [
+            {"pos": {"x": 2, "y": 2}, "neutralType": "iron"},
+            {"pos": {"x": 4, "y": 2}, "neutralType": "vendor"},
+        ]
+        first["vendorShopList"] = [{"name": "iron", "price": 100}]
+        first["weaponShopList"] = []
+        first["worldNews"] = {
+            "officialNews": "On game day 2 iron mines halt.",
+            "folkLegends": "",
+        }
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = economic_reply(
+            pending, "iron", "mining_halt", 2, 2,
+        )
+        today = engine.decide(second)["roleCommandMap"]["10010"]
+        self.assertEqual(today["action"], "collect")
+        active = copy.deepcopy(second)
+        active["roundNo"] = 131
+        active.pop("llmResp")
+        blocked = engine.decide(active)["roleCommandMap"]["10010"]
+        self.assertNotEqual(blocked["action"], "collect")
+        plan = engine.state.state.plans.get(10010)
+        self.assertFalse(plan is not None and plan.reason.startswith("mine:"))
+
+    def test_halt_checks_actual_collect_round_at_day_boundary(self):
+        first = economy_payload(gold=100)
+        first["teamOur"]["teamId"] = "economic-collect-boundary"
+        first["mapInfo"]["zones"][0]["neutralType"] = "iron"
+        first["vendorShopList"] = [{"name": "iron", "price": 100}]
+        first["worldNews"] = {
+            "officialNews": "On game day 2 iron mines halt.",
+            "folkLegends": "",
+        }
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = economic_reply(
+            pending, "iron", "mining_halt", 2, 2,
+        )
+        engine.decide(second)
+        near = copy.deepcopy(first)
+        near["roundNo"] = 130
+        near_turn = Turn.load(near)
+        far = copy.deepcopy(near)
+        far["teamOur"]["roles"][0]["pos"] = {"x": 2, "y": 0}
+        far_turn = Turn.load(far)
+        context = economy.RouteSearchContext({}, state=engine.state.state)
+        token = economy._ROUTE_SEARCH_CONTEXT.set(context)
+        try:
+            collect = economy._collect_or_move(
+                near_turn, near_turn.unit(10010), Pos(2, 2),
+                lambda: 0.0, 1.0, 256,
+            )
+            crossing = economy._collect_or_move(
+                far_turn, far_turn.unit(10010), Pos(2, 2),
+                lambda: 0.0, 1.0, 256,
+            )
+        finally:
+            economy._ROUTE_SEARCH_CONTEXT.reset(token)
+        self.assertEqual(collect.proposal.command["action"], "collect")
+        self.assertIsNone(crossing)
+
+    def test_conflicting_official_windows_disable_news_mining_override(self):
+        first = with_completed_wall_line(economy_payload(gold=100))
+        first["teamOur"]["teamId"] = "economic-conflict"
+        first["mapInfo"]["zones"][0]["neutralType"] = "iron"
+        first["vendorShopList"] = [{"name": "iron", "price": 100}]
+        first["weaponShopList"] = []
+        first["worldNews"] = {
+            "officialNews": "On game day 1 iron mines halt.",
+            "folkLegends": "",
+        }
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(first)
+        pending = engine.state.state.pending_news_request
+        second = copy.deepcopy(first)
+        second["roundNo"] = 2
+        second["llmResp"] = economic_reply(
+            pending, "iron", "mining_halt", 1, 1,
+        )
+        self.assertNotEqual(engine.decide(second)["roleCommandMap"]["10010"]["action"],
+                            "collect")
+        third = copy.deepcopy(first)
+        third["roundNo"] = 3
+        third["worldNews"]["officialNews"] = (
+            "On game days 1 and 2 iron mines halt."
+        )
+        engine.decide(third)
+        second_pending = engine.state.state.pending_news_request
+        fourth = copy.deepcopy(third)
+        fourth["roundNo"] = 4
+        fourth["llmResp"] = economic_reply(
+            second_pending, "iron", "mining_halt", 1, 2,
+        )
+        self.assertEqual(engine.decide(fourth)["roleCommandMap"]["10010"]["action"],
+                         "collect")
+
+    def test_official_economic_event_requires_cited_time_anchor(self):
+        first = payload(team_id="economic-event")
+        first["worldNews"]["officialNews"] = (
+            "On game days 2 and 3, iron mines halt and iron prices rise."
+        )
+        store = StateStore()
+        turn = Turn.load(first)
+        store.observe(turn, first, request_fingerprint(first))
+        request = store.prepare_news_request(turn)
+        source = request.sources[0]
+        citation = {"sourceId": source.source_id, "excerpt": source.text}
+        claim = {
+            "type": "news", "interpretation": "Iron economy window",
+            "citations": [citation], "missingConditions": [], "conflicts": [],
+            "economicEvents": [{
+                "resource": "iron", "effect": "mining_halt",
+                "startDay": 2, "endDay": 3,
+                "timeBasis": "absolute_day", "citations": [citation],
+            }],
+        }
+        parsed = intelligence.parse_news_response(
+            request, valid_response(request, candidates=[claim]),
+        )
+        self.assertIsNone(parsed.rejection_reason)
+        self.assertEqual(parsed.candidates[0].economic_events[0].start_day, 2)
+
     def test_citation_prompt_explains_contiguous_source_excerpts(self):
         first = payload(team_id="intelligence-citation-prompt")
         first["worldNews"]["officialNews"] = "North ... south; gate opens."

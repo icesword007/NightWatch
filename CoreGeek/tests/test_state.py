@@ -27,6 +27,53 @@ def load_state_module(test_case):
 
 
 class StateTests(unittest.TestCase):
+    def test_wall_breach_history_tracks_position_across_rebuilt_ids_and_nights(self):
+        state_module = load_state_module(self)
+        store = state_module.StateStore()
+        payload = load_fixture()
+        payload["roundNo"] = 99
+        wall = {
+            "id": 10100, "pos": {"x": 5, "y": 5}, "roleType": "wall",
+            "health": 1000, "attackPower": 0, "attackRange": 0,
+            "backPackCapability": 0, "backpack": [], "level": 1,
+            "cooldown": 0,
+        }
+        payload["teamOur"]["roles"].append(wall)
+        for round_no, wall_id in ((99, 10100), (100, None),
+                                  (130, None), (131, 20100),
+                                  (229, 20100), (230, None)):
+            payload["roundNo"] = round_no
+            payload["teamOur"]["roles"] = [
+                role for role in payload["teamOur"]["roles"]
+                if role["roleType"] != "wall"
+            ]
+            if wall_id is not None:
+                payload["teamOur"]["roles"].append({**wall, "id": wall_id})
+            store.observe(Turn.load(payload), payload,
+                          state_module.request_fingerprint(payload))
+
+        self.assertEqual(store.state.wall_breaches[Pos(5, 5)], (1, 2))
+
+    def test_wall_breach_history_does_not_infer_from_observation_gap(self):
+        state_module = load_state_module(self)
+        store = state_module.StateStore()
+        payload = load_fixture()
+        payload["roundNo"] = 99
+        payload["teamOur"]["roles"].append({
+            "id": 10100, "pos": {"x": 5, "y": 5}, "roleType": "wall",
+            "health": 1000, "attackPower": 0, "attackRange": 0,
+            "backPackCapability": 0, "backpack": [], "level": 1,
+            "cooldown": 0,
+        })
+        store.observe(Turn.load(payload), payload,
+                      state_module.request_fingerprint(payload))
+        payload["roundNo"] = 101
+        payload["teamOur"]["roles"].pop()
+        store.observe(Turn.load(payload), payload,
+                      state_module.request_fingerprint(payload))
+
+        self.assertEqual(store.state.wall_breaches, {})
+
     def test_wall_damage_history_requires_contiguous_same_wall_observations(self):
         state_module = load_state_module(self)
         store = state_module.StateStore()

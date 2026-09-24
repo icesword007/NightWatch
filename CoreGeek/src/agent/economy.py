@@ -9,10 +9,12 @@ from .defense import DAY_WORK_RETURN_MARGIN
 from .fortification import (
     MAX_WALL_TARGETS,
     fortification_stone_target,
+    low_pressure_flank_wall,
     ordered_wall_targets,
     remaining_wall_targets,
 )
 from .grid import PathResult, next_step
+from .intelligence import EconomicEvent
 from .layout import ensure_defense_layout
 from .protocol import (
     DUSK_POSITIONING_ROUNDS,
@@ -139,6 +141,7 @@ class RouteSearchContext:
     preferred_wall_targets: dict[str, int] = field(default_factory=dict)
     preferred_weapon_targets: dict[str, int] = field(default_factory=dict)
     procurement_blocked_role_ids: set[int] = field(default_factory=set)
+    state: SessionState | None = None
 
 
 _ROUTE_SEARCH_CONTEXT: ContextVar[RouteSearchContext | None] = ContextVar(
@@ -161,7 +164,7 @@ def propose_economy(
     allow_idle_pioneer_purchase: bool = False,
     diagnostic_sink: Callable[[dict], None] | None = None,
 ) -> tuple[PlannedAction, ...]:
-    context = RouteSearchContext({})
+    context = RouteSearchContext({}, state=state)
     token = _ROUTE_SEARCH_CONTEXT.set(context)
     try:
         result = _propose_economy(
@@ -313,6 +316,18 @@ def _propose_economy(
         and completed.success is False
         and completed.pending.target is not None
         and completed.pending.source_session == state.session_index
+    }
+    wall_failed_builds = {
+        completed.pending.target
+        for completed in state.action_history
+        if completed.pending.action == "build"
+        and completed.success is False
+        and completed.pending.target is not None
+        and completed.pending.source_session == state.session_index
+        and not (
+            completed.pending.name == "wall"
+            and completed.pending.target in state.fortification_retryable_builds
+        )
     }
     unconfirmed_builds = {
         completed.pending.target
@@ -557,6 +572,15 @@ def _propose_economy(
             for role in turn.controllable()
         )
     )
+    emergency_medicine_budget = (
+        turn.weapon_prices.get("Medicine", 0) * sum(
+            role.health <= EMERGENCY_MEDICINE_HEALTH
+            for role in turn.controllable()
+        )
+    )
+    growth_interrupted = any(
+        _wall_repair_urgent(turn, wall) for wall in turn.walls()
+    )
     protected_cash = 0
     if protected_reserve is not None and not reserve_interrupted:
         protected_cash = min(
@@ -568,12 +592,140 @@ def _propose_economy(
     if context is not None and reserve is not None:
         context.investment_owners[reserve.station_id] = reserve.holder_id
         context.investment_targets.add(reserve.station_id)
+    selected_growth: dict[int, PlannedAction] = {}
+    commitment = state.growth_commitment
+    if commitment is not None and (
+        growth_interrupted or len(turn.weapons()) < MAX_WEAPONS
+        or turn.gold - emergency_medicine_budget
+        + sum(
+            turn.vendor_prices.get(item, 0)
+            for item in (turn.unit(commitment.owner_id).backpack
+                         if turn.unit(commitment.owner_id) is not None else ())
+            if item in MINERALS
+        ) < commitment.price
+    ):
+        state.growth_commitment = None
+    elif commitment is not None and commitment.price > 0:
+        owner = turn.unit(commitment.owner_id)
+        continuation = (
+            _continue_plan(
+                turn, state, owner, failed_builds, failed_mines,
+                clock, deadline, max_expansions,
+            ) if owner is not None else None
+        )
+        if (
+            continuation is not None
+            and continuation.plan_reason is not None
+            and continuation.plan_reason.startswith(
+                (f"fund:{commitment.item}:", f"batch:{commitment.item}:")
+            )
+            and _plan_use_target_id(continuation) == commitment.target_id
+        ):
+            selected_growth[commitment.owner_id] = continuation
+            claimed_gold += min(
+                max(turn.gold - claimed_gold, 0), commitment.price,
+            )
+        else:
+            state.growth_commitment = None
+    selected_priority_wall: dict[int, PlannedAction] = {}
+    if (
+        state.wall_upgrade_due is not None
+        and not growth_interrupted and not selected_growth
+        and len(turn.weapons()) >= MAX_WEAPONS
+    ):
+        for worker in turn.workers():
+            if worker.unit_id in reserved_role_ids:
+                continue
+            wall = next((entry for entry in turn.walls()
+                         if entry.pos == state.wall_upgrade_due[0]), None)
+            if wall is None or wall.level != state.wall_upgrade_due[1]:
+                continue
+            item = f"WallUpgradeVoucher{wall.level}"
+            price = turn.weapon_prices.get(item)
+            if price is None:
+                continue
+            available = max(
+                turn.gold - claimed_gold - emergency_medicine_budget, 0,
+            )
+            inventory = sum(
+                turn.vendor_prices.get(entry, 0)
+                for entry in worker.backpack if entry in MINERALS
+            )
+            if item not in worker.backpack and (
+                price > available + inventory
+                or price > available and turn.gold >= price
+            ):
+                continue
+            candidate = _funding_action(
+                turn, worker, item,
+                turn.round_no + turn.rounds_until_night - 1,
+                clock, deadline, max_expansions,
+                preferred_use_target_id=wall.unit_id,
+            )
+            if candidate is None:
+                continue
+            selected_priority_wall[worker.unit_id] = candidate
+            if item not in worker.backpack:
+                claimed_gold += min(max(turn.gold - claimed_gold, 0), price)
+            break
+    if (
+        turn.is_day and len(turn.weapons()) >= MAX_WEAPONS
+        and not growth_interrupted and not tower_candidates
+        and not selected_growth and not selected_priority_wall
+    ):
+        growth_options = []
+        for worker in turn.workers():
+            if (
+                worker.unit_id in reserved_role_ids
+                or worker.unit_id in tower_candidates
+                or worker.unit_id in urgent_held
+                or worker.health <= EMERGENCY_MEDICINE_HEALTH
+                or urgent_purchase is not None
+                and worker.unit_id == urgent_purchase.proposal.actor_id
+            ):
+                continue
+            growth = _balanced_base_purchase(
+                turn, state, worker,
+                max(turn.gold - claimed_gold - emergency_medicine_budget, 0),
+                clock, deadline, max_expansions,
+            ) or _weapon_growth_purchase(
+                turn, state, worker,
+                max(turn.gold - claimed_gold - emergency_medicine_budget, 0),
+                clock, deadline, max_expansions,
+            )
+            if growth is not None:
+                growth_options.append((
+                    not growth.plan_reason.split(":", 2)[1].startswith(
+                        "StationUpgradeVoucher"
+                    ),
+                    growth.estimated_rounds or 0, worker.unit_id, growth,
+                ))
+        if growth_options:
+            _, _, role_id, growth = min(growth_options)
+            item = growth.plan_reason.split(":", 2)[1]
+            price = turn.weapon_prices.get(item, 0)
+            target_id = _plan_use_target_id(growth)
+            if target_id is not None and growth.deadline_round is not None:
+                diagnostic = dict(growth.diagnostic or {})
+                diagnostic["growthCommitment"] = {
+                    "item": item,
+                    "targetId": target_id,
+                    "price": price,
+                    "deadlineRound": growth.deadline_round,
+                }
+                growth = replace(growth, diagnostic=diagnostic)
+            selected_growth[role_id] = growth
+            claimed_gold += min(max(turn.gold - claimed_gold, 0), price)
     for role in sorted(turn.controllable(), key=lambda entry: entry.unit_id):
         if clock() >= deadline:
             break
         plan = state.plans.get(role.unit_id)
         joint_plan = _joint_plan(plan.reason) if plan is not None else None
-        candidate = urgent_held.get(role.unit_id)
+        candidate = (
+            selected_growth.get(role.unit_id)
+            or selected_priority_wall.get(role.unit_id)
+            or urgent_held.get(role.unit_id)
+        )
         if (
             candidate is None
             and urgent_purchase is not None
@@ -720,9 +872,21 @@ def _propose_economy(
         if _joint_plan(plan.reason) is not None and role_id not in joint_roles:
             state.plans.pop(role_id)
 
+    pending_emergency_roles = {
+        role.unit_id for role in turn.workers()
+        if role.health <= EMERGENCY_MEDICINE_HEALTH
+        and role.health < _max_role_health(role)
+        and "Medicine" in turn.weapon_prices
+        and role.unit_id not in maintained_roles
+    }
     for worker in sorted(turn.workers(), key=lambda entry: entry.unit_id):
         if clock() >= deadline:
             break
+        emergency_reserved = turn.weapon_prices.get("Medicine", 0) * (
+            len(pending_emergency_roles)
+            - (worker.unit_id in pending_emergency_roles)
+        )
+        spendable_gold = max(turn.gold - claimed_gold - emergency_reserved, 0)
         if worker.unit_id in maintained_roles:
             continue
         if worker.unit_id in reserved_role_ids:
@@ -736,7 +900,7 @@ def _propose_economy(
                 turn,
                 state,
                 worker,
-                failed_builds | claimed_build_targets | {
+                wall_failed_builds | claimed_build_targets | {
                     plan.target for role_id, plan in state.plans.items()
                     if role_id != worker.unit_id
                 },
@@ -796,14 +960,14 @@ def _propose_economy(
                 worker,
                 failed_builds | unconfirmed_builds | claimed_build_targets,
                 claimed_tower_types,
-                turn.gold - claimed_gold,
+                spendable_gold,
                 clock,
                 deadline,
                 max_expansions,
             )
         if candidate is None:
             candidate = _trade_or_mine(
-                turn, worker, turn.gold - claimed_gold,
+                turn, worker, spendable_gold,
                 clock, deadline, max_expansions, failed_mines,
                 check_funding=not funding_rechecked,
                 night_cleared=night_cleared,
@@ -849,6 +1013,7 @@ def _propose_economy(
                         claimed_gold += min(
                             max(turn.gold - claimed_gold, 0), price,
                         )
+        pending_emergency_roles.discard(worker.unit_id)
     if state.base_blocked_day == current_day:
         station = turn.station()
         if station is not None and station.level in (1, 2):
@@ -1465,6 +1630,14 @@ def _continue_plan(
     if plan.deadline_round is not None and turn.round_no > plan.deadline_round:
         return None
     if plan.reason.startswith("batch:"):
+        batch = _procurement_batch(plan.reason)
+        target = turn.unit(batch.primary_target_id) if batch is not None else None
+        if (
+            batch is not None and batch.item == "WallFixer"
+            and target is not None
+            and low_pressure_flank_wall(turn, state, target.pos)
+        ):
+            return None
         return _continue_procurement_batch(
             turn, worker, plan.reason, plan.deadline_round,
             clock, deadline, max_expansions,
@@ -1576,6 +1749,13 @@ def _continue_plan(
                 use_target_id = None
         except ValueError:
             return None
+        if item == "WallFixer" and item not in worker.backpack:
+            target = turn.unit(use_target_id) if use_target_id is not None else None
+            if (
+                target is not None
+                and low_pressure_flank_wall(turn, state, target.pos)
+            ):
+                return None
         return _funding_action(
             turn,
             worker,
@@ -1694,6 +1874,8 @@ def _continue_procurement_batch(
         and not worker.backpack_full
         and turn.zones.get(batch.mine) == batch.mineral
         and distance(worker.pos, batch.mine) == 1
+        and not any(_mine_blocked(turn, batch.mine, offset)
+                    for offset in range(effective_goal - current_count))
     )
     if keep_collecting:
         remaining = effective_goal - current_count
@@ -1879,23 +2061,31 @@ def _wall_action(
         target for target in state.fortification_batch_targets
         if target not in state.fortification_completed
         and target not in state.fortification_failed
+        and not low_pressure_flank_wall(turn, state, target)
     )
     stone_goal = max(len(batch_targets), 1)
     if worker.backpack.count("stone") < stone_goal:
-        stone = fortification_stone_target(turn, worker, failed_mines)
-        if stone is None:
-            return None
-        return _collect_or_move(
-            turn, worker, stone, clock, deadline, max_expansions,
-            diagnostic={
-                "kind": "fortification",
-                "phase": "mining",
-                "target": stone.dump(),
-            },
-        )
+        excluded_stones = set(failed_mines)
+        for _ in range(min(len(turn.stone_mines()), MAX_MINE_CANDIDATES)):
+            stone = fortification_stone_target(turn, worker, excluded_stones)
+            if stone is None:
+                return None
+            candidate = _collect_or_move(
+                turn, worker, stone, clock, deadline, max_expansions,
+                diagnostic={
+                    "kind": "fortification",
+                    "phase": "mining",
+                    "target": stone.dump(),
+                },
+            )
+            if candidate is not None:
+                return candidate
+            excluded_stones.add(stone)
+        return None
     target = next((
         pos for pos in (batch_targets or remaining_wall_targets(state))
         if pos not in excluded
+        and not low_pressure_flank_wall(turn, state, pos)
     ), None)
     if target is None:
         return None
@@ -2122,6 +2312,21 @@ def _joint_funding_actions(
     existing = None
     if commitment is not None:
         item, _, target_id, buyer_id, _ = commitment
+        target = turn.unit(target_id) if target_id is not None else None
+        buyer = turn.unit(buyer_id)
+        if (
+            item == "WallFixer"
+            and target is not None
+            and buyer is not None
+            and item not in buyer.backpack
+            and low_pressure_flank_wall(turn, state, target.pos)
+        ):
+            if context is not None:
+                context.joint_status = "low_pressure_flank_deferred"
+            return (), frozenset(), {
+                role_id: "low_pressure_flank_deferred"
+                for role_id in existing_plans
+            }
         buyer_plan = existing_plans.get(buyer_id)
         buyer_post_id = (
             buyer_plan[1]
@@ -2899,6 +3104,10 @@ def _trade_or_mine(
                 if candidate is not None:
                     return candidate
 
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    state = context.state if context is not None else None
+    if _held_minerals(turn, worker, state):
+        return None
     return _mine_action(
         turn,
         worker,
@@ -2932,11 +3141,7 @@ def _balanced_base_purchase(
                for role in turn.controllable() for item in role.backpack)
         or (
             "Medicine" in turn.weapon_prices
-            and (
-                worker.health < _max_role_health(worker)
-                or any(role.health <= EMERGENCY_MEDICINE_HEALTH
-                       for role in turn.controllable())
-            )
+            and worker.health <= EMERGENCY_MEDICINE_HEALTH
         )
         or any(_wall_repair_urgent(turn, wall) for wall in turn.walls())
     ):
@@ -2944,11 +3149,25 @@ def _balanced_base_purchase(
     base_item = f"StationUpgradeVoucher{station.level}"
     purchases = _purchase_candidates(turn, worker)
     base_price = turn.weapon_prices.get(base_item)
-    if base_item not in purchases or base_price is None or base_price > available_gold:
+    inventory_value = sum(
+        turn.vendor_prices.get(item, 0)
+        for item in worker.backpack if item in MINERALS
+    )
+    if (
+        base_item not in purchases or base_price is None
+        or base_price > available_gold + inventory_value
+        or base_price > available_gold and turn.gold >= base_price
+    ):
         return None
-    base_route = _purchase_route(
-        turn, worker, base_item, clock, deadline, max_expansions,
-        preferred_use_target_id=station.unit_id,
+    base_route = (
+        _purchase_route(
+            turn, worker, base_item, clock, deadline, max_expansions,
+            preferred_use_target_id=station.unit_id,
+        ) if base_price <= available_gold else _funding_chain(
+            turn, worker, base_item, base_price - available_gold,
+            clock, deadline, max_expansions,
+            preferred_use_target_id=station.unit_id,
+        )
     )
     if (
         base_route is None
@@ -2959,10 +3178,18 @@ def _balanced_base_purchase(
         if not item.startswith("WeaponUpgradeVoucher"):
             continue
         price = turn.weapon_prices.get(item)
-        if price is None or price > available_gold:
+        if (
+            price is None or price > available_gold + inventory_value
+            or price > available_gold and turn.gold >= price
+        ):
             continue
-        route = _purchase_route(
-            turn, worker, item, clock, deadline, max_expansions,
+        route = (
+            _purchase_route(
+                turn, worker, item, clock, deadline, max_expansions,
+            ) if price <= available_gold else _funding_chain(
+                turn, worker, item, price - available_gold,
+                clock, deadline, max_expansions,
+            )
         )
         if (
             route is None
@@ -2982,10 +3209,75 @@ def _balanced_base_purchase(
     return None
 
 
+def _weapon_growth_purchase(
+    turn: Turn,
+    state: SessionState,
+    worker: Unit,
+    available_gold: int,
+    clock: Callable[[], float],
+    deadline: float,
+    max_expansions: int,
+) -> PlannedAction | None:
+    if (
+        not turn.is_day or worker.backpack_full
+        or turn.rounds_until_night <= DUSK_POSITIONING_ROUNDS
+        or any(plan.reason.startswith(("fund:", "batch:", "use:", "shop:"))
+               for plan in state.plans.values())
+        or any(item.startswith(INVESTMENT_ITEM_PREFIXES)
+               for role in turn.controllable() for item in role.backpack)
+    ):
+        return None
+    inventory_value = sum(
+        turn.vendor_prices.get(item, 0)
+        for item in worker.backpack if item in MINERALS
+    )
+    options = []
+    for item in _purchase_candidates(turn, worker):
+        if not item.startswith("WeaponUpgradeVoucher"):
+            continue
+        price = turn.weapon_prices.get(item)
+        if (
+            price is None or price > available_gold + inventory_value
+            or price > available_gold and turn.gold >= price
+        ):
+            continue
+        route = (
+            _purchase_route(
+                turn, worker, item, clock, deadline, max_expansions,
+            ) if price <= available_gold else _funding_chain(
+                turn, worker, item, price - available_gold,
+                clock, deadline, max_expansions,
+            )
+        )
+        if (
+            route is None
+            or route.rounds + DAY_WORK_RETURN_MARGIN > turn.rounds_until_night
+        ):
+            continue
+        target = turn.unit(route.use_target_id) if route.use_target_id else None
+        if target is None:
+            continue
+        options.append((
+            _weapon_upgrade_priority(turn, target, item),
+            route.rounds, item, route,
+        ))
+    if not options:
+        return None
+    _, _, item, route = min(options)
+    return _funding_action(
+        turn, worker, item,
+        turn.round_no + turn.rounds_until_night - 1,
+        clock, deadline, max_expansions,
+        preferred_use_target_id=route.use_target_id,
+        verified_route=route,
+    )
+
+
 def daytime_liquidation_actions(
     turn: Turn,
     worker: Unit,
     *,
+    state: SessionState | None = None,
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
@@ -3001,7 +3293,7 @@ def daytime_liquidation_actions(
         if clock() >= deadline:
             break
         candidate = _sell_or_move(
-            turn, worker, vendor, clock, deadline, max_expansions,
+            turn, worker, vendor, clock, deadline, max_expansions, state=state,
         )
         if candidate is not None:
             result.append(candidate)
@@ -3155,6 +3447,7 @@ def _new_procurement_batch_action(
             if kind in MINERALS
             and distance(worker.pos, pos) == 1
             and turn.vendor_prices.get(kind, 0) > 0
+            and not _mine_blocked(turn, pos, 0)
         ),
         key=lambda pos: (
             -turn.vendor_prices.get(turn.zones[pos], 0), pos.x, pos.y,
@@ -3200,6 +3493,8 @@ def _new_procurement_batch_action(
         )
         extra = min(free_slots, needed_units)
         if extra <= 0:
+            continue
+        if any(_mine_blocked(turn, mine, offset) for offset in range(extra)):
             continue
         projected = replace(
             worker, backpack=worker.backpack + (mineral,) * extra,
@@ -3407,6 +3702,69 @@ def _batch_funding_chain(
     return best
 
 
+def _economic_events(state: SessionState | None, day: int) -> tuple[EconomicEvent, ...]:
+    if state is None:
+        return ()
+    candidates = (
+        event for candidate in state.news_candidates
+        if candidate.source_session == state.session_index
+        for event in candidate.economic_events
+        if event.end_day >= day
+    )
+    by_resource: dict[str, list[EconomicEvent]] = {}
+    for event in candidates:
+        by_resource.setdefault(event.resource, []).append(event)
+    accepted = []
+    for events in by_resource.values():
+        if len({event.source_fingerprint for event in events}) > 1:
+            continue
+        if any(len({(event.start_day, event.end_day)
+                    for event in events if event.effect == effect}) > 1
+               for effect in ("mining_halt", "price_rise")):
+            continue
+        accepted.extend(dict.fromkeys(events))
+    return tuple(accepted)
+
+
+def _event_key(event: EconomicEvent) -> tuple[str, str, int, int, str]:
+    return (event.resource, event.effect, event.start_day, event.end_day,
+            event.source_fingerprint)
+
+
+def _mine_blocked(turn: Turn, target: Pos, travel_rounds: int) -> bool:
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    state = context.state if context is not None else None
+    collect_day = (turn.round_no + travel_rounds - 1) // ROUNDS_PER_DAY + 1
+    return any(
+        event.effect == "mining_halt"
+        and event.resource == turn.zones.get(target)
+        and event.start_day <= collect_day <= event.end_day
+        for event in _economic_events(state, (turn.round_no - 1) // ROUNDS_PER_DAY + 1)
+    )
+
+
+def _held_minerals(
+    turn: Turn, worker: Unit, state: SessionState | None,
+) -> frozenset[str]:
+    if state is None or worker.backpack_full:
+        return frozenset()
+    day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+    held = set()
+    for event in _economic_events(state, day):
+        if event.effect != "price_rise" or event.resource not in worker.backpack:
+            continue
+        key = _event_key(event)
+        baseline = state.news_price_baselines.get(key)
+        actual = turn.vendor_prices.get(event.resource, 0)
+        if baseline is None or actual <= 0 or key in state.news_released_holds:
+            continue
+        if actual > baseline:
+            state.news_released_holds.add(key)
+            continue
+        held.add(event.resource)
+    return frozenset(held)
+
+
 def _mine_action(
     turn: Turn,
     worker: Unit,
@@ -3425,6 +3783,7 @@ def _mine_action(
             if target not in excluded_targets
         ),
         key=lambda pos: (
+            _mine_blocked(turn, pos, 0),
             pos != preferred_target,
             distance(worker.pos, pos),
             -turn.vendor_prices.get(turn.zones[pos], 0),
@@ -3443,6 +3802,8 @@ def _mine_action(
         if route is None:
             continue
         stand, travel_rounds = route
+        if _mine_blocked(turn, target, travel_rounds):
+            continue
         reachable.append((travel_rounds, target))
         value = turn.vendor_prices.get(turn.zones[target], 0)
         realization_rounds = _mine_realization_rounds(
@@ -4192,6 +4553,12 @@ def _maintenance_purchase_worthwhile(
         )
         if target is None or target.kind != WALL:
             return False
+        context = _ROUTE_SEARCH_CONTEXT.get()
+        if (
+            context is not None and context.state is not None
+            and low_pressure_flank_wall(turn, context.state, target.pos)
+        ):
+            return False
         recovery = _max_building_health(target) - target.health
         urgent = _wall_repair_urgent(turn, target)
     else:
@@ -4449,6 +4816,17 @@ def _collect_or_move(
 ) -> PlannedAction | None:
     reason = f"mine:{turn.zones[target]}"
     if distance(worker.pos, target) == 1:
+        travel_rounds = 0
+    else:
+        route = _best_adjacent_route(
+            turn, worker, target, clock, deadline, max_expansions,
+        )
+        if route is None:
+            return None
+        travel_rounds = route[1]
+    if _mine_blocked(turn, target, travel_rounds):
+        return None
+    if distance(worker.pos, target) == 1:
         return PlannedAction(ActionProposal(
             worker.unit_id,
             worker.unit_id,
@@ -4468,19 +4846,26 @@ def _sell_or_move(
     clock: Callable[[], float],
     deadline: float,
     max_expansions: int,
+    *,
+    state: SessionState | None = None,
 ) -> PlannedAction | None:
+    context = _ROUTE_SEARCH_CONTEXT.get()
+    state = state or (context.state if context is not None else None)
+    held = _held_minerals(turn, worker, state)
+    sale_minerals = Counter(
+        item for item in worker.backpack if item in MINERALS and item not in held
+    )
+    if not sale_minerals:
+        return None
     if distance(worker.pos, target) == 1:
-        minerals = Counter(item for item in worker.backpack if item in MINERALS)
-        if not minerals:
-            return None
         name = max(
-            minerals,
+            sale_minerals,
             key=lambda item: (turn.vendor_prices.get(item, 0), item),
         )
         return PlannedAction(ActionProposal(
             worker.unit_id,
             worker.unit_id,
-            sell_command(name, minerals[name]),
+            sell_command(name, sale_minerals[name]),
         ))
     return _move_adjacent(
         turn, worker, target, "vendor", None,
@@ -4567,6 +4952,21 @@ def _preferred_wall_targets(
     state: SessionState,
 ) -> dict[str, int]:
     result: dict[str, int] = {}
+    repeatedly_breached = sorted(
+        (
+            wall for wall in turn.walls()
+            if wall.level in (1, 2)
+            and len(state.wall_breaches.get(wall.pos, ())) >= 2
+        ),
+        key=lambda wall: (
+            -len(state.wall_breaches[wall.pos]),
+            wall.unit_id,
+        ),
+    )
+    for wall in repeatedly_breached:
+        item = f"WallUpgradeVoucher{wall.level}"
+        if item in turn.weapon_prices:
+            result.setdefault(item, wall.unit_id)
     ordered = sorted(
         turn.walls(),
         key=lambda wall: (
