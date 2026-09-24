@@ -139,7 +139,7 @@ class BaseUpgradeTests(unittest.TestCase):
         response = engine.decide(payload)["roleCommandMap"].get("10010", {})
         self.assertNotEqual(response.get("name"), "StationUpgradeVoucher1")
         self.assertTrue(engine.state.state.plans[10010].reason.startswith(
-            "fund:WeaponUpgradeVoucher1:"
+            "fund:StationUpgradeVoucher1:"
         ))
 
     def test_balanced_purchase_does_not_replace_cross_role_commitment(self):
@@ -176,7 +176,7 @@ class BaseUpgradeTests(unittest.TestCase):
         self.assertEqual(
             DecisionEngine(clock=lambda: 0.0).decide(payload)
             ["roleCommandMap"]["10010"]["name"],
-            "Medicine",
+            "StationUpgradeVoucher1",
         )
 
     def test_balanced_purchase_leaves_cash_for_other_roles_urgent_medicine(self):
@@ -234,11 +234,14 @@ class BaseUpgradeTests(unittest.TestCase):
         )
         engine = DecisionEngine(clock=lambda: 0.0)
         commands = engine.decide(payload)["roleCommandMap"]
-        self.assertTrue(engine.state.state.plans[10010].reason.startswith(
-            "fund:StationUpgradeVoucher1:"
+        self.assertTrue(any(
+            plan.reason.startswith("fund:StationUpgradeVoucher1:")
+            for plan in engine.state.state.plans.values()
         ))
-        self.assertFalse(any(
-            command.get("action") == "buy" for command in commands.values()
+        self.assertTrue(all(
+            command.get("name") == "StationUpgradeVoucher1"
+            for command in commands.values()
+            if command.get("action") == "buy"
         ))
 
     def test_balanced_base_reserve_is_not_displaced_by_other_new_funding(self):

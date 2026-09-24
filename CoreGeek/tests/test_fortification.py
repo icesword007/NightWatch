@@ -36,6 +36,31 @@ def unit(unit_id, kind, x, y, *, health=1000):
     }
 
 
+def temporary_wall_payload():
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    payload["roundNo"] = 5
+    payload["mapInfo"].update({"width": 20, "height": 20, "zones": []})
+    builder = unit(10010, "worker", 11, 8)
+    builder["backpack"] = ["stone"]
+    payload["teamOur"].update({
+        "teamId": "fortification-temporary-rotation",
+        "roles": [
+            builder,
+            unit(10013, "station", 9, 9),
+            unit(10020, "gatling", 8, 8),
+            unit(10030, "railgun", 9, 7),
+            unit(10040, "rocket", 10, 7),
+        ],
+    })
+    payload["teamEnemy"]["roles"] = [
+        unit(20013, "station", 17, 9),
+        unit(20010, "worker", 12, 8),
+        unit(20012, "worker", 13, 8),
+    ]
+    payload["robot"]["roles"] = []
+    return payload
+
+
 def layout_turn(*, our_x, enemy_x):
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     payload["roundNo"] = 5
@@ -50,6 +75,220 @@ def layout_turn(*, our_x, enemy_x):
 
 
 class FortificationTests(unittest.TestCase):
+    def _first_wall_build(self):
+        payload = temporary_wall_payload()
+        payload["teamEnemy"]["roles"] = payload["teamEnemy"]["roles"][:1]
+        payload["teamOur"]["roles"][0]["backpack"] = ["stone"] * 8
+        engine = DecisionEngine(clock=lambda: 0.0)
+        first = engine.decide(payload)["roleCommandMap"].get("10010", {})
+        self.assertEqual(first.get("action"), "build")
+        self.assertEqual(first.get("name"), "wall")
+        return engine, payload, Pos.load(first["targetPos"][0])
+
+    def test_decision_rechecks_rotating_legal_blockers_then_builds_when_clear(self):
+        # Break caught: changing the occupant exhausts the temporary recheck cap.
+        payload = temporary_wall_payload()
+        target = Pos(12, 8)
+        engine = DecisionEngine(clock=lambda: 0.0)
+        state = SessionState(payload["teamOur"]["teamId"], "challenger")
+        state.fortification_initialized = True
+        state.fortification_builder_id = 10010
+        state.fortification_targets = (target,)
+        engine.state.state = state
+
+        for round_no in range(5, 11):
+            payload["roundNo"] = round_no
+            first, second = payload["teamEnemy"]["roles"][1:]
+            first["pos"] = {"x": 12, "y": 8 if round_no % 2 else 9}
+            second["pos"] = {"x": 13 if round_no % 2 else 12, "y": 8}
+            response = engine.decide(payload)
+            self.assertFalse(any(
+                command["action"] == "build"
+                and command.get("name") == "wall"
+                and command["targetPos"] == [target.dump()]
+                for command in response["roleCommandMap"].values()
+            ))
+            self.assertNotIn(target, engine.state.state.fortification_failed)
+
+        payload["roundNo"] = 11
+        payload["teamEnemy"]["roles"][1]["pos"] = {"x": 12, "y": 9}
+        payload["teamEnemy"]["roles"][2]["pos"] = {"x": 13, "y": 8}
+        response = engine.decide(payload)
+        self.assertTrue(any(
+            command["action"] == "build"
+            and command.get("name") == "wall"
+            and command["targetPos"] == [target.dump()]
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_failed_wall_build_with_visible_blocker_retries_after_clearance(self):
+        # Break caught: failed build history and attempt day suppress a now-legal wall.
+        engine, payload, target = self._first_wall_build()
+
+        payload["teamEnemy"]["roles"].append(
+            unit(20010, "worker", target.x, target.y),
+        )
+        payload["lastRoundRoleActionResults"] = {"10010": False}
+        retried = False
+        timeline = []
+        for round_no in range(6, 19):
+            payload["roundNo"] = round_no
+            if round_no == 9:
+                payload["teamEnemy"]["roles"][1]["pos"] = {
+                    "x": target.x + 1, "y": target.y,
+                }
+            response = engine.decide(payload)["roleCommandMap"]
+            command = response.get("10010", {})
+            timeline.append((
+                round_no, command.get("action"),
+                target in engine.state.state.fortification_failed,
+                target in engine.state.state.fortification_blocked_builds,
+                target in engine.state.state.fortification_retryable_builds,
+                engine.state.state.fortification_skip_reason,
+            ))
+            if command.get("action") == "build" and command.get("name") == "wall":
+                built = Pos.load(command["targetPos"][0])
+                if built == target:
+                    self.assertGreaterEqual(round_no, 9)
+                    retried = True
+                payload["teamOur"]["roles"].append(unit(
+                    11000 + round_no, "wall", built.x, built.y,
+                ))
+                payload["teamOur"]["roles"][0]["backpack"].remove("stone")
+            elif command.get("action") == "move":
+                payload["teamOur"]["roles"][0]["pos"] = command["targetPos"][0]
+            payload["lastRoundRoleActionResults"] = {
+                role_id: True for role_id in response
+            }
+            if retried:
+                payload["roundNo"] = round_no + 1
+                engine.decide(payload)
+                break
+        self.assertTrue(retried, timeline)
+        self.assertIn(target, engine.state.state.fortification_completed)
+
+    def test_failed_wall_waits_while_blocker_remains(self):
+        engine, payload, target = self._first_wall_build()
+        payload["teamEnemy"]["roles"].append(
+            unit(20010, "worker", target.x, target.y),
+        )
+        payload["lastRoundRoleActionResults"] = {"10010": False}
+        for round_no in range(6, 12):
+            payload["roundNo"] = round_no
+            response = engine.decide(payload)["roleCommandMap"]
+            self.assertFalse(any(
+                command.get("action") == "build"
+                and command.get("name") == "wall"
+                and command["targetPos"] == [target.dump()]
+                for command in response.values()
+            ))
+            self.assertNotIn(target, engine.state.state.fortification_failed)
+            self.assertIn(target, engine.state.state.fortification_blocked_builds)
+            payload["lastRoundRoleActionResults"] = {}
+
+    def test_unknown_wall_feedback_does_not_become_retryable(self):
+        engine, payload, target = self._first_wall_build()
+        payload["teamEnemy"]["roles"].append(
+            unit(20010, "worker", target.x, target.y),
+        )
+        payload["lastRoundRoleActionResults"] = {}
+        payload["roundNo"] = 6
+        engine.decide(payload)
+        self.assertIn(target, engine.state.state.fortification_failed)
+        self.assertNotIn(target, engine.state.state.fortification_blocked_builds)
+
+        payload["roundNo"] = 7
+        payload["teamEnemy"]["roles"][1]["pos"] = {
+            "x": target.x + 1, "y": target.y,
+        }
+        response = engine.decide(payload)["roleCommandMap"]
+        self.assertNotIn(target, engine.state.state.fortification_retryable_builds)
+        self.assertFalse(any(
+            command.get("action") == "build"
+            and command.get("name") == "wall"
+            and command["targetPos"] == [target.dump()]
+            for command in response.values()
+        ))
+
+    def test_repeated_occupancy_failures_do_not_retry_each_clearance(self):
+        engine, payload, target = self._first_wall_build()
+        enemy = unit(20010, "worker", target.x, target.y)
+        payload["teamEnemy"]["roles"].append(enemy)
+        payload["lastRoundRoleActionResults"] = {"10010": False}
+        payload["roundNo"] = 6
+        engine.decide(payload)
+        enemy["pos"] = {"x": target.x + 1, "y": target.y}
+        payload["roundNo"] = 7
+        payload["lastRoundRoleActionResults"] = {}
+        retry = engine.decide(payload)["roleCommandMap"].get("10010", {})
+        self.assertEqual(retry.get("action"), "build")
+        self.assertEqual(retry["targetPos"], [target.dump()])
+
+        enemy["pos"] = target.dump()
+        payload["roundNo"] = 8
+        payload["lastRoundRoleActionResults"] = {"10010": False}
+        engine.decide(payload)
+        enemy["pos"] = {"x": target.x + 1, "y": target.y}
+        payload["lastRoundRoleActionResults"] = {}
+        for round_no in range(9, 13):
+            payload["roundNo"] = round_no
+            response = engine.decide(payload)["roleCommandMap"]
+            self.assertFalse(any(
+                command.get("action") == "build"
+                and command.get("name") == "wall"
+                and command["targetPos"] == [target.dump()]
+                for command in response.values()
+            ))
+        self.assertNotIn(target, engine.state.state.fortification_failed)
+        self.assertIn(target, engine.state.state.fortification_retryable_builds)
+
+        payload["roundNo"] = 131
+        next_day = engine.decide(payload)["roleCommandMap"].get("10010", {})
+        self.assertEqual(next_day.get("action"), "build")
+        self.assertEqual(next_day["targetPos"], [target.dump()])
+
+    def test_cleared_blocker_rechecks_static_wall_safety(self):
+        engine, payload, target = self._first_wall_build()
+        payload["teamEnemy"]["roles"].append(
+            unit(20010, "worker", target.x, target.y),
+        )
+        payload["lastRoundRoleActionResults"] = {"10010": False}
+        payload["roundNo"] = 6
+        engine.decide(payload)
+        payload["roundNo"] = 7
+        payload["teamEnemy"]["roles"][1]["pos"] = {
+            "x": target.x + 1, "y": target.y,
+        }
+        payload["lastRoundRoleActionResults"] = {}
+        payload["mapInfo"]["zones"] = [
+            {"pos": {"x": x, "y": y}, "neutralType": "stone"}
+            for x, y in ((10, 7), (11, 7), (11, 9), (12, 7), (12, 9))
+        ]
+        response = engine.decide(payload)["roleCommandMap"]
+        self.assertIn(target, engine.state.state.fortification_failed)
+        self.assertFalse(any(
+            command.get("action") == "build"
+            and command.get("name") == "wall"
+            and command["targetPos"] == [target.dump()]
+            for command in response.values()
+        ))
+
+    def test_temporary_wall_retry_state_resets_with_team_session(self):
+        engine, payload, target = self._first_wall_build()
+        payload["teamEnemy"]["roles"].append(
+            unit(20010, "worker", target.x, target.y),
+        )
+        payload["lastRoundRoleActionResults"] = {"10010": False}
+        payload["roundNo"] = 6
+        engine.decide(payload)
+        self.assertIn(target, engine.state.state.fortification_blocked_builds)
+
+        payload["teamOur"]["teamId"] = "fortification-new-session"
+        payload["roundNo"] = 7
+        engine.decide(payload)
+        self.assertEqual(engine.state.state.fortification_blocked_builds, set())
+        self.assertEqual(engine.state.state.fortification_retryable_builds, set())
+
     def _planning_regression_payload(self):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
         payload["roundNo"] = 11

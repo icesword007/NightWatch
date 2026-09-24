@@ -13,6 +13,7 @@ from agent.grid import PathResult
 from agent.protocol import Pos, Turn
 from agent.state import (
     CompletedAction,
+    GrowthCommitment,
     PendingAction,
     PlanState,
     StateStore,
@@ -97,6 +98,341 @@ def with_completed_wall_line(payload):
 
 
 class EconomyTests(unittest.TestCase):
+    def test_emergency_medicine_and_reachable_growth_precede_minor_medicine(self):
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(6, 1), gold=116,
+        ))
+        payload["teamOur"]["teamId"] = "emergency-plus-growth-budget"
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"][0]["health"] = 25
+        payload["teamOur"]["roles"].extend((
+            role(10011, "worker", 5, 1, health=200),
+            role(10012, "worker", 4, 1),
+        ))
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["weaponShopList"] = [
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "Medicine", "price": 10},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertEqual(commands["10010"], {
+            "action": "buy", "name": "Medicine", "num": 1,
+        })
+        self.assertNotEqual(commands.get("10011", {}).get("name"), "Medicine")
+        self.assertTrue(any(
+            plan.reason.startswith("fund:StationUpgradeVoucher1:")
+            for plan in engine.state.state.plans.values()
+        ))
+
+    def test_reachable_base_growth_beats_two_minor_medicine_purchases(self):
+        # Break caught: two routine heals spend 116 gold below the 100 voucher.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(6, 1), gold=116,
+        ))
+        payload["teamOur"]["teamId"] = "growth-before-minor-healing"
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"][0]["health"] = 180
+        payload["teamOur"]["roles"].append(
+            role(10011, "worker", 5, 1, health=180),
+        )
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "WeaponUpgradeVoucher2", "price": 150},
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "Medicine", "price": 10},
+            {"name": "WallFixer", "price": 10},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        commands = engine.decide(payload)["roleCommandMap"]
+        self.assertIn(
+            {"action": "buy", "name": "StationUpgradeVoucher1", "num": 1},
+            commands.values(),
+        )
+        self.assertLessEqual(sum(
+            next((entry["price"] for entry in payload["weaponShopList"]
+                  if entry["name"] == command.get("name")), 0)
+            for command in commands.values() if command["action"] == "buy"
+        ), 116)
+
+    def test_reachable_base_growth_uses_existing_inventory_funding_route(self):
+        # Break caught: cash below voucher price diverts a base catch-up
+        # opportunity to a lower-priority weapon despite sufficient inventory.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(6, 1), items=("copper",), gold=90,
+        ))
+        payload["teamOur"]["teamId"] = "growth-funded-from-inventory"
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "StationUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertIn(command["action"], ("move", "sell"))
+        self.assertTrue(engine.state.state.plans[10010].reason.startswith(
+            "fund:StationUpgradeVoucher1:"
+        ))
+
+    def test_growth_commitment_reserves_shared_cash_before_lower_id_minor_heal(self):
+        # Break caught: lower-ID healer spends the 90 cash needed by a
+        # higher-ID worker's executable 90 cash + 10 inventory upgrade chain.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(6, 1), gold=90,
+        ))
+        payload["teamOur"]["teamId"] = "growth-shared-cash-order"
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"][0]["health"] = 180
+        payload["teamOur"]["roles"].append(
+            role(10011, "worker", 5, 1, items=("copper",)),
+        )
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "Medicine", "price": 10},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        commands = engine.decide(payload)["roleCommandMap"]
+        self.assertNotEqual(commands.get("10010", {}).get("name"), "Medicine")
+        self.assertTrue(engine.state.state.plans[10011].reason.startswith(
+            "fund:StationUpgradeVoucher1:"
+        ))
+        commitment = getattr(engine.state.state, "growth_commitment", None)
+        self.assertIsNotNone(commitment)
+        self.assertEqual((commitment.owner_id, commitment.item,
+                          commitment.target_id, commitment.price),
+                         (10011, "StationUpgradeVoucher1", 10013, 100))
+        self.assertEqual(commands["10011"]["action"], "sell")
+        next_turn = copy.deepcopy(payload)
+        next_turn["roundNo"] = 132
+        next_turn["teamOur"]["goldNum"] = 100
+        next_turn["teamOur"]["roles"][-1]["backpack"] = []
+        next_turn["lastRoundRoleActionResults"] = {"10011": True}
+        next_commands = engine.decide(next_turn)["roleCommandMap"]
+        self.assertNotEqual(next_commands.get("10010", {}).get("name"), "Medicine")
+        self.assertEqual(next_commands["10011"], {
+            "action": "buy", "name": "StationUpgradeVoucher1", "num": 1,
+        })
+
+    def test_reachable_weapon_growth_precedes_minor_heal_shared_cash(self):
+        # Break caught: ordinary medicine drains a reachable weapon voucher.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(6, 1), gold=100,
+        ))
+        payload["teamOur"]["teamId"] = "weapon-growth-before-minor-heal"
+        payload["teamOur"]["roles"][0]["health"] = 180
+        payload["teamOur"]["roles"].append(
+            role(10011, "worker", 5, 1),
+        )
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "Medicine", "price": 10},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        commands = engine.decide(payload)["roleCommandMap"]
+        self.assertIn(
+            {"action": "buy", "name": "WeaponUpgradeVoucher1", "num": 1},
+            commands.values(),
+        )
+        self.assertNotIn("Medicine", [
+            command.get("name") for command in commands.values()
+        ])
+        buyer_id = next(
+            role_id for role_id, command in commands.items()
+            if command.get("name") == "WeaponUpgradeVoucher1"
+        )
+        followup = copy.deepcopy(payload)
+        followup["teamOur"]["goldNum"] = 0
+        owner = next(role for role in followup["teamOur"]["roles"]
+                     if str(role["id"]) == buyer_id)
+        owner["backpack"] = ["WeaponUpgradeVoucher1"]
+        followup["lastRoundRoleActionResults"] = {buyer_id: True}
+        used = False
+        for round_no in range(132, 140):
+            followup["roundNo"] = round_no
+            command = engine.decide(followup)["roleCommandMap"].get(buyer_id, {})
+            if command.get("action") == "use":
+                self.assertEqual(command["name"], "WeaponUpgradeVoucher1")
+                self.assertIn(command["targetPos"][0], [
+                    weapon["pos"] for weapon in followup["teamOur"]["roles"]
+                    if weapon["roleType"] in ("gatling", "railgun", "rocket")
+                ])
+                used = True
+                break
+            if command.get("action") == "move":
+                owner["pos"] = command["targetPos"][0]
+            followup["lastRoundRoleActionResults"] = {buyer_id: True}
+        self.assertTrue(used)
+        owner["backpack"] = []
+        upgraded = next(
+            weapon for weapon in followup["teamOur"]["roles"]
+            if weapon["pos"] == command["targetPos"][0]
+        )
+        upgraded["level"] = 2
+        followup["roundNo"] = round_no + 1
+        followup["lastRoundRoleActionResults"] = {buyer_id: True}
+        engine.decide(followup)
+        self.assertIsNone(engine.state.state.growth_commitment)
+
+    def test_growth_commitment_releases_when_target_already_upgraded(self):
+        # Break caught: a stale growth lock survives observed target completion.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(5, 1), items=("copper",), gold=90,
+        ))
+        payload["teamOur"]["teamId"] = "growth-target-completed"
+        payload["teamOur"]["roles"][0]["health"] = 180
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "Medicine", "price": 10},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        first = engine.decide(payload)["roleCommandMap"]["10010"]
+        self.assertEqual(first["action"], "sell")
+        self.assertIsNotNone(engine.state.state.growth_commitment)
+        completed = copy.deepcopy(payload)
+        completed["roundNo"] = 132
+        completed["teamOur"]["goldNum"] = 100
+        completed["teamOur"]["roles"][0]["backpack"] = []
+        completed["teamOur"]["roles"][1]["level"] = 2
+        completed["weaponShopList"] = [{"name": "Medicine", "price": 10}]
+        completed["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(completed)
+        self.assertIsNone(engine.state.state.growth_commitment)
+
+    def test_growth_commitment_releases_when_price_exceeds_real_resources(self):
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(5, 1), items=("copper",), gold=90,
+        ))
+        payload["teamOur"]["teamId"] = "growth-price-release"
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "StationUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(payload)
+        self.assertIsNotNone(engine.state.state.growth_commitment)
+
+        later = copy.deepcopy(payload)
+        later["roundNo"] = 132
+        later["teamOur"]["goldNum"] = 100
+        later["teamOur"]["roles"][0]["backpack"] = []
+        later["weaponShopList"] = [
+            {"name": "StationUpgradeVoucher1", "price": 120},
+        ]
+        later["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(later)
+
+        self.assertIsNone(engine.state.state.growth_commitment)
+
+    def test_growth_commitment_releases_when_shop_route_disappears(self):
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(5, 1), items=("copper",), gold=90,
+        ))
+        payload["teamOur"]["teamId"] = "growth-route-release"
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "StationUpgradeVoucher1", "price": 100},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.decide(payload)
+        self.assertIsNotNone(engine.state.state.growth_commitment)
+
+        later = copy.deepcopy(payload)
+        later["roundNo"] = 132
+        later["teamOur"]["goldNum"] = 100
+        later["teamOur"]["roles"][0]["backpack"] = []
+        later["mapInfo"]["zones"] = [
+            zone for zone in later["mapInfo"]["zones"]
+            if zone["neutralType"] != "weaponShop"
+        ]
+        later["lastRoundRoleActionResults"] = {"10010": True}
+        engine.decide(later)
+
+        self.assertIsNone(engine.state.state.growth_commitment)
+
+    def test_existing_growth_commitment_protects_cash_from_new_worker(self):
+        # Break caught: a newly seen lower-ID worker spends already committed
+        # cash before the original fund owner can buy the voucher.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(5, 1), items=("copper",), gold=90,
+        ))
+        payload["teamOur"]["teamId"] = "growth-new-worker-cash-lock"
+        payload["teamOur"]["roles"][0]["id"] = 10011
+        payload["teamOur"]["roles"][2].update(level=2, health=1500)
+        payload["teamOur"]["roles"] = [
+            entry for entry in payload["teamOur"]["roles"]
+            if entry["roleType"] != "wall"
+            or entry["pos"] != {"x": 7, "y": 8}
+        ]
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "StationUpgradeVoucher1", "price": 100},
+            {"name": "Medicine", "price": 10},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        self.assertEqual(engine.decide(payload)["roleCommandMap"]["10011"]["action"],
+                         "sell")
+        later = copy.deepcopy(payload)
+        later["roundNo"] = 132
+        later["teamOur"]["goldNum"] = 100
+        later["teamOur"]["roles"][0]["backpack"] = []
+        later["teamOur"]["roles"].append(
+            role(10010, "worker", 6, 1, health=180),
+        )
+        later["lastRoundRoleActionResults"] = {"10011": True}
+        commands = engine.decide(later)["roleCommandMap"]
+        self.assertNotEqual(commands.get("10010", {}).get("name"), "Medicine")
+        self.assertEqual(commands["10011"], {
+            "action": "buy", "name": "StationUpgradeVoucher1", "num": 1,
+        })
+
     def test_long_sale_does_not_displace_late_defense_return(self):
         # Break caught: newly found distant sale overrides the dusk gunner return.
         payload = economy_payload(
@@ -562,6 +898,285 @@ class EconomyTests(unittest.TestCase):
             economy._plan_use_target_id(engine.state.state.plans[10010]),
             10051,
         )
+
+    def test_twice_breached_rebuilt_wall_precedes_minor_side_damage(self):
+        payload = economy_payload(worker_pos=(5, 2), gold=20)
+        payload["teamOur"]["teamId"] = "wall-repeat-breach-priority"
+        payload["teamOur"]["roles"].extend((
+            role(10050, "wall", 5, 3, health=1000),
+            role(10051, "wall", 7, 3, health=700),
+        ))
+        payload["weaponShopList"] = [
+            {"name": "WallFixer", "price": 10},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+        engine = DecisionEngine()
+        engine.state.state = state_for(payload)
+        engine.state.state.wall_breaches[Pos(5, 3)] = (1, 2)
+        engine.state.state.wall_recent_damage[Pos(7, 3)] = ((1, 300),)
+
+        response = engine.decide(payload)
+
+        self.assertEqual(response["roleCommandMap"]["10010"]["name"],
+                         "WallUpgradeVoucher1")
+        self.assertEqual(
+            economy._plan_use_target_id(engine.state.state.plans[10010]),
+            10050,
+        )
+
+    def test_completed_growth_grants_repeated_breach_one_upgrade_opportunity(self):
+        payload = with_completed_wall_line(economy_payload(
+            round_no=261, worker_pos=(5, 2), gold=100,
+        ))
+        payload["teamOur"]["teamId"] = "growth-then-repeated-wall"
+        payload["teamOur"]["roles"][1].update(level=2, health=3000)
+        front = next(wall for wall in payload["teamOur"]["roles"]
+                     if wall["pos"] == {"x": 7, "y": 8})
+        front["id"] = 30100
+        payload["weaponShopList"] = [
+            {"name": "WeaponUpgradeVoucher1", "price": 100},
+            {"name": "WallUpgradeVoucher1", "price": 20},
+        ]
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.state.state = state_for(payload)
+        state = engine.state.state
+        state.wall_breaches[Pos(7, 8)] = (1, 2)
+        state.growth_commitment = GrowthCommitment(
+            10010, "StationUpgradeVoucher1", 10013, 0, 280,
+            state.session_index,
+        )
+
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command.get("name"), "WallUpgradeVoucher1")
+        self.assertEqual(economy._plan_use_target_id(state.plans[10010]), 30100)
+        payload["teamOur"]["goldNum"] = 80
+        payload["teamOur"]["roles"][0]["backpack"] = ["WallUpgradeVoucher1"]
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        used = False
+        for round_no in range(262, 278):
+            payload["roundNo"] = round_no
+            followup = engine.decide(payload)["roleCommandMap"].get("10010", {})
+            if followup.get("action") == "move":
+                payload["teamOur"]["roles"][0]["pos"] = followup["targetPos"][0]
+            elif followup.get("action") == "use":
+                self.assertEqual(followup["name"], "WallUpgradeVoucher1")
+                self.assertEqual(followup["targetPos"], [front["pos"]])
+                used = True
+                break
+            payload["lastRoundRoleActionResults"] = {"10010": True}
+        self.assertTrue(used)
+        front.update(level=2, health=1500)
+        payload["teamOur"]["roles"][0]["backpack"] = []
+        payload["teamOur"]["goldNum"] = 100
+        payload["lastRoundRoleActionResults"] = {"10010": True}
+        payload["roundNo"] += 1
+        engine.decide(payload)
+        self.assertIsNone(state.wall_upgrade_due)
+
+    def test_continuously_quiet_flank_defers_minor_wall_repair(self):
+        payload = with_completed_wall_line(economy_payload(
+            round_no=1, worker_pos=(5, 2), gold=10,
+        ))
+        payload["teamOur"]["teamId"] = "quiet-flank-defers-repair"
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        for wall in payload["teamOur"]["roles"]:
+            if wall["pos"] == {"x": 8, "y": 6}:
+                wall["health"] = 950
+        engine = DecisionEngine(clock=lambda: 0.0)
+        for round_no in range(1, 131):
+            payload["roundNo"] = round_no
+            engine.state.observe(Turn.load(payload), payload,
+                                 request_fingerprint(payload))
+
+        payload["roundNo"] = 131
+        response = engine.decide(payload)
+
+        self.assertFalse(any(
+            command.get("action") == "buy"
+            and command.get("name") == "WallFixer"
+            for command in response["roleCommandMap"].values()
+        ))
+
+    def test_two_daytime_frames_do_not_prove_flank_was_quiet_overnight(self):
+        # Break caught: a global two-frame streak was treated as a quiet night.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=131, worker_pos=(5, 2), gold=10,
+        ))
+        payload["teamOur"]["teamId"] = "flank-night-unknown"
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        side = next(wall for wall in payload["teamOur"]["roles"]
+                    if wall["pos"] == {"x": 8, "y": 6})
+        side["health"] = 950
+        engine = DecisionEngine(clock=lambda: 0.0)
+        engine.state.observe(Turn.load(payload), payload,
+                             request_fingerprint(payload))
+
+        payload["roundNo"] = 132
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command, {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+
+    def test_critical_flank_health_is_not_deferred_after_quiet_night(self):
+        # Break caught: absence of fresh damage hid a nearly destroyed wall.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=1, worker_pos=(5, 2), gold=10,
+        ))
+        payload["teamOur"]["teamId"] = "flank-critical-health"
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        side = next(wall for wall in payload["teamOur"]["roles"]
+                    if wall["pos"] == {"x": 8, "y": 6})
+        side["health"] = 1
+        engine = DecisionEngine(clock=lambda: 0.0)
+        for round_no in range(1, 131):
+            payload["roundNo"] = round_no
+            engine.state.observe(Turn.load(payload), payload,
+                                 request_fingerprint(payload))
+
+        payload["roundNo"] = 131
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command, {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+
+    def test_new_flank_wall_after_night_start_has_unknown_pressure(self):
+        # Break caught: a newly observed wall inherited the team's long streak.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=1, worker_pos=(5, 2), gold=10,
+        ))
+        payload["teamOur"]["teamId"] = "flank-new-after-night-start"
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        side = next(wall for wall in payload["teamOur"]["roles"]
+                    if wall["pos"] == {"x": 8, "y": 6})
+        side["health"] = 950
+        payload["teamOur"]["roles"].remove(side)
+        engine = DecisionEngine(clock=lambda: 0.0)
+        for round_no in range(1, 131):
+            payload["roundNo"] = round_no
+            if round_no == 101:
+                payload["teamOur"]["roles"].append(side)
+            engine.state.observe(Turn.load(payload), payload,
+                                 request_fingerprint(payload))
+
+        payload["roundNo"] = 131
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command, {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+
+    def test_daytime_frame_gap_invalidates_previous_quiet_wall_window(self):
+        # Break caught: two fresh frames after a gap revived stale night proof.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=1, worker_pos=(5, 2), gold=10,
+        ))
+        payload["teamOur"]["teamId"] = "flank-day-gap-unknown"
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        side = next(wall for wall in payload["teamOur"]["roles"]
+                    if wall["pos"] == {"x": 8, "y": 6})
+        side["health"] = 950
+        engine = DecisionEngine(clock=lambda: 0.0)
+        for round_no in (*range(1, 131), 132, 133):
+            payload["roundNo"] = round_no
+            engine.state.observe(Turn.load(payload), payload,
+                                 request_fingerprint(payload))
+
+        payload["roundNo"] = 134
+        command = engine.decide(payload)["roleCommandMap"]["10010"]
+
+        self.assertEqual(command, {
+            "action": "buy", "name": "WallFixer", "num": 1,
+        })
+
+    def test_late_day_streak_does_not_reactivate_pre_gap_quiet_night(self):
+        # Break caught: 61 post-gap frames revived an older quiet-night sample.
+        payload = with_completed_wall_line(economy_payload(
+            round_no=1, worker_pos=(5, 2), gold=10,
+        ))
+        payload["teamOur"]["teamId"] = "flank-gap-stale-at-round-192"
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        side = next(wall for wall in payload["teamOur"]["roles"]
+                    if wall["pos"] == {"x": 8, "y": 6})
+        side["health"] = 950
+        engine = DecisionEngine(clock=lambda: 0.0)
+        for round_no in (*range(1, 131), *range(132, 192)):
+            payload["roundNo"] = round_no
+            engine.state.observe(Turn.load(payload), payload,
+                                 request_fingerprint(payload))
+
+        payload["roundNo"] = 192
+        engine.decide(payload)
+        self.assertFalse(economy.low_pressure_flank_wall(
+            Turn.load(payload), engine.state.state, Pos(8, 6),
+        ))
+
+    def test_old_wall_repair_funding_plan_does_not_bypass_quiet_flank_gate(self):
+        payload = with_completed_wall_line(economy_payload(
+            round_no=1, worker_pos=(5, 2), gold=10,
+        ))
+        payload["teamOur"]["teamId"] = "quiet-flank-old-plan"
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        side = next(wall for wall in payload["teamOur"]["roles"]
+                    if wall["pos"] == {"x": 8, "y": 6})
+        side["health"] = 950
+        engine = DecisionEngine(clock=lambda: 0.0)
+        for round_no in range(1, 131):
+            payload["roundNo"] = round_no
+            engine.state.observe(Turn.load(payload), payload,
+                                 request_fingerprint(payload))
+        engine.state.set_plan(
+            10010, Pos(6, 2), f"fund:WallFixer:10020:{side['id']}", 180,
+        )
+
+        payload["roundNo"] = 131
+        commands = engine.decide(payload)["roleCommandMap"]
+
+        self.assertNotEqual(commands.get("10010", {}).get("name"), "WallFixer")
+
+    def test_old_joint_wall_repair_plan_does_not_bypass_quiet_flank_gate(self):
+        from agent.layout import plan_defense_layout
+
+        payload = with_completed_wall_line(economy_payload(
+            round_no=1, worker_pos=(5, 2), gold=0,
+        ))
+        payload["teamOur"]["teamId"] = "quiet-flank-old-joint"
+        payload["teamOur"]["roles"].append(
+            role(10011, "worker", 5, 1, items=("copper",)),
+        )
+        payload["vendorShopList"] = [{"name": "copper", "price": 10}]
+        payload["weaponShopList"] = [{"name": "WallFixer", "price": 10}]
+        side = next(wall for wall in payload["teamOur"]["roles"]
+                    if wall["pos"] == {"x": 8, "y": 6})
+        side["health"] = 950
+        store = StateStore()
+        for round_no in range(1, 131):
+            payload["roundNo"] = round_no
+            store.observe(Turn.load(payload), payload,
+                          request_fingerprint(payload))
+        payload["roundNo"] = 131
+        turn = Turn.load(payload)
+        state = store.state
+        state.layout_wall_targets = plan_defense_layout(turn).wall_targets
+        for worker_id, post_id in ((10010, 10020), (10011, 10030)):
+            state.plans[worker_id] = PlanState(
+                worker_id, Pos(4, 2),
+                f"fund:WallFixer:{post_id}:{side['id']}:joint:10010",
+                180, state.session_index,
+            )
+
+        actions, _, cancelled = economy._joint_funding_actions(
+            turn, state, excluded_role_ids=frozenset(),
+            clock=lambda: 0.0, deadline=1.0, max_expansions=64,
+        )
+
+        self.assertEqual(actions, ())
+        self.assertEqual(cancelled, {
+            10010: "low_pressure_flank_deferred",
+            10011: "low_pressure_flank_deferred",
+        })
 
     def test_joint_funding_uses_same_wall_value_choice(self):
         payload = economy_payload(

@@ -42,7 +42,10 @@ from .protocol import (
 from .pressure_shadow import (
     historical_investment_assessment, observe_shadow, shadow_diagnostic,
 )
-from .state import BaseReserve, MAX_HISTORY_FACTS, StateStore, request_fingerprint
+from .state import (
+    BaseReserve, GrowthCommitment, MAX_HISTORY_FACTS, StateStore,
+    request_fingerprint,
+)
 from .tasks import TaskTurnProposal, propose_tasks, task_opportunity_status
 from .treasure import MAX_TREASURE_CANDIDATES, evaluate_treasure_candidates
 
@@ -326,6 +329,7 @@ class DecisionEngine:
                             for liquidation in daytime_liquidation_actions(
                                 turn,
                                 actor,
+                                state=state,
                                 clock=self.clock,
                                 deadline=economy_deadline,
                                 max_expansions=self.max_search_expansions,
@@ -748,6 +752,16 @@ class DecisionEngine:
                         turn.round_no - 1
                     ) // ROUNDS_PER_DAY
                 actor_id = candidate.proposal.actor_id
+                growth = (
+                    candidate.diagnostic.get("growthCommitment")
+                    if isinstance(candidate.diagnostic, dict) else None
+                )
+                if isinstance(growth, dict):
+                    state.growth_commitment = GrowthCommitment(
+                        actor_id, growth["item"], growth["targetId"],
+                        growth["price"], growth["deadlineRound"],
+                        state.session_index,
+                    )
                 if (
                     isinstance(candidate.diagnostic, dict)
                     and candidate.diagnostic.get("kind") == "baseReserve"
@@ -1083,7 +1097,11 @@ class DecisionEngine:
                             "round": observation.observed_round,
                             "day": observation.observed_day,
                         },
-                        "publicationTimeKnown": False,
+                        "publicationTimeKnown": (
+                            observation.fact.publication_day is not None
+                        ),
+                        **({"publicationDay": observation.fact.publication_day}
+                           if observation.fact.publication_day is not None else {}),
                         "text": {
                             "value": observation.fact.value,
                             "originalLength": observation.fact.original_length,

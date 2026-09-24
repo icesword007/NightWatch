@@ -12,7 +12,7 @@ from .brain import decide
 from .tasks import parse_llm_envelope
 
 LOGGER = logging.getLogger(__name__)
-BUILD_ID = "nightwatch-s2-integrated-r20"
+BUILD_ID = "nightwatch-s2-integrated-r21"
 MAX_TASK_DETAIL_CHARS = 131_072
 MAX_NEWS_DETAIL_CHARS = 4_096
 MAX_LOG_ITEMS = 16

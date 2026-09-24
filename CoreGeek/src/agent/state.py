@@ -14,7 +14,8 @@ from .intelligence import (
     parse_news_response,
     source_id,
 )
-from .protocol import ROUNDS_PER_DAY, Pos, Turn, distance
+from .layout import plan_defense_layout
+from .protocol import DAY_ROUNDS, ROUNDS_PER_DAY, Pos, Turn, distance
 from .pressure_shadow import ShadowState
 
 MAX_ACTION_HISTORY = 64
@@ -24,6 +25,7 @@ MAX_NEWS_TEXT_CHARS = 2_048
 MAX_NEWS_ATTEMPTS = 256
 MAX_NEWS_DAY_RECORDS = 2
 MAX_NEWS_EVENT_TEXT_CHARS = 4_096
+MAX_WALL_BREACH_POSITIONS = 32
 
 
 def request_fingerprint(payload: dict[str, Any]) -> str:
@@ -57,6 +59,16 @@ class PlanState:
     target: Pos
     reason: str
     deadline_round: int | None
+    source_session: int
+
+
+@dataclass(frozen=True, slots=True)
+class GrowthCommitment:
+    owner_id: int
+    item: str
+    target_id: int
+    price: int
+    deadline_round: int
     source_session: int
 
 
@@ -136,6 +148,7 @@ class HistoricalFact:
     source_session: int
     source_round: int
     source_day: int
+    publication_day: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +174,7 @@ class SessionState:
     session_index: int = 1
     pressure_shadow: ShadowState = field(default_factory=ShadowState)
     base_reserve: BaseReserve | None = None
+    growth_commitment: GrowthCommitment | None = None
     base_last_sample: tuple[int, int, int, int] | None = None
     base_recent_drops: tuple[int, ...] = ()
     base_reserve_event: str | None = None
@@ -173,6 +187,16 @@ class SessionState:
     wall_recent_damage: dict[Pos, tuple[tuple[int, int], ...]] = field(
         default_factory=dict
     )
+    wall_breaches: dict[Pos, tuple[int, ...]] = field(default_factory=dict)
+    wall_observation_streak: int = 0
+    wall_line_ever_complete: bool = False
+    wall_night_candidates: dict[Pos, tuple[int, int, int, int]] = field(
+        default_factory=dict
+    )
+    wall_quiet_nights: dict[Pos, tuple[int, int, int, int]] = field(
+        default_factory=dict
+    )
+    wall_upgrade_due: tuple[Pos, int] | None = None
     last_round_no: int | None = None
     last_fingerprint: str | None = None
     last_response: dict[str, Any] | None = None
@@ -193,6 +217,8 @@ class SessionState:
     news_blocked_days: set[int] = field(default_factory=set)
     news_attempted_source_ids: list[str] = field(default_factory=list)
     news_candidates: list[NewsCandidate] = field(default_factory=list)
+    news_price_baselines: dict[tuple[str, str, int, int, str], int] = field(default_factory=dict)
+    news_released_holds: set[tuple[str, str, int, int, str]] = field(default_factory=set)
     news_events: list[dict[str, Any]] = field(default_factory=list)
     news_skip_reason: str | None = None
     late_tool_results: int = 0
@@ -225,9 +251,12 @@ class SessionState:
     )
     fortification_planning_day: int | None = None
     fortification_failed: set[Pos] = field(default_factory=set)
-    fortification_deferred: dict[Pos, tuple[str, str, int]] = field(
+    fortification_deferred: dict[Pos, str] = field(
         default_factory=dict
     )
+    fortification_blocked_builds: set[Pos] = field(default_factory=set)
+    fortification_retryable_builds: set[Pos] = field(default_factory=set)
+    fortification_retry_days: dict[Pos, int] = field(default_factory=dict)
     fortification_phase: str = "idle"
     fortification_skip_reason: str | None = None
     wave_history: list[WaveNight] = field(default_factory=list)
@@ -290,8 +319,9 @@ class StateStore:
         self._apply_feedback(turn, payload)
         self._release_dead_roles(turn)
         self._release_invalid_plans(turn)
+        self._release_invalid_growth(turn)
         self._observe_base_upgrade(turn)
-        self._observe_wall_damage(turn)
+        self._observe_wall_damage(turn, payload)
         self._observe_fortification(turn)
         observe_pressure(turn, state)
         self._update_task(
@@ -352,6 +382,11 @@ class StateStore:
                 state.fortification_attempt_days[target] = self._day(
                     turn.round_no
                 )
+                if target in state.fortification_retryable_builds:
+                    state.fortification_retry_days[target] = self._day(
+                        turn.round_no
+                    )
+                state.fortification_retryable_builds.discard(target)
             task = state.active_task
             if (
                 task is not None
@@ -550,8 +585,15 @@ class StateStore:
             ):
                 if success is True:
                     state.fortification_completed.add(pending.target)
+                elif success is False and self._movable_wall_occupies(
+                    turn, pending.target,
+                ):
+                    state.fortification_blocked_builds.add(pending.target)
+                    state.fortification_batch_targets = ()
                 else:
                     state.fortification_failed.add(pending.target)
+                    state.fortification_blocked_builds.discard(pending.target)
+                    state.fortification_retryable_builds.discard(pending.target)
             plan = state.plans.get(pending.actor_id)
             if (
                 plan is not None
@@ -657,8 +699,14 @@ class StateStore:
         elif reserve.item in holder.backpack and state.base_reserve_event == "buy_reported":
             state.base_reserve_event = "held"
 
-    def _observe_wall_damage(self, turn: Turn) -> None:
+    def _observe_wall_damage(self, turn: Turn, payload: dict[str, Any]) -> None:
         state = self._require_state()
+        complete_roles = isinstance(payload.get("teamOur", {}).get("roles"), list)
+        state.wall_observation_streak = (
+            state.wall_observation_streak + 1
+            if complete_roles and state.last_round_no == turn.round_no - 1
+            else 1 if complete_roles else 0
+        )
         cutoff = turn.round_no - ROUNDS_PER_DAY + 1
         recent = {
             pos: tuple(event for event in events if event[0] >= cutoff)
@@ -679,6 +727,66 @@ class StateStore:
                 recent[wall.pos] = events
             current[wall.pos] = (
                 wall.unit_id, wall.level, turn.round_no, wall.health,
+            )
+        day = self._day(turn.round_no)
+        state.wall_quiet_nights = {
+            pos: sample for pos, sample in state.wall_quiet_nights.items()
+            if sample[0] >= day - 1
+        }
+        threatened = {
+            pos for pos in current
+            if any(
+                robot.target_team == turn.team_type
+                and distance(robot.pos, pos) <= 3
+                for robot in turn.robots
+            )
+        }
+        if turn.round_in_day == DAY_ROUNDS + 1 and complete_roles:
+            state.wall_night_candidates = {
+                pos: (day, sample[0], sample[1], sample[3])
+                for pos, sample in current.items() if pos not in threatened
+            }
+        elif not turn.is_day and complete_roles and state.last_round_no == turn.round_no - 1:
+            state.wall_night_candidates = {
+                pos: candidate
+                for pos, candidate in state.wall_night_candidates.items()
+                if pos not in threatened
+                and pos in current
+                and (current[pos][0], current[pos][1], current[pos][3])
+                == candidate[1:]
+            }
+        else:
+            state.wall_night_candidates = {}
+        if turn.round_in_day == ROUNDS_PER_DAY:
+            state.wall_quiet_nights.update(state.wall_night_candidates)
+        breaches = {
+            pos: tuple(value for value in days if value >= day - 2)
+            for pos, days in state.wall_breaches.items()
+        }
+        if (
+            state.last_round_no == turn.round_no - 1
+            and complete_roles
+        ):
+            for pos in state.wall_last_samples.keys() - current.keys():
+                days = breaches.get(pos, ())
+                if not days or days[-1] != day:
+                    breaches[pos] = (*days, day)
+        state.wall_breaches = dict(sorted(
+            ((pos, days) for pos, days in breaches.items() if days),
+            key=lambda entry: (-entry[1][-1], entry[0].x, entry[0].y),
+        )[:MAX_WALL_BREACH_POSITIONS])
+        if state.wall_upgrade_due is not None:
+            pos, level = state.wall_upgrade_due
+            rebuilt = next((wall for wall in turn.walls() if wall.pos == pos), None)
+            if (
+                pos not in state.wall_breaches
+                or rebuilt is not None and rebuilt.level > level
+            ):
+                state.wall_upgrade_due = None
+        if not state.wall_line_ever_complete and state.wall_observation_streak >= 2:
+            targets = state.layout_wall_targets or plan_defense_layout(turn).wall_targets
+            state.wall_line_ever_complete = bool(targets) and all(
+                target in current for target in targets
             )
         state.wall_recent_damage = {
             pos: events for pos, events in recent.items() if events
@@ -774,6 +882,71 @@ class StateStore:
                 ):
                     state.plans.pop(role_id)
 
+    def _release_invalid_growth(self, turn: Turn) -> None:
+        state = self._require_state()
+        commitment = state.growth_commitment
+        if commitment is None:
+            return
+        owner = turn.unit(commitment.owner_id)
+        target = turn.unit(commitment.target_id)
+        item = commitment.item
+        if (
+            commitment.source_session == state.session_index
+            and target is not None and item.endswith(("1", "2"))
+            and target.level > int(item[-1])
+            and state.wall_upgrade_due is None
+        ):
+            repeated = sorted(
+                (
+                    wall for wall in turn.walls()
+                    if wall.level in (1, 2)
+                    and len(state.wall_breaches.get(wall.pos, ())) >= 2
+                ),
+                key=lambda wall: (
+                    -len(state.wall_breaches[wall.pos]), wall.unit_id,
+                ),
+            )
+            if repeated:
+                state.wall_upgrade_due = (repeated[0].pos, repeated[0].level)
+        if (
+            commitment.source_session != state.session_index
+            or turn.round_no > commitment.deadline_round
+            or owner is None or target is None
+            or not item.endswith(("1", "2"))
+            or target.level != int(item[-1])
+            or item.startswith("StationUpgradeVoucher")
+            and target.kind != "station"
+            or item.startswith("WeaponUpgradeVoucher")
+            and target.kind not in ("gatling", "railgun", "rocket")
+        ):
+            state.growth_commitment = None
+            return
+        if item in owner.backpack:
+            state.growth_commitment = GrowthCommitment(
+                commitment.owner_id, item, commitment.target_id, 0,
+                commitment.deadline_round, commitment.source_session,
+            )
+            return
+        price = turn.weapon_prices.get(item)
+        inventory_value = sum(
+            turn.vendor_prices.get(name, 0)
+            for name in owner.backpack
+            if name in ("stone", "iron", "copper")
+        )
+        plan = state.plans.get(owner.unit_id)
+        if (
+            price is None or price > turn.gold + inventory_value
+            or plan is None or not plan.reason.startswith(
+                (f"fund:{item}:", f"batch:{item}:")
+            )
+        ):
+            state.growth_commitment = None
+        elif price != commitment.price:
+            state.growth_commitment = GrowthCommitment(
+                commitment.owner_id, item, commitment.target_id, price,
+                commitment.deadline_round, commitment.source_session,
+            )
+
     def _observe_fortification(self, turn: Turn) -> None:
         state = self._require_state()
         if not state.fortification_initialized:
@@ -792,8 +965,20 @@ class StateStore:
             state.fortification_observed_days[target] = day
             state.fortification_recovery_targets.discard(target)
             state.fortification_attempt_days.pop(target, None)
+            state.fortification_blocked_builds.discard(target)
+            state.fortification_retryable_builds.discard(target)
+            state.fortification_retry_days.pop(target, None)
         if not turn.is_day:
             return
+        cleared = {
+            target for target in state.fortification_blocked_builds
+            if not self._movable_wall_occupies(turn, target)
+        }
+        for target in cleared:
+            if state.fortification_retry_days.get(target) != day:
+                state.fortification_attempt_days.pop(target, None)
+        state.fortification_blocked_builds.difference_update(cleared)
+        state.fortification_retryable_builds.update(cleared)
         reopened = {
             target for target in state.fortification_completed
             if target not in occupied_walls
@@ -805,6 +990,20 @@ class StateStore:
         state.fortification_completed.difference_update(reopened)
         state.fortification_recovery_targets.update(reopened)
         state.fortification_batch_targets = ()
+
+    @staticmethod
+    def _movable_wall_occupies(turn: Turn, target: Pos) -> bool:
+        return (
+            turn.zones.get(target, "land") == "land"
+            and (
+                any(
+                    unit.pos == target and unit.kind in ("worker", "pioneer")
+                    for unit in (*turn.ours, *turn.enemies)
+                )
+                or any(robot.pos == target and robot.health > 0
+                       for robot in turn.robots)
+            )
+        )
 
     def _update_task(
         self,
@@ -987,6 +1186,28 @@ class StateStore:
         if parsed.rejection_reason is None:
             state.news_candidates.extend(parsed.candidates)
             del state.news_candidates[:-MAX_NEWS_CANDIDATES]
+            retained_prices = {
+                (event.resource, event.effect, event.start_day,
+                 event.end_day, event.source_fingerprint)
+                for candidate in state.news_candidates
+                for event in candidate.economic_events
+                if event.effect == "price_rise"
+            }
+            state.news_price_baselines = {
+                key: price for key, price in state.news_price_baselines.items()
+                if key in retained_prices
+            }
+            state.news_released_holds.intersection_update(retained_prices)
+            observed_day = (turn.round_no - 1) // ROUNDS_PER_DAY + 1
+            for candidate in parsed.candidates:
+                for event in candidate.economic_events:
+                    if event.effect != "price_rise" or observed_day >= event.start_day:
+                        continue
+                    price = turn.vendor_prices.get(event.resource, 0)
+                    if price > 0:
+                        key = (event.resource, event.effect, event.start_day,
+                               event.end_day, event.source_fingerprint)
+                        state.news_price_baselines.setdefault(key, price)
             state.news_events.append({
                 "kind": "response_accepted",
                 "requestId": pending.request_id,
@@ -1063,6 +1284,17 @@ class StateStore:
                 "window": StateStore._treasure_field_detail(conditions.window),
                 "items": StateStore._treasure_field_detail(conditions.items),
             }
+        if candidate.economic_events:
+            detail["economicEvents"] = [{
+                "resource": event.resource,
+                "effect": event.effect,
+                "startDay": event.start_day,
+                "endDay": event.end_day,
+                "timeBasis": event.time_basis,
+                "effectBasis": event.effect_basis,
+                "sourceFingerprint": event.source_fingerprint[:16],
+                "status": "structure_and_citation_validated",
+            } for event in candidate.economic_events]
         return detail
 
     @staticmethod
@@ -1175,6 +1407,11 @@ class StateStore:
 
     def _record_news(self, turn: Turn, payload: dict[str, Any]) -> None:
         state = self._require_state()
+        prior_official = next((
+            observation.fact.value_fingerprint
+            for observation in state.news_observations
+            if observation.fact.category == "officialNews"
+        ), None)
         state.news_observations = ()
         news = payload.get("worldNews")
         if not isinstance(news, dict):
@@ -1194,6 +1431,16 @@ class StateStore:
             fact = known.get((category, fingerprint))
             is_new = fact is None
             if fact is None:
+                publication_day = (
+                    observed_day if category == "officialNews"
+                    and (turn.round_no - 1) % ROUNDS_PER_DAY == 0
+                    and (
+                        turn.round_no == 1
+                        or state.last_round_no == turn.round_no - 1
+                        and prior_official is not None
+                        and prior_official != fingerprint
+                    ) else None
+                )
                 fact = HistoricalFact(
                     category=category,
                     value=value[:MAX_NEWS_TEXT_CHARS],
@@ -1203,6 +1450,7 @@ class StateStore:
                     source_session=state.session_index,
                     source_round=turn.round_no,
                     source_day=observed_day,
+                    publication_day=publication_day,
                 )
                 state.history.append(fact)
                 known[(category, fingerprint)] = fact
